@@ -15,7 +15,8 @@
 #      empty; filled = remaining% rounded to nearest fifth) with filled
 #      cells in the same dynamic tier as "N%" (>=50 green / 20-49 yellow /
 #      <20 bright red) and empty cells gray, "N%" dynamic, "Nk" white, "/Nk" gray
-#   8  session cost: "$" gray, amount dynamic (<$1 gray / $1-4 yellow / >=$5 bright red)
+#   8  session cost: "$" green (constant anchor), amount dynamic (<$1 gray /
+#      $1-4 yellow / >=$5 bright red)
 #   9  lines changed +added/-removed                        - "+" green / "/" uncolored / "-" red
 #   10 rate limits: "5h"/"7d" label shares its window's dynamic color (<50
 #      green / 50-79 yellow / >=80 bright red), same for "N%", "→reset" gray
@@ -201,8 +202,8 @@ if [ -n "$remaining" ]; then
   fi
 fi
 
-# 8. session cost (USD): "$" gray, amount dynamic by integer dollars: <1
-# gray, 1-4 yellow, >=5 bright red.
+# 8. session cost (USD): "$" is a constant green anchor, amount dynamic by
+# integer dollars: <1 gray, 1-4 yellow, >=5 bright red.
 cost=$(jqr '.cost.total_cost_usd // empty')
 cost_seg=""
 if [ -n "$cost" ]; then
@@ -216,7 +217,7 @@ if [ -n "$cost" ]; then
     fi
   fi
   cost_amount=$(printf '%.2f' "$cost")
-  cost_seg="${GRAY}\$${RESET}${cost_color}${cost_amount}${RESET}"
+  cost_seg="${GREEN}\$${RESET}${cost_color}${cost_amount}${RESET}"
 fi
 
 # 9. lines changed (shown once either field is present; missing side defaults
@@ -234,7 +235,7 @@ fi
 # "->reset" suffix guarded by a numeric check before it's handed to `date`).
 # Per-part colors per window: "5h"/"7d" label AND "N%" both use that
 # window's own dynamic color, by floor(used_percentage) (<50 green, 50-79
-# yellow, >=80 bright red); "→reset" (arrow included) is cyan. Windows are
+# yellow, >=80 bright red); "→reset" (arrow included) is white. Windows are
 # still joined by a plain space.
 five=$(jqr '.rate_limits.five_hour.used_percentage // empty')
 five_reset=$(jqr '.rate_limits.five_hour.resets_at // empty')
@@ -252,7 +253,7 @@ if [ -n "$five" ]; then
     fi
   fi
   five_part="${five_color}5h${RESET} ${five_color}$(printf '%.0f' "$five")%${RESET}"
-  [[ "$five_reset" =~ ^[0-9]+$ ]] && five_part="${five_part}${CYAN}→$(date -d "@$five_reset" +%H:%M)${RESET}"
+  [[ "$five_reset" =~ ^[0-9]+$ ]] && five_part="${five_part}${WHITE}→$(date -d "@$five_reset" +%H:%M)${RESET}"
   rl_seg="$five_part"
 fi
 if [ -n "$week" ]; then
@@ -266,7 +267,7 @@ if [ -n "$week" ]; then
     fi
   fi
   week_part="${week_color}7d${RESET} ${week_color}$(printf '%.0f' "$week")%${RESET}"
-  [[ "$week_reset" =~ ^[0-9]+$ ]] && week_part="${week_part}${CYAN}→$(date -d "@$week_reset" +%m-%d)${RESET}"
+  [[ "$week_reset" =~ ^[0-9]+$ ]] && week_part="${week_part}${WHITE}→$(date -d "@$week_reset" +%m-%d)${RESET}"
   if [ -n "$rl_seg" ]; then
     rl_seg="${rl_seg} ${week_part}"
   else
