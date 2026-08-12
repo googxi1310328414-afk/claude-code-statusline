@@ -101,3 +101,23 @@
 - **颜色码核对**：输出管过 `sed 's/\x1b/\\e/g'` 逐段比对上表颜色编号。
 
 边界清单：`remaining_percentage` 为 null（段消失）、`pr` 无 `review_state`（只显示紫色 PR#N）、`rate_limits` 只有一个窗口、`effort`/`thinking`/`session_name`/`repo` 全缺、路径恰好 3 层（不折叠）与 4 层（折叠）、主目录本身（显示 `~`）。
+
+## 6. 子代理面板行（subagentStatusLine，可选但推荐）
+
+第二个脚本 `~/.claude/subagent-statusline.sh` 接管代理面板里每个子代理行的渲染。settings.json 在 `statusLine` 旁**合并**：
+
+```json
+{ "subagentStatusLine": { "type": "command", "command": "bash ~/.claude/subagent-statusline.sh" } }
+```
+
+**契约（与主状态栏不同！）**：每次刷新 stdin 收到**一个**JSON：`{"columns": <可用宽度>, "tasks": [<每个子代理一个对象>]}`。任务字段：`id`、`name`、`type`、`status`、`description`、`label`、`startTime`（Unix 时间戳，**可能是毫秒**）、`tokenCount`、`model`、`contextWindowSize`（≥2.1.205）、`effort`（≥2.1.214；缺席=继承主会话）。脚本对 `.tasks[]` 的每个元素向 stdout 输出一行紧凑 JSON：`{"id":"<task.id>","content":"<含 ANSI 的行文本>"}`（用 `jq -cn --arg` 构造，自动转义 ESC 字节）；无 `id` 的任务跳过（保持默认渲染）；`tasks` 缺失/为空则无任何输出。
+
+**行规格**（分隔符、常量、守卫、无浮点等硬性要求同主脚本；瘦身 + 与主状态栏视觉区分）：
+
+1. 身份：灰 `▸ ` 前缀 + name/label/type 三选一（取第一个非空）**亮紫 95**（刻意区别于主状态栏的亮青身份色）；仅当 `effort` 存在时附加灰 `·` + 热度色 effort（映射同主脚本，数字型预算值用黄）。**不显示模型**（冗余）。
+2. 状态：running/in_progress **绿**；pending/queued/starting **黄**；failed/error/cancelled/killed **亮红**；completed/done/finished **灰**；其他**黄**。
+3. 电池条：`tokenCount` 与 `contextWindowSize` 都为正数才显示；`used_pct = tokenCount*100/contextWindowSize`（夹 0–100），`remaining = 100 - used_pct`，之后与主脚本第 7 段完全同款（5 格、`(remaining+10)/20`、`!` 规则、`Xk/Yk`）。
+4. 用时：`startTime > 10^12` 视为毫秒（除以 1000）；`now - start` 负数夹 0；`<1h` 显示 `Nm`，否则 `XhYm`；**白**。
+5. 描述：**灰**，宽度预算 = `columns`（缺省 120）−（前四段纯文本长度含 `▸ ` 与分隔符）− 3；预算 < 8 整段省略，超长截到预算−1 字符 + `…`。
+
+**验证**：用 `fixtures/subagent-tasks.json`（4 个任务）跑 `bash subagent-statusline.sh < …`，应输出 **3** 行有效 JSON（无 id 的跳过）：t1 = `▸ code-reviewer·max`（紫+亮红）、绿 running、绿 `███░░ 66% 68k/200k`、描述按 columns=100 截断带 `…`；t2 = 无电池段（缺 window）、灰 completed；t3 = label 兜底身份、黄 `50000`、亮红 failed、红 `!░░░░░ 8% 185k/200k`。用时段需用 jq 注入相对当前的 `startTime` 测试（毫秒与秒各一），静态夹具里无 `startTime`（该段省略即为正确）。注意 Git Bash 需 UTF-8 locale（`locale charmap` = UTF-8），否则 `▸`/`█`/`…` 的字符计数会导致提前截断（不致错，但保守）。

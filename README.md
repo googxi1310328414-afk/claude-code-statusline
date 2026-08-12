@@ -72,6 +72,23 @@ Claude Code 的信息密集型彩色状态栏（Windows / Git Bash）。一行�
 
 把 [`AI-GUIDE.md`](AI-GUIDE.md) 的内容整个发给 Claude Code（或其他会写 shell 的 AI agent），它会按规格在你的机器上重建、适配并验证整套状态栏——这份指导文件就是本仓库的核心。
 
+## 子代理面板行（subagentStatusLine）
+
+Claude Code 的底部状态栏永远显示主会话数据（官方没有让它跟随子代理视图的机制），但代理面板里每个子代理的那一行可以完全接管。`subagent-statusline.sh` 把它渲染成与主状态栏同一套视觉语言、又刻意做了区分的瘦身版：
+
+```
+▸ code-reviewer·max | running | ███░░ 66% 68k/200k | 5m | Review the auth module for c…
+```
+
+- 行首灰色 `▸` + **亮紫**名称——主状态栏的身份色是亮青，一眼分清主/子
+- `·max` 仅当该子代理被显式指定思考档位时出现（缺省继承主会话，不显示）
+- 状态动态色：running 绿 / 排队 黄 / failed 亮红 / completed 灰
+- 电池条是**该子代理自己**的上下文余量（`tokenCount`/`contextWindowSize`，需 Claude Code ≥ 2.1.205）
+- 用时 + 按面板宽度（`columns`）预算截断的描述
+- 机制与主状态栏不同：每次刷新 stdin 收到一个 `{"columns":N,"tasks":[…]}`，脚本对每行输出一条 `{"id":…,"content":…}` JSON 来接管渲染；无 `id` 的任务保持默认渲染
+
+安装：把 `subagent-statusline.sh` 复制到 `~/.claude/`，settings.json 合并 `subagentStatusLine` 键（`settings-snippet.json` 已含两个键）。
+
 ## 测试
 
 ```bash
@@ -79,7 +96,7 @@ bash test.sh          # 渲染全部测试夹具（终端里直接看颜色效�
 bash test.sh --codes  # 把 ANSI 转义显示为 \e[..m，便于核对颜色代码
 ```
 
-`test.sh` 会额外创建一个临时 git 仓库演示干净/脏分支两种状态。
+`test.sh` 会额外创建一个临时 git 仓库演示干净/脏分支两种状态，并渲染子代理面板行（含动态用时）。
 
 ## 移植注意
 
