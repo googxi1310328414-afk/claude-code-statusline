@@ -11,18 +11,20 @@
 #      yellow token
 #   6  PR: "PR#N" magenta; review state (if any) keeps its dynamic color
 #      (approved green / changes_requested bright red / draft gray / other yellow)
-#   7  context: "!" bright red, "ctx"/"left" gray, "N%" dynamic (>=50 green /
-#      20-49 yellow / <20 bright red), "Nk" white, "/Nk" gray
+#   7  context battery: "!" bright red when <20%, 5-cell bar (█ filled / ░
+#      empty; filled = remaining% rounded to nearest fifth) with filled
+#      cells in the same dynamic tier as "N%" (>=50 green / 20-49 yellow /
+#      <20 bright red) and empty cells gray, "N%" dynamic, "Nk" white, "/Nk" gray
 #   8  session cost: "$" gray, amount dynamic (<$1 gray / $1-4 yellow / >=$5 bright red)
 #   9  lines changed +added/-removed                        - "+" green / "/" uncolored / "-" red
-#   10 rate limits: "5h"/"7d" label gray, "N%" dynamic per window (<50 green /
-#      50-79 yellow / >=80 bright red), "→reset" gray
+#   10 rate limits: "5h"/"7d" label shares its window's dynamic color (<50
+#      green / 50-79 yellow / >=80 bright red), same for "N%", "→reset" gray
 #   11 session name                                                  - gray
 # Colors are the basic 16-color ANSI palette (30-37 / 90-97) via bash
 # ANSI-C quoting ($'\e[..m'), so each variable already holds the literal
 # escape byte; the final printf only ever needs %s (never %b).
-# Full example:         14:32 | Fable 5·max·think | ~\proj\webapp | acme/webapp | main* | PR#42 approved | ctx 66% left 68k/200k | $0.42 | +156/-23 | 5h 37%→09:00 7d 12%→08-15 | my-session
-# Low-context example:  09:15 | Fable 5 | ~\…\b\c | !ctx 12% left 176k/200k
+# Full example:         14:32 | Fable 5·max·think | ~\proj\webapp | acme/webapp | main* | PR#42 approved | ███░░ 66% 68k/200k | $0.42 | +156/-23 | 5h 37%→09:00 7d 12%→08-15 | my-session
+# Low-context example:  09:15 | Fable 5 | ~\…\b\c | !█░░░░ 12% 176k/200k
 # Minimal example:      14:32 | Fable 5 | ~
 
 # --- color constants (basic 16-color ANSI only) ---
@@ -151,12 +153,15 @@ if [ -n "$pr_number" ]; then
   fi
 fi
 
-# 7. context: remaining % (+ used/total tokens in k, rounded to nearest 1000);
-# "!" is prefixed when remaining is below 20%. remaining_int truncates the
-# fractional part, which is equivalent to flooring a non-negative percentage,
-# so the integer comparisons below match real-valued thresholds exactly.
-# Per-part colors: "!" bright red, "ctx"/"left" gray, "N%" dynamic (>=50
-# green, 20-49 yellow, <20 bright red), "Nk" white, "/Nk" (slash included) gray.
+# 7. context battery bar: [!]<bar> N% [Xk/Yk]. remaining_int truncates the
+# fractional part (floor for a non-negative percentage), so the integer
+# comparisons below match real-valued thresholds exactly. "!" is prefixed
+# when remaining is below 20%. The bar is 5 cells; filled count is
+# remaining_int rounded to the nearest fifth via integer math
+# ((remaining_int + 10) / 20), clamped to 0..5. Filled cells (█, U+2588) use
+# the segment's dynamic color (>=50 green, 20-49 yellow, <20 bright red);
+# empty cells (░, U+2591) are gray. "N%" keeps the dynamic color; token
+# counts are unchanged: "Nk" white, "/Nk" (slash included) gray.
 remaining=$(jqr '.context_window.remaining_percentage // empty')
 in_tokens=$(jqr '.context_window.total_input_tokens // empty')
 win_size=$(jqr '.context_window.context_window_size // empty')
@@ -165,7 +170,11 @@ if [ -n "$remaining" ]; then
   remaining_int="${remaining%%.*}"
   ctx_color="$GREEN"
   ctx_warn=""
+  filled=0
   if [[ "$remaining_int" =~ ^[0-9]+$ ]]; then
+    filled=$(( (remaining_int + 10) / 20 ))
+    [ "$filled" -lt 0 ] && filled=0
+    [ "$filled" -gt 5 ] && filled=5
     if [ "$remaining_int" -lt 20 ]; then
       ctx_warn="1"
       ctx_color="$RED_BRIGHT"
@@ -173,8 +182,18 @@ if [ -n "$remaining" ]; then
       ctx_color="$YELLOW"
     fi
   fi
+  bar_filled=""
+  bar_empty=""
+  for ((bi=0; bi<5; bi++)); do
+    if [ "$bi" -lt "$filled" ]; then
+      bar_filled="${bar_filled}█"
+    else
+      bar_empty="${bar_empty}░"
+    fi
+  done
+  bar="${ctx_color}${bar_filled}${RESET}${GRAY}${bar_empty}${RESET}"
   [ -n "$ctx_warn" ] && ctx_seg="${RED_BRIGHT}!${RESET}"
-  ctx_seg="${ctx_seg}${GRAY}ctx${RESET} ${ctx_color}$(printf '%.0f' "$remaining")%${RESET} ${GRAY}left${RESET}"
+  ctx_seg="${ctx_seg}${bar} ${ctx_color}$(printf '%.0f' "$remaining")%${RESET}"
   if [ -n "$in_tokens" ] && [ -n "$win_size" ] && [[ "$in_tokens" =~ ^[0-9]+$ ]] && [[ "$win_size" =~ ^[0-9]+$ ]]; then
     used_k=$(( (in_tokens + 500) / 1000 ))
     total_k=$(( (win_size + 500) / 1000 ))
@@ -213,9 +232,10 @@ fi
 
 # 10. rate limits (each window independently optional, each with an optional
 # "->reset" suffix guarded by a numeric check before it's handed to `date`).
-# Per-part colors per window: "5h"/"7d" label gray, "N%" dynamic by that
-# window's own floor(used_percentage) (<50 green, 50-79 yellow, >=80 bright
-# red), "→reset" gray. Windows are still joined by a plain space.
+# Per-part colors per window: "5h"/"7d" label AND "N%" both use that
+# window's own dynamic color, by floor(used_percentage) (<50 green, 50-79
+# yellow, >=80 bright red); "→reset" (arrow included) is cyan. Windows are
+# still joined by a plain space.
 five=$(jqr '.rate_limits.five_hour.used_percentage // empty')
 five_reset=$(jqr '.rate_limits.five_hour.resets_at // empty')
 week=$(jqr '.rate_limits.seven_day.used_percentage // empty')
@@ -231,8 +251,8 @@ if [ -n "$five" ]; then
       five_color="$YELLOW"
     fi
   fi
-  five_part="${GRAY}5h${RESET} ${five_color}$(printf '%.0f' "$five")%${RESET}"
-  [[ "$five_reset" =~ ^[0-9]+$ ]] && five_part="${five_part}${GRAY}→$(date -d "@$five_reset" +%H:%M)${RESET}"
+  five_part="${five_color}5h${RESET} ${five_color}$(printf '%.0f' "$five")%${RESET}"
+  [[ "$five_reset" =~ ^[0-9]+$ ]] && five_part="${five_part}${CYAN}→$(date -d "@$five_reset" +%H:%M)${RESET}"
   rl_seg="$five_part"
 fi
 if [ -n "$week" ]; then
@@ -245,8 +265,8 @@ if [ -n "$week" ]; then
       week_color="$YELLOW"
     fi
   fi
-  week_part="${GRAY}7d${RESET} ${week_color}$(printf '%.0f' "$week")%${RESET}"
-  [[ "$week_reset" =~ ^[0-9]+$ ]] && week_part="${week_part}${GRAY}→$(date -d "@$week_reset" +%m-%d)${RESET}"
+  week_part="${week_color}7d${RESET} ${week_color}$(printf '%.0f' "$week")%${RESET}"
+  [[ "$week_reset" =~ ^[0-9]+$ ]] && week_part="${week_part}${CYAN}→$(date -d "@$week_reset" +%m-%d)${RESET}"
   if [ -n "$rl_seg" ]; then
     rl_seg="${rl_seg} ${week_part}"
   else
