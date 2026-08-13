@@ -160,9 +160,13 @@ export LC_ALL=C.UTF-8
 #      .transcript_path (see item 10b below) newest-first for the latest
 #      assistant/non-sidechain line with nonzero cache activity and a
 #      parseable ISO timestamp, then remaining = $STATUSLINE_CACHE_TTL_
-#      SECONDS (default 3600) - 5 - (now - that timestamp); "47m" or
-#      "9m42s" white when remaining/ttl >0.5, yellow >0.2, bright red >0,
-#      gray "cold" otherwise; absent when no candidate line is found. The
+#      SECONDS (default 3600) - 5 - (now - that timestamp). UX: an active
+#      session keeps re-warming the cache, so a raw countdown sits near
+#      TTL almost continuously and reads as frozen rather than healthy -
+#      remaining/ttl >0.9 collapses to a static green "hot" instead of a
+#      number; below that, the countdown itself - "47m" or "9m42s" white
+#      when remaining/ttl >0.5, yellow >0.2, bright red >0, gray "cold" at
+#      or below 0. Absent entirely when no candidate line is found. The
 #      ISO timestamp needs one `date -d` spawn (no pure-bash ISO parse) -
 #      fired only when a candidate was actually found, never per-render.
 #   10b compaction counter - gray "↻" + white count of `"subtype":
@@ -1322,25 +1326,34 @@ if [ -n "$cache_seg" ] && [ "${#tail_lines[@]}" -gt 0 ] && command -v date >/dev
         cache_fresh_text="cold"
         cache_fresh_color="$GRAY"
       else
-        if [ "$cache_remaining" -lt 60 ]; then
-          cache_fresh_text="${cache_remaining}s"
-        else
-          cf_m=$(( cache_remaining / 60 ))
-          cf_s=$(( cache_remaining % 60 ))
-          if [ "$cf_m" -ge 60 ]; then
-            cache_fresh_text="${cf_m}m"
-          else
-            cache_fresh_text="${cf_m}m${cf_s}s"
-          fi
-        fi
         cache_frac1000=0
         [ "$cache_ttl" -gt 0 ] && cache_frac1000=$(( cache_remaining * 1000 / cache_ttl ))
-        if [ "$cache_frac1000" -gt 500 ]; then
-          cache_fresh_color="$WHITE"
-        elif [ "$cache_frac1000" -gt 200 ]; then
-          cache_fresh_color="$YELLOW"
+        if [ "$cache_frac1000" -gt 900 ]; then
+          # UX: an active session keeps re-warming the cache, so the
+          # countdown sits near TTL almost continuously and reads as
+          # frozen/broken rather than "healthy" - collapse anything above
+          # 90% remaining into a static "hot" instead of a number.
+          cache_fresh_text="hot"
+          cache_fresh_color="$GREEN"
         else
-          cache_fresh_color="$RED_BRIGHT"
+          if [ "$cache_remaining" -lt 60 ]; then
+            cache_fresh_text="${cache_remaining}s"
+          else
+            cf_m=$(( cache_remaining / 60 ))
+            cf_s=$(( cache_remaining % 60 ))
+            if [ "$cf_m" -ge 60 ]; then
+              cache_fresh_text="${cf_m}m"
+            else
+              cache_fresh_text="${cf_m}m${cf_s}s"
+            fi
+          fi
+          if [ "$cache_frac1000" -gt 500 ]; then
+            cache_fresh_color="$WHITE"
+          elif [ "$cache_frac1000" -gt 200 ]; then
+            cache_fresh_color="$YELLOW"
+          else
+            cache_fresh_color="$RED_BRIGHT"
+          fi
         fi
       fi
       cache_seg="${cache_seg} ${cache_fresh_color}${cache_fresh_text}${RESET}"
