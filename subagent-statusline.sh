@@ -91,10 +91,11 @@ export LC_ALL=C.UTF-8
 #      is empty for this row, i.e. a padded blank column here unless it's
 #      also this row's trailing-absent point) + "(type)" in gray when
 #      .type is non-empty and differs from the chosen identity text + "·"
-#      + short model name (cyan 36) when .model is non-empty and differs
-#      from the payload-wide majority model (majority computed once
-#      before pass 1; if every task shares one model, or none have one,
-#      this marker never shows anywhere) + "·" + effort (heat-colored: low
+#      + short model name (cyan 36) whenever .model is non-empty -
+#      UNCONDITIONAL by user request (was minority-vs-majority-only;
+#      the jq call still emits majority_model to keep the JL scalar
+#      indices stable, it just no longer gates this marker) + "·" +
+#      effort (heat-colored: low
 #      gray / medium green / high yellow / xhigh bright magenta / max
 #      bright red / anything else incl. numeric budgets yellow) + " " + a
 #      status glyph: running/in_progress "●" green, pending/queued/
@@ -428,7 +429,7 @@ for ((ti=0; ti<task_count_total; ti++)); do
   [ -z "$id" ] && continue
 
   # column 1: identity segment: "▸ " + identity (bright magenta) + "(type)"
-  # (gray) + "·"+short-model (cyan, only when minority) + "·"+effort
+  # (gray) + "·"+short-model (cyan, always when present) + "·"+effort
   # (heat-colored) + " "+status glyph
   # (identity_plain/task_type/model/effort/status split from task_rows above)
   seg1_plain=""
@@ -442,7 +443,7 @@ for ((ti=0; ti<task_count_total; ti++)); do
       seg1="${seg1}${GRAY}(${task_type})${RESET}"
     fi
 
-    if [ -n "$model" ] && [ "$model" != "$majority_model" ]; then
+    if [ -n "$model" ]; then
       short_model "$model"; model_short="$REPLY"
       seg1_plain="${seg1_plain}·${model_short}"
       seg1="${seg1}${GRAY}·${RESET}${CYAN}${model_short}${RESET}"

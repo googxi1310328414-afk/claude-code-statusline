@@ -150,6 +150,10 @@ if [ "$1" = "--assert" ]; then
   solo=$(jq -n --argjson now "$now" '{columns:120,tasks:[{id:"t1",label:"solo",status:"running",tokenCount:5000,startTime:(($now-120)*1000),description:"x"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
   printf '%s' "$solo" | grep -q '| |' && bad "solo row empty cell" || ok "solo row clean"
   printf '%s' "$solo" | grep -q 'Σ' && bad "solo row shows share" || ok "solo hides share"
+  # model marker is UNCONDITIONAL now: a solo task (its model IS the
+  # majority) must still show it
+  modrow=$(jq -n --argjson now "$now" '{columns:120,tasks:[{id:"m1",label:"a",status:"running",tokenCount:5,model:"claude-fable-5",startTime:(($now-30)*1000),description:"d"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  printf '%s' "$modrow" | grep -q '·fable-5' && ok "model always shown" || bad "model marker hidden"
 
   # own 10s trend state: the two renders above created one row per
   # tokened task (3 from the panel payload + 1 from solo)

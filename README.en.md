@@ -22,7 +22,7 @@ The subagent panel row (via `subagentStatusLine`) renders every agent as an alig
 ▸ 0.2.79 收尾与发布(local_agent) ● | 295k tok | █▄▁ 14.9k/m | Σ78% | 19m44s@08:11:18 | description…
 ```
 
-with bright-magenta identity (vs. the main line's bright cyan), minority-model marker, status glyphs (● ○ ✓ ✗), cumulative token spend (deliberately **not** a fake "context battery" — `tokenCount` is cumulative), sparkline + rate, Σ fleet-share, seconds-precision elapsed time, and a width-budgeted description. Columns align using true display-width measurement (CJK = 2 cells).
+with bright-magenta identity (vs. the main line's bright cyan), an always-on short-model marker, status glyphs (● ○ ✓ ✗), cumulative token spend (deliberately **not** a fake "context battery" — `tokenCount` is cumulative), sparkline + rate, Σ fleet-share, seconds-precision elapsed time, and a width-budgeted description. Columns align using true display-width measurement (CJK = 2 cells).
 
 ## Install
 
