@@ -9,6 +9,7 @@ cd "$(dirname "$0")" || exit 1
 # 全程使用隔离历史文件——绝不触碰真实 ~/.claude/statusline-history.tsv
 export STATUSLINE_HISTORY_FILE="$(mktemp -u)/test-hist.tsv" 2>/dev/null || export STATUSLINE_HISTORY_FILE="/tmp/statusline-test-hist.$$"
 mkdir -p "$(dirname "$STATUSLINE_HISTORY_FILE")"
+export STATUSLINE_SUBAGENT_SAMPLES_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-subsamp.tsv"
 trap 'rm -rf "$(dirname "$STATUSLINE_HISTORY_FILE")"' EXIT
 
 strip() { perl -pe 's/\e\[[0-9;]*m//g; s/\e\]8;;[^\e]*\e\\//g'; }
@@ -96,6 +97,24 @@ if [ "$1" = "--assert" ]; then
   printf '%s' "$bare" | grep -q 'degraded' && bad "empty-tail payload false degraded" || ok "empty-tail payload not degraded"
   [ "$(printf '%s\n' "$bare" | wc -l)" -eq 4 ] && ok "empty-tail payload full 4-line render" || bad "empty-tail payload line count != 4"
 
+  # stash segment: count rides the same single git call (--porcelain=v2
+  # --branch --show-stash); also guards the v1->v2 branch-parse rewrite
+  stash_tmp=$(mktemp -d)
+  git -C "$stash_tmp" init -q -b main 2>/dev/null || git -C "$stash_tmp" init -q
+  git -C "$stash_tmp" -c user.email=t@t -c user.name=t commit -qm init --allow-empty
+  echo one > "$stash_tmp/s.txt"
+  git -C "$stash_tmp" add s.txt
+  git -C "$stash_tmp" -c user.email=t@t -c user.name=t stash -q
+  stashed=$(jq --arg d "$stash_tmp" '.workspace.current_dir=$d' fixtures/full.json | bash ./statusline-command.sh | strip)
+  printf '%s' "$stashed" | grep -q '⚑1' && ok "stash count segment" || bad "stash segment missing"
+  printf '%s' "$stashed" | grep -q 'main' && ok "branch parsed (v2)" || bad "branch missing after v2 switch"
+  git -C "$stash_tmp" stash clear
+  echo x > "$stash_tmp/untracked.txt"
+  nostash=$(jq --arg d "$stash_tmp" '.workspace.current_dir=$d' fixtures/full.json | bash ./statusline-command.sh | strip)
+  printf '%s' "$nostash" | grep -q '⚑' && bad "stash glyph at zero stashes" || ok "stash hidden at zero"
+  printf '%s' "$nostash" | grep -q 'main\*' && ok "dirty star (v2 entries)" || bad "dirty star missing"
+  rm -rf "$stash_tmp"
+
   sub=$(subagent_payload "$now" | bash ./subagent-statusline.sh)
   [ "$(printf '%s\n' "$sub" | wc -l)" -eq 3 ] && ok "subagent 3 rows" || bad "subagent row count"
   all_json=1
@@ -105,6 +124,14 @@ if [ "$1" = "--assert" ]; then
   solo=$(jq -n --argjson now "$now" '{columns:120,tasks:[{id:"t1",label:"solo",status:"running",tokenCount:5000,startTime:(($now-120)*1000),description:"x"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
   printf '%s' "$solo" | grep -q '| |' && bad "solo row empty cell" || ok "solo row clean"
   printf '%s' "$solo" | grep -q 'Σ' && bad "solo row shows share" || ok "solo hides share"
+
+  # own 10s sampling: the two renders above took one sample per tokened
+  # task (3 from the panel payload + 1 from solo)
+  [ "$(grep -c . "$STATUSLINE_SUBAGENT_SAMPLES_FILE" 2>/dev/null)" -eq 4 ] && ok "subagent samples captured" || bad "subagent samples file wrong"
+  # pre-seeded own samples (10s apart) drive the sparkline as primary source
+  printf "%s\x1fms\x1f%s\n" "$((now-30))" 1000 "$((now-20))" 3000 "$((now-10))" 4000 > "$STATUSLINE_SUBAGENT_SAMPLES_FILE"
+  spark=$(subagent_payload "$now" | bash ./subagent-statusline.sh | jq -r 'select(.id=="ms") | .content' | strip)
+  printf '%s' "$spark" | grep -qE '[▁▂▃▄▅▆]' && ok "subagent sparkline from own samples" || bad "own-sample sparkline missing"
 
   rm -rf "$tmpd"
   echo "----"

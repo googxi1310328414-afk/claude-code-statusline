@@ -12,7 +12,7 @@ ctx ████░ 71% 294k/1M  | ▂▃▂▄ 2.9k/m       | cache 99%
 $74.94 $79.8/h         | +2005/-585        | 5h 32%→09:10 7d 12%→08-15 | » session-name
 ```
 
-- **Line 1 — identity & location**: seconds clock · model + effort heat + thinking marker · abbreviated directory · `⎇ worktree` · repo (OSC 8 hyperlink) · branch + dirty `*` · PR (hyperlink + review state)
+- **Line 1 — identity & location**: seconds clock · model + effort heat + thinking marker · abbreviated directory · `⎇ worktree` · repo (OSC 8 hyperlink) · branch + dirty `*` · `⚑N` stash count (bright red at ≥5, hidden at zero) · PR (hyperlink + review state)
 - **Line 2 — context engine**: `ctx` battery (occupancy = input + latest output tokens, `k`/`M` units) · token sparkline + burn rate (from a cross-refresh history file) · cache hit rate
 - **Line 3 — spend & quota**: cost + `$X.X/h` rate · lines changed · 5h/7d rate-limit windows with reset times · `»` session name
 
@@ -26,7 +26,7 @@ with bright-magenta identity (vs. the main line's bright cyan), minority-model m
 
 ## Install
 
-Requirements: Claude Code (≥ 2.1.205 for some subagent fields), Git Bash (bash ≥ 4, UTF-8), `jq`, `git`.
+Requirements: Claude Code (≥ 2.1.205 for some subagent fields), Git Bash (bash ≥ 4, UTF-8), `jq`, `git` (≥ 2.35 for the stash segment).
 
 1. Copy both `.sh` files into `~/.claude/`.
 2. Merge the two keys from `settings-snippet.json` into `~/.claude/settings.json`.
@@ -43,7 +43,7 @@ bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
 
 ## Notable engineering notes
 
-- Status line refresh is event-driven (~300 ms debounce) unless `refreshInterval` is configured.
+- Auto-refresh = event-driven repaints (~300 ms debounce) + a `refreshInterval` timer (defaults here: main 10s / subagent panel 3s) that re-runs the whole script with fresh stdin JSON even when idle. A new trigger CANCELS the in-flight render, so the interval must comfortably exceed worst-case render time (0.4–1.3 s measured) — undershooting it blanks the bar entirely. settings.json changes hot-reload by CONTENT (touching mtime does nothing), which is also the no-restart recovery path if the render loop ever wedges.
 - Windows `jq` emits CRLF: every line-wise read must pass through `tr -d '\r'` (MSYS bash strips trailing CRs in `$(...)` substitutions, `mapfile` does not).
 - Scripts export `LC_ALL=C.UTF-8` — column alignment depends on character-based (not byte-based) string measurement, plus a `disp_width()` that counts East-Asian wide characters as 2 terminal cells.
 - Workflow/ultracode fleets do **not** flow through `subagentStatusLine` (measured empirically); they render in the dedicated `/workflows` UI, which has no customization hook.

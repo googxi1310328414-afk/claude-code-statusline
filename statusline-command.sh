@@ -36,9 +36,9 @@ exec 2>>"$statusline_err_log"
 #
 # PERFORMANCE: after the jq-missing guard, every stdin field this script
 # needs is read via ONE jq invocation into the F[] array (see the mapfile
-# block below), not one jq call per field. The git branch+dirty check is
-# ONE `git status --porcelain=v1 --branch` call instead of two separate
-# git invocations. TODAY/WEEK TOTAL is a pure-bash scan over the same
+# block below), not one jq call per field. The git branch+dirty+stash
+# check is ONE `git status --porcelain=v2 --branch --show-stash` call
+# instead of separate git invocations. TODAY/WEEK TOTAL is a pure-bash scan over the same
 # in-memory history rows already loaded for the token-rate/sparkline
 # segment - no background job or transcript scan of its own. Almost every
 # `date` call has been replaced by bash's own `printf '%(fmt)T' epoch`
@@ -62,7 +62,7 @@ exec 2>>"$statusline_err_log"
 #
 # EXPECTED REMAINING SPAWN INVENTORY per render, after this pass:
 #   - jq: exactly 1 (the consolidated F[] extraction)
-#   - git: exactly 1 (status --porcelain=v1 --branch)
+#   - git: exactly 1 (status --porcelain=v2 --branch --show-stash)
 #   - tail: 0 or 1 (N3/N4's shared transcript-tail read; only when
 #     transcript_path is set, the file exists, and `tail` is on PATH)
 #   - date: 0 or 1 (N4's ISO-8601 parse; only when the tail scan above
@@ -123,6 +123,13 @@ exec 2>>"$statusline_err_log"
 #      https://<host>/<owner>/<name> (host defaults to "github.com")
 #   6  git branch: name always green; trailing "*" when dirty is its own
 #      yellow token
+#   6b stash count: gray "⚑" + count yellow (bright red from 5 up). Rides
+#      the SAME single git call as segment 6 (--show-stash): git only
+#      emits the "# stash <N>" v2 header when at least one stash entry
+#      exists AND git is >=2.35, so zero stashes, non-repo dirs and older
+#      gits all hide the segment for free. Deliberately independent of
+#      segment 6's branch name: a detached HEAD blanks the branch but
+#      stashes still exist and still show.
 #   7  PR: "PR#N" magenta, an OSC 8 hyperlink to .pr.url when present
 #      (plain text otherwise); review state (if any) stays outside the
 #      link and keeps its own dynamic color (approved green /
@@ -584,10 +591,14 @@ if [ -n "$session_id" ]; then
     fi
   done
 
+  # Sampling throttle: at most one history row per session every 20s
+  # (paired with statusLine refreshInterval 10 - one row every other
+  # render). Each sparkline bar therefore spans ~20s of token change, and
+  # the rate segment's >=60s span gate arms after ~4 samples (~1 min).
   should_append=1
   if [ -n "$last_hist_epoch" ]; then
     hist_age=$(( now_epoch - last_hist_epoch ))
-    [ "$hist_age" -lt 5 ] && should_append=0
+    [ "$hist_age" -lt 20 ] && should_append=0
   fi
 
   if [ "$should_append" -eq 1 ]; then
@@ -731,7 +742,11 @@ if [ -n "$session_id" ] && [ "$should_append" -eq 1 ]; then
   if [ "$hist_trimmed_count" -gt 50000 ]; then
     hist_trimmed=("${hist_trimmed[@]: -50000}")
   fi
-  printf '%s\n' "${hist_trimmed[@]}" > "${history_file}.tmp" 2>/dev/null && mv -f "${history_file}.tmp" "$history_file" 2>/dev/null
+  # Per-PID tmp name: two concurrent sessions trimming at the same tick
+  # collided on a shared fixed ".tmp" (Windows: "Device or resource busy",
+  # loser dropped its freshly-appended row). Same $$ pattern as the CI/
+  # usage cache writers below; the mv stays atomic either way.
+  printf '%s\n' "${hist_trimmed[@]}" > "${history_file}.tmp.$$" 2>/dev/null && mv -f "${history_file}.tmp.$$" "$history_file" 2>/dev/null
 fi
 
 current_cost_cents=0
@@ -955,44 +970,79 @@ if [ -n "$repo_owner" ] && [ -n "$repo_name" ]; then
 fi
 
 # 6. git branch; uses the ORIGINAL $dir, never the abbreviated display text.
-# --no-optional-locks keeps this read-only and fast. PERF: ONE git call
-# (`status --porcelain=v1 --branch`) replaces the old branch+status pair;
-# line 1 ("## <branch>[...<upstream>][...]" or "## HEAD (no branch)" or
-# "## No commits yet on <branch>") is parsed for the branch name, matching
-# `git branch --show-current`'s empty-on-detached-HEAD behavior; any
-# further line means the tree is dirty (same signal `head -c1` on
-# `status --porcelain` used to give). Branch name is always green; a dirty
-# "*" is appended as its own yellow token.
-# FAILURE SAFETY (confirmed, no change needed): branch/branch_plain are
-# already initialized empty just below, BEFORE this call - if the git
-# spawn itself fails (already stderr-silenced by 2>/dev/null; same
-# fork-exhaustion class of failure the jq guard above now handles),
+# --no-optional-locks keeps this read-only and fast. PERF: still ONE git
+# call (`status --porcelain=v2 --branch --show-stash`), now also carrying
+# the stash count for segment 6b. v2 output shape: header lines first
+# ("# branch.oid <sha|(initial)>", "# branch.head <name|(detached)>",
+# optional "# branch.upstream ..."/"# branch.ab ..."/"# stash <N>"), then
+# one non-"#" line per changed/untracked path. "# branch.head" gives the
+# BARE branch name - no "...upstream" decoration to strip, unlike the old
+# v1 "## " line - with "(detached)" mapping to empty (matching `git
+# branch --show-current`'s empty-on-detached-HEAD behavior) and unborn
+# branches ("No commits yet") still named normally. The first non-"#"
+# line means the tree is dirty (untracked included, same signal v1 gave);
+# headers always precede entry lines, so the parse loop breaks right
+# there and never walks the rest of a big dirty tree's entry list.
+# Branch name is always green; a dirty "*" is appended as its own yellow
+# token.
+# FAILURE SAFETY (confirmed, no change needed): branch/branch_plain/
+# stash_count are already initialized empty just below, BEFORE this call -
+# if the git spawn itself fails (already stderr-silenced by 2>/dev/null;
+# same fork-exhaustion class of failure the jq guard above now handles),
 # $git_status_out is simply empty, the `if` below is skipped entirely,
-# and branch/branch_plain stay at their empty defaults - the rest of the
-# script continues normally with the branch segment omitted, same as any
-# other optional segment whose data isn't available. Nothing here can
+# and they all stay at their empty defaults - the rest of the script
+# continues normally with the branch and stash segments omitted, same as
+# any other optional segment whose data isn't available. Nothing here can
 # abort the script.
 branch=""
 branch_plain=""
-git_status_out=$(git -C "$dir" --no-optional-locks status --porcelain=v1 --branch 2>/dev/null)
+stash_count=""
+git_status_out=$(git -C "$dir" --no-optional-locks status --porcelain=v2 --branch --show-stash 2>/dev/null)
 git_status_out=${git_status_out//$'\r'/}
 if [ -n "$git_status_out" ]; then
   mapfile -t git_status_lines <<< "$git_status_out"
-  git_head_line="${git_status_lines[0]}"
-  git_branch_info="${git_head_line#\#\# }"
-  case "$git_branch_info" in
-    "HEAD (no branch)"*) branch="" ;;
-    "No commits yet on "*) branch="${git_branch_info#No commits yet on }"; branch="${branch%%...*}" ;;
-    *) branch="${git_branch_info%%...*}" ;;
-  esac
+  git_dirty=0
+  for git_line in "${git_status_lines[@]}"; do
+    case "$git_line" in
+      "# branch.head (detached)") ;;
+      "# branch.head "*) branch="${git_line#"# branch.head "}" ;;
+      "# stash "*)
+        stash_count="${git_line#"# stash "}"
+        [[ "$stash_count" =~ ^[0-9]+$ ]] || stash_count=""
+        ;;
+      "#"*) ;;
+      ?*) git_dirty=1; break ;;
+    esac
+  done
   if [ -n "$branch" ]; then
     branch_plain="$branch"
     branch="${GREEN}${branch}${RESET}"
-    if [ "${#git_status_lines[@]}" -gt 1 ]; then
+    if [ "$git_dirty" -eq 1 ]; then
       branch="${branch}${YELLOW}*${RESET}"
       branch_plain="${branch_plain}*"
     fi
   fi
+fi
+
+# 6b. git stash count, riding the SAME single git call above
+# (--show-stash): gray "⚑" flag + count, count yellow normally and
+# bright red from 5 up (that many parked changes usually means forgotten
+# work). git only prints the "# stash <N>" header when at least one
+# stash entry exists (verified: no "# stash 0" line is ever emitted) and
+# only on git >=2.35 (older gits silently ignore --show-stash with
+# porcelain v2), so an empty stash_count already covers the zero-stash/
+# non-repo/old-git cases - the -gt 0 test below is belt-and-suspenders
+# for a hypothetical git that DID emit a zero line (stash_count is
+# regex-guarded numeric at parse time, so the arithmetic test is safe).
+# NOT part of the narrow-mode compact line, which keeps its documented
+# minimal segment set.
+stash_seg=""
+stash_plain=""
+if [ -n "$stash_count" ] && [ "$stash_count" -gt 0 ]; then
+  stash_color="$YELLOW"
+  [ "$stash_count" -ge 5 ] && stash_color="$RED_BRIGHT"
+  stash_seg="${GRAY}⚑${RESET}${stash_color}${stash_count}${RESET}"
+  stash_plain="⚑${stash_count}"
 fi
 
 # 7. PR info: "PR#N" is always magenta, wrapped in an OSC 8 hyperlink to
@@ -2080,6 +2130,7 @@ else
   [ -n "$wt_seg" ]       && { parts1+=("$wt_seg"); parts1_plain+=("$wt_plain"); }
   [ -n "$repo" ]         && { parts1+=("$repo"); parts1_plain+=("$repo_plain"); }
   [ -n "$branch" ]       && { parts1+=("$branch"); parts1_plain+=("$branch_plain"); }
+  [ -n "$stash_seg" ]    && { parts1+=("$stash_seg"); parts1_plain+=("$stash_plain"); }
   [ -n "$pr_seg" ]       && { parts1+=("$pr_seg"); parts1_plain+=("$pr_plain"); }
 
   # Line 2: context engine

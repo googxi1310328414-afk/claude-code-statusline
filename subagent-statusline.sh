@@ -114,11 +114,16 @@ export LC_ALL=C.UTF-8
 #   3  sparkline + burn rate, ONE combined segment (each half
 #      independently optional; both absent -> segment empty for this
 #      row), joined by a single space when both are present. Sparkline
-#      from .tokenSamples - defensively parsed (any failure or fewer than
-#      2 usable numeric samples -> omitted silently, never crashes the
-#      row). Numbers come from raw numeric entries or from an object
-#      entry's .tokens/.tokenCount/.count/.value/.v field; the last 8 are
-#      kept; if that subsequence is non-decreasing (a cumulative counter)
+#      PRIMARY source: this script's OWN 10s sampling of each task's
+#      cumulative tokenCount into a state file (see the block above
+#      PASS 1) - last 9 samples -> up to 8 bars, each spanning a KNOWN
+#      ~10s. FALLBACK (fewer than 2 own samples yet, e.g. a just-spawned
+#      task): .tokenSamples from the payload - defensively parsed (any
+#      failure or fewer than 2 usable numeric samples -> omitted
+#      silently, never crashes the row); numbers come from raw numeric
+#      entries or from an object entry's .tokens/.tokenCount/.count/
+#      .value/.v field; the last 8 are kept. Either way: if the sequence
+#      is non-decreasing (a cumulative counter)
 #      it's converted to consecutive deltas first; the result is
 #      normalized min..max onto 6 glyphs ▁▂▃▄▅▆ (all-equal -> all ▃) -
 #      capped at ▆, never ▇/█, so a full-height cell in one row can't
@@ -340,6 +345,43 @@ tokened_count="${JL[3]}"
 [[ "$total_tokens" =~ ^[0-9]+$ ]] || total_tokens=0
 [[ "$tokened_count" =~ ^[0-9]+$ ]] || tokened_count=0
 
+# ---------- own 10s token sampling (state file) ----------
+# The host's .tokenSamples cadence is undocumented and uncontrollable, so
+# each task's cumulative tokenCount is ALSO sampled here, at most one row
+# per task every 10s, into a small state file - giving every sparkline
+# bar a KNOWN ~10s span (the main script's history file does the same
+# for the session chart at a 20s step). Row shape: epoch/task_id/count,
+# 0x1F-separated like every other state file in this pair. Reads apply
+# strict whole-row validation (exactly 3 columns, numeric epoch/count -
+# malformed rows dropped whole, never partially trusted) plus a 6h
+# retention window (agent tasks live minutes-to-hours, not days); rows
+# outside it vanish for good at the next rewrite. Multiple concurrent
+# sessions share the file: task ids are globally unique so rows never
+# clash logically, and the rewrite (after PASS 1) goes through a per-PID
+# tmp + atomic mv, so a same-tick race is last-writer-wins with the
+# loser's newest sample simply re-taken ~10s later - no corruption, no
+# error spam. Fully guarded end to end: an unreadable/unwritable file
+# only costs the sparkline its preferred source, never the row.
+subagent_samples_file="${STATUSLINE_SUBAGENT_SAMPLES_FILE:-$HOME/.claude/statusline-subagent-samples.tsv}"
+printf -v samp_now '%(%s)T' -1
+declare -A samp_tokens_by_id samp_last_by_id
+samp_kept_lines=()
+samp_new_rows=0
+if [ -r "$subagent_samples_file" ]; then
+  mapfile -t samp_raw_lines < "$subagent_samples_file" 2>/dev/null
+  for samp_line in "${samp_raw_lines[@]}"; do
+    IFS=$'\x1f' read -r s_epoch s_id s_tok s_extra <<< "$samp_line"
+    [[ "$s_epoch" =~ ^[0-9]+$ ]] || continue
+    [ -n "$s_id" ] || continue
+    [[ "$s_tok" =~ ^[0-9]+$ ]] || continue
+    [ -n "$s_extra" ] && continue
+    [ $(( samp_now - s_epoch )) -gt 21600 ] && continue
+    samp_kept_lines+=("$samp_line")
+    samp_tokens_by_id[$s_id]="${samp_tokens_by_id[$s_id]:-} $s_tok"
+    samp_last_by_id[$s_id]="$s_epoch"
+  done
+fi
+
 # ---------- PASS 1: compute every row's 6 cells + track column maxima ----------
 ids=()
 descriptions=()
@@ -452,6 +494,21 @@ for ((ti=0; ti<task_count_total; ti++)); do
     fi
   fi
 
+  # Sample this task's cumulative tokenCount into the own-samples state
+  # (at most one row per task every 10s - see the state block above PASS
+  # 1). Taken BEFORE the sparkline below so a just-taken sample is part
+  # of this very render's chart, mirroring the main script's "reflect
+  # the just-appended row" behavior.
+  if [[ "$token_count" =~ ^[0-9]+$ ]]; then
+    samp_prev_epoch="${samp_last_by_id[$id]:-}"
+    if [ -z "$samp_prev_epoch" ] || [ $(( samp_now - samp_prev_epoch )) -ge 10 ]; then
+      samp_kept_lines+=("${samp_now}"$'\x1f'"${id}"$'\x1f'"${token_count}")
+      samp_tokens_by_id[$id]="${samp_tokens_by_id[$id]:-} $token_count"
+      samp_last_by_id[$id]="$samp_now"
+      samp_new_rows=1
+    fi
+  fi
+
   # column 3: sparkline + burn rate, ONE combined segment (each half
   # independently optional), matching the main script's token-rate layout.
   # PERF: the tokenSamples extraction, the >=2-usable-numbers check, and
@@ -473,6 +530,18 @@ for ((ti=0; ti<task_count_total; ti++)); do
   nums=()
   if [ "${#sfields[@]}" -ge 1 ] && [ "${sfields[0]}" = "S${ti}" ]; then
     nums=("${sfields[@]:1}")
+  fi
+  # PRIMARY sparkline source: the own 10s samples loaded above (>=2 for
+  # this task id; last 9 kept -> up to 8 bars of ~10s each). The host
+  # .tokenSamples parse above remains as the cold-start fallback so a
+  # just-spawned task can still chart before two own samples exist.
+  if [ -n "${samp_tokens_by_id[$id]:-}" ]; then
+    read -r -a samp_own_all <<< "${samp_tokens_by_id[$id]}"
+    samp_own_n=${#samp_own_all[@]}
+    if [ "$samp_own_n" -ge 2 ]; then
+      samp_own_start=$(( samp_own_n > 9 ? samp_own_n - 9 : 0 ))
+      nums=("${samp_own_all[@]:$samp_own_start}")
+    fi
   fi
   if [ "${#nums[@]}" -ge 1 ]; then
     n_ok=1
@@ -610,6 +679,18 @@ for ((ti=0; ti<task_count_total; ti++)); do
   [ "$dw3" -gt "${col_max[3]}" ] && col_max[3]=$dw3
   [ "$dw4" -gt "${col_max[4]}" ] && col_max[4]=$dw4
 done
+
+# Persist the own-samples state (only when this render actually took at
+# least one new sample). Retention was already applied at read time, so
+# the in-memory rows ARE the post-trim file; the count cap is a runaway
+# backstop only. Per-PID tmp + atomic mv, same pattern as every other
+# state writer in this pair; all failure modes silenced.
+if [ "$samp_new_rows" -eq 1 ]; then
+  samp_total=${#samp_kept_lines[@]}
+  [ "$samp_total" -gt 4000 ] && samp_kept_lines=("${samp_kept_lines[@]: -4000}")
+  printf '%s\n' "${samp_kept_lines[@]}" > "${subagent_samples_file}.tmp.$$" 2>/dev/null &&
+    mv -f "${subagent_samples_file}.tmp.$$" "$subagent_samples_file" 2>/dev/null
+fi
 
 # ---------- PASS 2: build the uniform description budget, pad, emit ----------
 # ALIGNMENT FIX: a column that's empty for EVERY row in this payload (e.g.

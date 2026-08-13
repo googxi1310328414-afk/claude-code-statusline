@@ -4,11 +4,11 @@
 
 ## 0. 前置检查
 
-1. 环境：bash ≥ 4（Windows 用 Git Bash），`jq`、`git` 可用；`locale charmap` 应为 UTF-8（否则多字节字符宽度计数会提前截断）。
+1. 环境：bash ≥ 4（Windows 用 Git Bash），`jq`、`git` 可用（git ≥2.35 才有 stash 段，更旧则该段自动消失）；`locale charmap` 应为 UTF-8（否则多字节字符宽度计数会提前截断）。
 2. 确认目标机器**主目录**，目录缩写逻辑用它，不要硬编码别人的路径。
 3. `date -d "@epoch"` 是 GNU 语法（Git Bash/Linux）；macOS/BSD 用 `date -r epoch`。
 4. **Windows 陷阱**：Windows 版 jq 输出 CRLF。`$(...)` 命令替换在 MSYS bash 会剥掉尾部 `\r`，**但 `mapfile`/`read` 逐行读不会**——凡逐行读 jq 输出，必须管过 `tr -d '\r'`，否则数值校验全部静默失败。
-5. 刷新机制：状态栏是**事件驱动**（会话状态变化时重跑脚本，约 300ms 防抖），无定时器。秒级时钟空闲时不走、"实时"效果只在模型活动期间成立——这是宿主行为，提前告知用户。
+5. 刷新机制：宿主**事件驱动**（新助手消息/compact/权限切换，约 300ms 防抖）+ `refreshInterval: N`（秒）常驻定时器（空闲也每 N 秒重跑脚本）。**新触发会取消进行中的渲染**——N 必须显著大于最坏渲染耗时，否则帧帧被杀、整栏空白（重负载下实锤过）。settings.json 是**内容**监听热重载（touch 无效），渲染循环挂死时改任意值保存即免重启复活。忙碌回合主栏画面冻结但调用照常，回合结束回正。
 6. 颜色一律基础 16 色 ANSI（30–37/90–97），bash ANSI-C quoting 常量（`GREEN=$'\e[32m'`），输出只用 `printf '%s\n'`（永不 `%b`）；每个着色 token 独立 reset。本文颜色记号：灰90、红31、绿32、黄33、蓝34、紫35、青36、白37、亮蓝94、亮紫95、亮青96、亮红91、亮白97。
 
 ## 1. 主状态栏（statusLine）
@@ -52,7 +52,7 @@
 
 > **权威规格说明**：下面的分段表描述核心形态；每段的最终权威细节（含后续增量：today/week 跨会话统计、`wk` 按模型周配额、`extra` 溢出、压缩计数 `↻`、缓存倒计时、80% 压缩线 `│`、`·t` 节奏游标及其变色覆盖）以参考实现 `statusline-command.sh` **头部注释**为准——实现时先通读那份头注。
 
-四行分组：**1 身份与位置**（时钟|模型|目录|worktree|仓库|分支|PR+CI）；**2 上下文引擎**（ctx 电池|走势+速率|cache 三件套|↻压缩）；**3 花费**（$+$/h|today|week|行数）；**4 限额与会话**（5h/7d 节奏游标|wk 模型配额|extra|»会话名）。每行独立拼装，段间分隔符为灰色 ` | `（前后 reset），行尾补一次 reset；**一行内无任何段时该行不打印**（第 1 行有时钟兜底恒在）。settings.json 的 statusLine 键配 `"refreshInterval": 2`（渲染实测 <1.3s，2 秒安全）。
+四行分组：**1 身份与位置**（时钟|模型|目录|worktree|仓库|分支|⚑stash|PR+CI）；**2 上下文引擎**（ctx 电池|走势+速率|cache 三件套|↻压缩）；**3 花费**（$+$/h|today|week|行数）；**4 限额与会话**（5h/7d 节奏游标|wk 模型配额|extra|»会话名）。每行独立拼装，段间分隔符为灰色 ` | `（前后 reset），行尾补一次 reset；**一行内无任何段时该行不打印**（第 1 行有时钟兜底恒在）。settings.json 的 statusLine 键配 `"refreshInterval": 10`、subagentStatusLine 配 `3`（渲染实测 0.4–1.3s；间隔必须显著大于最坏渲染耗时——新触发会取消在途渲染，见前置检查 5）。
 
 **第 1 行 · 身份与位置**
 1. 时钟：`date +%H:%M:%S`，亮白。
@@ -60,7 +60,8 @@
 3. 目录：显示副本三步变换——主目录前缀（大小写不敏感，反斜杠/正斜杠都匹配）→`~`；`/`→`\`；组件数>3 折叠为 `首\…\倒数第二\末尾`。末级组件亮蓝，其余（含所有 `\` 和 `…`）蓝；单组件整体亮蓝。**git 命令必须用原始未变换路径**。
 4. worktree：`.worktree.name` 存在才显示：灰`⎇ ` + 名称亮蓝 + （branch 存在时）灰`→` + 分支绿。
 5. 仓库：owner 与 name 都存在才显示：owner青 + `/`灰 + name亮青。
-6. 分支：`git -C "$dir" --no-optional-locks branch --show-current 2>/dev/null` 非空才显示，名称恒绿；脏检测（`status --porcelain | head -c1` 非空）追加独立黄`*`。
+6. 分支：与脏检测、stash 计数共用**同一次** `git -C "$dir" --no-optional-locks status --porcelain=v2 --branch --show-stash 2>/dev/null`：`# branch.head` 头行取名（无 upstream 修饰需剥；`(detached)`→空→整段消失；无提交仓库仍给名），首个非 `#` 开头行=脏（含未跟踪，追加独立黄`*`）——头行恒在实体行之前，见脏即 break，不遍历大脏树。名称恒绿。
+6b. stash：`# stash N` 头行（git ≥2.35 且 N≥1 才输出）驱动：灰`⚑` + 数量（黄，≥5 亮红）；0/非仓库/旧 git 整段消失；与分支段刻意独立（detached 仍显示）。
 7. PR：`.pr.number` 存在才显示：`PR#N` 紫；有 review_state 加空格+状态词（approved绿/changes_requested亮红/draft灰/其他黄）。
 
 **第 2 行 · 上下文引擎**
@@ -76,7 +77,7 @@
 
 ### 1.3 状态文件（走势/速率/花费速率的数据源）
 
-`~/.claude/statusline-history.tsv`，TSV 行：`epoch<TAB>session_id<TAB>tokens<TAB>cost`（tokens 记**占用**=输入+输出，主路径不可用时记 input-only；缺值存空串）。每次调用：同会话最后一行不存在或 ≥5 秒旧才追加；追加后 `tail -n 200` 到临时文件再 `mv` 截断。所有读取按会话过滤、要求恰好 4 列 + 逐列数值校验，损坏/并发行静默跳过；全部文件操作 `2>/dev/null` 包裹，文件不可写绝不能影响其余段。
+`~/.claude/statusline-history.tsv`，TSV 行：`epoch<TAB>session_id<TAB>tokens<TAB>cost`（tokens 记**占用**=输入+输出，主路径不可用时记 input-only；缺值存空串）。每次调用：同会话最后一行不存在或 ≥20 秒旧才追加（采样步长，与 refreshInterval 配比：走势每格≈20 秒变化量）；追加后到**带 `$$` 的临时文件**再 `mv` 截断（固定 tmp 名会让多会话并发裁剪互撞丢行，已实锤）。所有读取按会话过滤、要求恰好 4 列 + 逐列数值校验，损坏/并发行静默跳过；全部文件操作 `2>/dev/null` 包裹，文件不可写绝不能影响其余段。
 
 ## 2. 硬性要求（两个脚本通用）
 
@@ -100,8 +101,8 @@
 
 ```json
 {
-  "statusLine":         { "type": "command", "command": "bash ~/.claude/statusline-command.sh", "refreshInterval": 2 },
-  "subagentStatusLine": { "type": "command", "command": "bash ~/.claude/subagent-statusline.sh" }
+  "statusLine":         { "type": "command", "command": "bash ~/.claude/statusline-command.sh", "refreshInterval": 10 },
+  "subagentStatusLine": { "type": "command", "command": "bash ~/.claude/subagent-statusline.sh", "refreshInterval": 3 }
 }
 ```
 
@@ -117,14 +118,14 @@
 
 1. 身份：灰`▸ ` + name/label/type 三选一**亮紫**（区别于主行的亮青）+ 灰`(type)`（type 非空且≠身份文本时）+ 灰`·`+青·短模型名（**仅当该行模型 ≠ 面板多数模型**；短名=剥 `claude-` 前缀和 `-20`+6位日期后缀，预扫描 `group_by` 求多数）+ 灰`·`+热度色 effort（仅显式存在时；数字型预算值用黄）+ 空格+状态图标：`●`运行绿32 / `○`pending|queued|starting 黄 / `✗`failed|error|cancelled|killed 亮红 / `✓`completed|done|finished **绿**（不是灰——灰在深色主题上如同无色）/ `?`未知黄。
 2. 消耗：tokenCount 为数值即显示白`Nk` + 灰` tok`（**累计消耗**，不读 contextWindowSize、不做任何占用/百分比近似——tokenCount 是累计口径，画电池必然失真，用户明确宁精勿滥）。
-3. 走势+速率（一段，与主行第 9 段同构）：走势=tokenSamples 防御式解析（数字直接用；对象试 `.tokens//.tokenCount//.count//.value//.v`；<2 个数或解析失败→静默省略），取末 8 个，非递减序列先转相邻差值，归一到 8 档青色；速率=`tokenCount*60/(elapsed*100)` 十倍值（elapsed ≥60s 才显示），档色同主行。
+3. 走势+速率（一段，与主行第 9 段同构）：走势**主源**=脚本自建 10s 采样——`~/.claude/statusline-subagent-samples.tsv`（可用 `STATUSLINE_SUBAGENT_SAMPLES_FILE` 覆盖），0x1F 三列 `epoch␟task_id␟tokenCount`，每任务 ≥10s 才追加、读时 6h 窗+整行形状校验、`$$` 临时名原子重写（多会话共存安全），取末 ≤9 样本→≤8 格、**每格≈10s**；<2 个自建样本时回退 tokenSamples 防御式解析（数字直接用；对象试 `.tokens//.tokenCount//.count//.value//.v`；<2 个数或解析失败→静默省略，取末 8 个）。两种源同走：非递减序列先转相邻差值，归一到 ▁-▆ 六档（封顶防行间粘连）青色；速率=`tokenCount*60/(elapsed*100)` 十倍值（elapsed ≥60s 才显示），档色同主行。
 4. 份额：预扫描全 tasks 的 tokenCount 总和；有 token 的任务 ≥2 个才显示：灰`Σ` + `N%`（本行/总量，<50灰/50–74黄/≥75亮红）。
 5. 用时：秒级——`<60s`→`42s`、`<1h`→`5m12s`、否则`1h23m45s`，白；+灰`@HH:MM:SS`（启动时刻）。
 6. 描述：灰，宽度预算 = columns（缺省 120）−前五段纯文本长度（含 `▸ ` 与分隔符）−3；预算 <8 省略，超长截到预算−1 字符+`…`。
 
 ## 5. 验证（必须实际执行）
 
-**首选**：仓库根目录 `bash test.sh --assert` —— 17 项断言（四行结构、各新段存在性、列对齐、TSV 列序、空列裁剪、性能 <3s 门槛），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
+**首选**：仓库根目录 `bash test.sh --assert` —— 30 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、列对齐、TSV 列序、空列裁剪、性能 <3s 门槛），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
 
 主状态栏（`fixtures/` 三份 + 状态文件人工历史）：
 - **full.json**：三行齐全；电池 `ctx ███░░ 66% 70k/200k`（占用 69671=68471+1200→70k，非 68k！）；`cache 92%` 绿；`» my-session`。
@@ -142,4 +143,4 @@
 - **对齐**：多行输出剥掉全部转义后，所有 ` | ` 分隔符逐列竖向对齐（纯 ASCII 列必须精确对齐）；主状态栏三行同理。
 - **链接**：full.json 渲染输出中 `\e]8;;` 出现 4 次（仓库、PR 各一对开闭）。
 
-边界清单：remaining null、pr 无状态、单窗口限额、effort/thinking/repo/session_name 全缺、路径 3 层不折叠/4 层折叠、主目录=`~`、历史文件损坏行/不可写、tokenSamples 乱结构、startTime 毫秒与秒、19.6% 显示 20% 仍触发红档。
+边界清单：remaining null、pr 无状态、单窗口限额、effort/thinking/repo/session_name 全缺、路径 3 层不折叠/4 层折叠、主目录=`~`、历史文件损坏行/不可写、tokenSamples 乱结构、startTime 毫秒与秒、19.6% 显示 20% 仍触发红档、stash 0/非仓库/git<2.35 隐藏而 detached 仍显示（≥5 亮红）。
