@@ -90,11 +90,7 @@ export LC_ALL=C.UTF-8
 #      non-empty of name/label/type; identity absent -> the WHOLE segment
 #      is empty for this row, i.e. a padded blank column here unless it's
 #      also this row's trailing-absent point) + "(type)" in gray when
-#      .type is non-empty and differs from the chosen identity text + "·"
-#      + short model name (cyan 36) whenever .model is non-empty -
-#      UNCONDITIONAL by user request (was minority-vs-majority-only;
-#      the jq call still emits majority_model to keep the JL scalar
-#      indices stable, it just no longer gates this marker) + "·" +
+#      .type is non-empty and differs from the chosen identity text + "·" +
 #      effort (heat-colored: low
 #      gray / medium green / high yellow / xhigh bright magenta / max
 #      bright red / anything else incl. numeric budgets yellow) + " " + a
@@ -106,6 +102,14 @@ export LC_ALL=C.UTF-8
 #      name = id with a leading "claude-" and a trailing "-20"+6-digits
 #      date suffix both stripped (e.g. "claude-haiku-4-5-20251001" ->
 #      "haiku-4-5").
+#   1b model cell: the short model name (cyan; "claude-" prefix, a
+#      trailing "[1m]"-style capacity tag and the "-20"+date suffix all
+#      stripped) as its OWN standalone column right after identity -
+#      user request: not glued to the task name. Unconditional whenever
+#      .model is present; when no task in the payload has a model the
+#      whole column is dropped by the active-column pass. majority_model
+#      is still emitted by jq (JL scalar index stability) but no longer
+#      used for display at all.
 #   2  raw cumulative spend - unconditional whenever tokenCount is
 #      numeric: "<Nk>" white 37 + space + "tok" gray 90, e.g. "221k tok".
 #      (There is deliberately no context-window battery/percentage here
@@ -419,7 +423,8 @@ col1_c=(); col1_p=()   # raw spend
 col2_c=(); col2_p=()   # sparkline+rate
 col3_c=(); col3_p=()   # token share
 col4_c=(); col4_p=()   # elapsed
-col_max=(0 0 0 0 0)
+col5_c=(); col5_p=()   # model (standalone cell; rendered 2nd, see active_cols)
+col_max=(0 0 0 0 0 0)
 
 jl_count=${#JL[@]}
 task_count_total=$(( (jl_count - 4) / 2 ))
@@ -445,12 +450,6 @@ for ((ti=0; ti<task_count_total; ti++)); do
     if [ -n "$task_type" ] && [ "$task_type" != "$identity_plain" ]; then
       seg1_plain="${seg1_plain}(${task_type})"
       seg1="${seg1}${GRAY}(${task_type})${RESET}"
-    fi
-
-    if [ -n "$model" ]; then
-      short_model "$model"; model_short="$REPLY"
-      seg1_plain="${seg1_plain}·${model_short}"
-      seg1="${seg1}${GRAY}·${RESET}${CYAN}${model_short}${RESET}"
     fi
 
     if [ -n "$effort" ]; then
@@ -520,6 +519,20 @@ for ((ti=0; ti<task_count_total; ti++)); do
     if [ -n "$start_clock" ]; then
       elapsed_seg="${elapsed_seg}${GRAY}@${start_clock}${RESET}"
       elapsed_plain="${elapsed_plain}@${start_clock}"
+    fi
+  fi
+
+  # column 1b: model as its OWN standalone cell (user request - not glued
+  # to the task name; see header item 1b). Cyan short name, unconditional
+  # when present; the active-column pass drops the whole column when no
+  # task carries a model.
+  model_seg=""
+  model_plain=""
+  if [ -n "$model" ]; then
+    short_model "$model"; model_short="$REPLY"
+    if [ -n "$model_short" ]; then
+      model_seg="${CYAN}${model_short}${RESET}"
+      model_plain="$model_short"
     fi
   fi
 
@@ -697,6 +710,7 @@ for ((ti=0; ti<task_count_total; ti++)); do
   ids+=("$id")
   descriptions+=("$description")
   col0_c+=("$seg1");          col0_p+=("$seg1_plain")
+  col5_c+=("$model_seg");     col5_p+=("$model_plain")
   col1_c+=("$spend_seg");     col1_p+=("$spend_plain")
   col2_c+=("$sparkburn_seg"); col2_p+=("$sparkburn_plain")
   col3_c+=("$share_seg");     col3_p+=("$share_plain")
@@ -712,6 +726,8 @@ for ((ti=0; ti<task_count_total; ti++)); do
   [ "$dw2" -gt "${col_max[2]}" ] && col_max[2]=$dw2
   [ "$dw3" -gt "${col_max[3]}" ] && col_max[3]=$dw3
   [ "$dw4" -gt "${col_max[4]}" ] && col_max[4]=$dw4
+  disp_width "$model_plain"; dw5="$REPLY"
+  [ "$dw5" -gt "${col_max[5]}" ] && col_max[5]=$dw5
 done
 
 # Persist the own-samples state (only when this render actually took at
@@ -749,7 +765,10 @@ fi
 # no separator for it, on any row.
 active_cols=()
 active_col_width_sum=0
-for ci in 0 1 2 3 4; do
+# iteration order IS the display order: index 5 (the standalone model
+# cell) deliberately rides SECOND, between identity and spend, without
+# renumbering any existing column
+for ci in 0 5 1 2 3 4; do
   cw="${col_max[$ci]}"
   if [ "$cw" -gt 0 ]; then
     active_cols+=("$ci")
@@ -770,6 +789,7 @@ for ((r=0; r<row_total; r++)); do
   present2=0; [ -n "${col2_p[$r]}" ] && present2=1
   present3=0; [ -n "${col3_p[$r]}" ] && present3=1
   present4=0; [ -n "${col4_p[$r]}" ] && present4=1
+  present5=0; [ -n "${col5_p[$r]}" ] && present5=1
 
   # description - gray, cut to the UNIFORM budget computed above (same for
   # every row, since alignment pads columns 1-5 to the same widths
@@ -820,6 +840,7 @@ for ((r=0; r<row_total; r++)); do
       2) [ "$present2" -eq 1 ] && row_last_idx=$ai ;;
       3) [ "$present3" -eq 1 ] && row_last_idx=$ai ;;
       4) [ "$present4" -eq 1 ] && row_last_idx=$ai ;;
+      5) [ "$present5" -eq 1 ] && row_last_idx=$ai ;;
     esac
   done
   [ -n "$desc_seg" ] && row_last_idx=$active_col_count
@@ -838,6 +859,7 @@ for ((r=0; r<row_total; r++)); do
           2) cell_c="${col2_c[$r]}"; cell_p="${col2_p[$r]}" ;;
           3) cell_c="${col3_c[$r]}"; cell_p="${col3_p[$r]}" ;;
           4) cell_c="${col4_c[$r]}"; cell_p="${col4_p[$r]}" ;;
+          5) cell_c="${col5_c[$r]}"; cell_p="${col5_p[$r]}" ;;
         esac
         w="${col_max[$ci]}"
       else

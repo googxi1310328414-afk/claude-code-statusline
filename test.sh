@@ -150,10 +150,12 @@ if [ "$1" = "--assert" ]; then
   solo=$(jq -n --argjson now "$now" '{columns:120,tasks:[{id:"t1",label:"solo",status:"running",tokenCount:5000,startTime:(($now-120)*1000),description:"x"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
   printf '%s' "$solo" | grep -q '| |' && bad "solo row empty cell" || ok "solo row clean"
   printf '%s' "$solo" | grep -q 'Σ' && bad "solo row shows share" || ok "solo hides share"
-  # model marker is UNCONDITIONAL now: a solo task (its model IS the
-  # majority) must still show it, with the "[1m]" capacity tag stripped
+  # model is a STANDALONE cell now (not glued to the identity), always
+  # shown when present, with the "[1m]" capacity tag stripped
   modrow=$(jq -n --argjson now "$now" '{columns:120,tasks:[{id:"m1",label:"a",status:"running",tokenCount:5,model:"claude-fable-5[1m]",startTime:(($now-30)*1000),description:"d"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
-  printf '%s' "$modrow" | grep -q '·fable-5' && ! printf '%s' "$modrow" | grep -q '\[1m\]' && ok "model always shown, tag stripped" || bad "model marker wrong"
+  # NOTE: separators are NBSP-padded ("|" between NBSPs), so match the
+  # bare name; '·fable-5' absent proves it is NOT glued to the identity
+  printf '%s' "$modrow" | grep -q 'fable-5' && ! printf '%s' "$modrow" | grep -q '·fable-5' && ! printf '%s' "$modrow" | grep -q '\[1m\]' && ok "model standalone cell, tag stripped" || bad "model cell wrong"
 
   # own 10s trend state: the renders above created one row per tokened
   # task (3 from the panel payload + solo t1 + the model-marker probe m1)
