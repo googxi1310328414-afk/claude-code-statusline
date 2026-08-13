@@ -84,6 +84,9 @@
 4. git 全部 `--no-optional-locks` + stderr 静默；目录非法时整段静默消失。
 5. stdin 只读一次进变量，jq 取值用 `printf '%s' "$input" | jq -r`（不用 echo）。
 6. **逐行读 jq/awk 输出必须 `| tr -d '\r'`**（见前置检查 4）。
+7. 两脚本 shebang 后第一句 `export LC_ALL=C.UTF-8`——所有 `${#}` 长度、`${var:0:N}` 切片、正则类按**字符**而非字节算，对齐才成立。
+8. **列对齐**：每段维护无转义纯文本孪生串（颜色与 OSC 8 序列不计宽）。主状态栏三行按列索引取最大宽度补空格成网格（每行最后一格不垫）；子代理面板两遍法——第一遍算出所有行 5 个定位列的内容与宽度并取列最大值，第二遍统一垫宽后输出（缺中间列的行垫空格占位，尾部缺列丢弃；描述列共用统一预算 = columns − 各列最大宽及分隔符 − 15）。CJK 字符占两格的近似误差如实文档化。
+9. **OSC 8 超链接**（`\e]8;;URL\e\\文本\e]8;;\e\\`，零宽、不计入纯文本宽度）：PR 段的 `PR#N` 链到 `.pr.url`；仓库段整体链到 `https://<.workspace.repo.host // "github.com">/<owner>/<name>`；URL 含空白或 ESC 时放弃链接回退纯文本。
 
 ## 3. 安装
 
@@ -102,12 +105,12 @@
 
 ### 4.1 契约（与主状态栏不同！）
 
-每次刷新 stdin 收到**一个**JSON：`{"columns": <可用宽度>, "tasks": [<每个子代理一个对象>]}`。任务字段：`id`、`name`、`type`、`status`、`description`、`label`、`startTime`（Unix 时间戳，**可能是毫秒**：>10^12 则除以 1000）、`tokenCount`（**累计消耗**，可远超窗口！）、`model`、`contextWindowSize`（≥2.1.205）、`effort`（≥2.1.214，缺席=继承主会话）、`tokenSamples`（结构未文档化）。对 `.tasks[]` 每个元素向 stdout 输出一行紧凑 JSON `{"id":…,"content":…}`（`jq -cn --arg` 构造）；无 `id` 跳过（保持默认渲染）；tasks 空则无输出。
+每次刷新 stdin 收到**一个**JSON：`{"columns": <可用宽度>, "tasks": [<每个子代理一个对象>]}`。实测：只有常规 Agent 子代理（type=`local_agent`，身份在 `label` 字段、通常无 `name`）会出现；workflow/ultracode 编队渲染在 /workflows 专属 UI，不经过此钩子。任务字段：`id`、`name`、`type`、`status`、`description`、`label`、`startTime`（Unix 时间戳，**可能是毫秒**：>10^12 则除以 1000）、`tokenCount`（**累计消耗**，可远超窗口！）、`model`、`contextWindowSize`（≥2.1.205）、`effort`（≥2.1.214，缺席=继承主会话）、`tokenSamples`（结构未文档化）。对 `.tasks[]` 每个元素向 stdout 输出一行紧凑 JSON `{"id":…,"content":…}`（`jq -cn --arg` 构造）；无 `id` 跳过（保持默认渲染）；tasks 空则无输出。
 
 ### 4.2 行规格（6 段，同款分隔符/守卫）
 
 1. 身份：灰`▸ ` + name/label/type 三选一**亮紫**（区别于主行的亮青）+ 灰`(type)`（type 非空且≠身份文本时）+ 灰`·`+青·短模型名（**仅当该行模型 ≠ 面板多数模型**；短名=剥 `claude-` 前缀和 `-20`+6位日期后缀，预扫描 `group_by` 求多数）+ 灰`·`+热度色 effort（仅显式存在时；数字型预算值用黄）+ 空格+状态图标：`●`运行绿32 / `○`pending|queued|starting 黄 / `✗`failed|error|cancelled|killed 亮红 / `✓`completed|done|finished **绿**（不是灰——灰在深色主题上如同无色）/ `?`未知黄。
-2. 电池/消耗：window>0 且 `tokenCount ≤ window` → 与主行同款电池（占用近似）+`Xk/Yk`；`tokenCount > window` → **红满条 `█████` + 白`Nk` 灰` tok`**（累计消耗，无百分比、无`!`）；window 缺失但 tokenCount 有 → 白`Nk` 灰` tok`。
+2. 消耗：tokenCount 为数值即显示白`Nk` + 灰` tok`（**累计消耗**，不读 contextWindowSize、不做任何占用/百分比近似——tokenCount 是累计口径，画电池必然失真，用户明确宁精勿滥）。
 3. 走势+速率（一段，与主行第 9 段同构）：走势=tokenSamples 防御式解析（数字直接用；对象试 `.tokens//.tokenCount//.count//.value//.v`；<2 个数或解析失败→静默省略），取末 8 个，非递减序列先转相邻差值，归一到 8 档青色；速率=`tokenCount*60/(elapsed*100)` 十倍值（elapsed ≥60s 才显示），档色同主行。
 4. 份额：预扫描全 tasks 的 tokenCount 总和；有 token 的任务 ≥2 个才显示：灰`Σ` + `N%`（本行/总量，<50灰/50–74黄/≥75亮红）。
 5. 用时：秒级——`<60s`→`42s`、`<1h`→`5m12s`、否则`1h23m45s`，白；+灰`@HH:MM:SS`（启动时刻）。
@@ -124,9 +127,11 @@
 - 干净/脏 git 仓库两态：绿 `main` / 绿 `main`+黄`*`。
 
 子代理行（`fixtures/subagent-tasks.json`，4 任务应输出 3 行有效 JSON）：
-- t1：`▸ code-reviewer(general)·max ●`（紫/灰/亮红/绿）、电池 66%、走势`▄█▁▁`+速率、`Σ`份额、秒级用时`@HH:MM:SS`、描述截断。
-- t2：无窗口→`12k tok`；`✓` **绿**；分钟级速率 `131/m`。
-- t3：label 兜底 + `·haiku-4-5` 青（少数派）+ `·50000` 黄 + `✗` 亮红；把 tokenCount 改 447000（>窗口）→ `█████ 447k tok`；对象形态 tokenSamples 走势正常。
+- t1：`▸ code-reviewer(general)·max ●`（紫/灰/亮红/绿）、`68k tok`、走势`▄█▁▁`+速率、`Σ`份额、秒级用时`@HH:MM:SS`、描述截断。
+- t2：`12k tok`；`✓` **绿**；分钟级速率 `131/m`。
+- t3：label 兜底 + `·haiku-4-5` 青（少数派）+ `·50000` 黄 + `✗` 亮红 + `185k tok`；对象形态 tokenSamples 走势正常。
 - 无 id 任务不产生输出行。
+- **对齐**：多行输出剥掉全部转义后，所有 ` | ` 分隔符逐列竖向对齐（纯 ASCII 列必须精确对齐）；主状态栏三行同理。
+- **链接**：full.json 渲染输出中 `\e]8;;` 出现 4 次（仓库、PR 各一对开闭）。
 
 边界清单：remaining null、pr 无状态、单窗口限额、effort/thinking/repo/session_name 全缺、路径 3 层不折叠/4 层折叠、主目录=`~`、历史文件损坏行/不可写、tokenSamples 乱结构、startTime 毫秒与秒、19.6% 显示 20% 仍触发红档。

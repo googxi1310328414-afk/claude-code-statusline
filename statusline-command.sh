@@ -1,13 +1,27 @@
 #!/bin/bash
-# Claude Code status line (detailed layout, ANSI colors, THREE printed lines)
+# Force a UTF-8 locale: this environment's LANG is empty (POSIX/C locale),
+# under which bash's ${#var}, ${var:0:N}, and =~ character classes are all
+# BYTE-based, silently over-counting every multibyte glyph used below
+# (▸ ● ✓ ✗ · █ ░ ▁-█ … ⎇ » Σ →) and throwing off column alignment. Must be
+# set before any string measurement happens (i.e. before every other line
+# in this script).
+export LC_ALL=C.UTF-8
+# Claude Code status line (detailed layout, ANSI colors, THREE printed
+# lines, column-aligned)
 # Reads the JSON payload once from stdin and prints up to three lines to
 # stdout (Claude Code renders each printed line as its own status-line row;
-# ANSI colors work on every line). Each line is assembled independently -
-# same separators/colors/per-segment omission rules regardless of line -
-# with its own trailing RESET. Line 1 always has at least the clock, so it
-# always prints; lines 2 and 3 are skipped ENTIRELY (no blank line) when
-# every one of their segments is absent - e.g. a fresh minimal session can
-# render as just line 1 + a short line 3, with no line 2 at all.
+# ANSI colors and OSC 8 hyperlinks work on every line). Each line is
+# assembled independently - same colors/per-segment omission rules
+# regardless of line - with its own trailing RESET. Line 1 always has at
+# least the clock, so it always prints; lines 2 and 3 are skipped ENTIRELY
+# (no blank line) when every one of their segments is absent - e.g. a
+# fresh minimal session can render as just line 1 + a short line 3, with
+# no line 2 at all. The " | " separators are COLUMN-ALIGNED across all
+# three lines: every segment tracks a parallel plain-text twin (no ANSI,
+# no OSC 8 - hyperlinks and colors are zero-width and never factor into
+# alignment) purely for width measurement; see the render_line()/
+# col_widths block near the bottom for the actual padding logic, and its
+# comment for the CJK-width caveat.
 #
 # LINE 1 (identity/location), joined with " | ":
 #   1  clock time HH:MM:SS (not from stdin; only advances on refresh)  - bright white
@@ -17,11 +31,15 @@
 #      component bright blue, everything before it (incl. backslashes) blue
 #   4  worktree (only in --worktree sessions): "⎇" gray + name bright blue,
 #      "→"+branch (gray arrow, green branch) appended when branch is known
-#   5  repo identity: owner cyan, "/" gray, name bright cyan
+#   5  repo identity: owner cyan, "/" gray, name bright cyan; the whole
+#      colored construct is an OSC 8 hyperlink to
+#      https://<host>/<owner>/<name> (host defaults to "github.com")
 #   6  git branch: name always green; trailing "*" when dirty is its own
 #      yellow token
-#   7  PR: "PR#N" magenta; review state (if any) keeps its dynamic color
-#      (approved green / changes_requested bright red / draft gray / other yellow)
+#   7  PR: "PR#N" magenta, an OSC 8 hyperlink to .pr.url when present
+#      (plain text otherwise); review state (if any) stays outside the
+#      link and keeps its own dynamic color (approved green /
+#      changes_requested bright red / draft gray / other yellow)
 #
 # LINE 2 (context engine), joined with " | ":
 #   8  context battery, always led by a gray "ctx" label + space (so it
@@ -64,8 +82,9 @@
 #   11 session cost: "$" uncolored (plain default foreground, like the "/" in
 #      lines changed), amount dynamic (<$1 gray / $1-4 yellow / >=$5 bright
 #      red); optionally followed by a space and a history-derived cost rate
-#      "$X.Y/h" (own dynamic color by whole dollars/hour: <1 gray / 1-4
-#      yellow / >=5 bright red)
+#      "$X.Y/h" whose "$" is ALSO uncolored (bare, matching the amount's),
+#      with only "X.Y/h" itself in its own dynamic color by whole
+#      dollars/hour: <1 gray / 1-4 yellow / >=5 bright red
 #   12 lines changed +added/-removed                        - "+" green / "/" uncolored / "-" red
 #   13 rate limits: "5h"/"7d" label fixed cyan, "N%" dynamic per window (<50
 #      green / 50-79 yellow / >=80 bright red), "→reset" white
@@ -105,6 +124,13 @@ CYAN_BRIGHT=$'\e[96m'
 RED_BRIGHT=$'\e[91m'
 MAGENTA_BRIGHT=$'\e[95m'
 WHITE_BRIGHT=$'\e[97m'
+
+# OSC 8 terminal hyperlinks (experimental - terminals without support just
+# render the plain colored text, which is fine). A link is
+# OSC_OPEN + url + OSC_CLOSE + <visible text, with its own color codes
+# inside as usual> + OSC_OPEN + OSC_CLOSE (an empty-URL open ends the link).
+OSC_OPEN=$'\e]8;;'
+OSC_CLOSE=$'\e\\'
 
 input=$(cat)
 jqr() { printf '%s' "$input" | jq -r "$1"; }
@@ -208,6 +234,7 @@ fmt_k_or_m() {
 
 # 1. clock (not from stdin) - bright white
 clock=$(date +%H:%M:%S)
+clock_plain="$clock"
 [ -n "$clock" ] && clock="${WHITE_BRIGHT}${clock}${RESET}"
 
 # 2. model + effort + thinking markers, each part colored individually:
@@ -219,7 +246,11 @@ model=$(jqr '.model.display_name // empty')
 effort=$(jqr '.effort.level // empty')
 thinking=$(jqr 'if .thinking.enabled == true then "think" else empty end')
 model_seg=""
-[ -n "$model" ] && model_seg="${CYAN_BRIGHT}${model}${RESET}"
+model_plain=""
+if [ -n "$model" ]; then
+  model_seg="${CYAN_BRIGHT}${model}${RESET}"
+  model_plain="$model"
+fi
 if [ -n "$effort" ]; then
   case "$effort" in
     low) effort_color="$GRAY" ;;
@@ -230,9 +261,11 @@ if [ -n "$effort" ]; then
     *) effort_color="$YELLOW" ;;
   esac
   model_seg="${model_seg}${GRAY}·${RESET}${effort_color}${effort}${RESET}"
+  model_plain="${model_plain}·${effort}"
 fi
 if [ -n "$thinking" ]; then
   model_seg="${model_seg}${GRAY}·${RESET}${MAGENTA}${thinking}${RESET}"
+  model_plain="${model_plain}·${thinking}"
 fi
 
 # 3. current directory, abbreviated for display (the original $dir is kept
@@ -255,6 +288,7 @@ comp_count=${#dir_comps[@]}
 if [ "$comp_count" -gt 3 ]; then
   dir_display="${dir_comps[0]}\\…\\${dir_comps[$((comp_count-2))]}\\${dir_comps[$((comp_count-1))]}"
 fi
+dir_plain="$dir_display"
 if [ -n "$dir_display" ]; then
   IFS='\' read -ra dir_final_comps <<< "$dir_display"
   dfc=${#dir_final_comps[@]}
@@ -278,17 +312,32 @@ fi
 wt_name=$(jqr '.worktree.name // empty')
 wt_branch=$(jqr '.worktree.branch // empty')
 wt_seg=""
+wt_plain=""
 if [ -n "$wt_name" ]; then
   wt_seg="${GRAY}⎇${RESET} ${BLUE_BRIGHT}${wt_name}${RESET}"
-  [ -n "$wt_branch" ] && wt_seg="${wt_seg}${GRAY}→${RESET}${GREEN}${wt_branch}${RESET}"
+  wt_plain="⎇ ${wt_name}"
+  if [ -n "$wt_branch" ]; then
+    wt_seg="${wt_seg}${GRAY}→${RESET}${GREEN}${wt_branch}${RESET}"
+    wt_plain="${wt_plain}→${wt_branch}"
+  fi
 fi
 
-# 5. repo identity: owner cyan, "/" gray, name bright cyan
+# 5. repo identity: owner cyan, "/" gray, name bright cyan; the whole
+# colored construct is wrapped in an OSC 8 hyperlink to
+# https://<host>/<owner>/<name> (host defaults to github.com), unless the
+# built URL fails the whitespace/ESC paranoia guard.
 repo_owner=$(jqr '.workspace.repo.owner // empty')
 repo_name=$(jqr '.workspace.repo.name // empty')
+repo_host=$(jqr '.workspace.repo.host // "github.com"')
 repo=""
+repo_plain=""
 if [ -n "$repo_owner" ] && [ -n "$repo_name" ]; then
   repo="${CYAN}${repo_owner}${RESET}${GRAY}/${RESET}${CYAN_BRIGHT}${repo_name}${RESET}"
+  repo_plain="${repo_owner}/${repo_name}"
+  repo_url="https://${repo_host}/${repo_owner}/${repo_name}"
+  if [[ "$repo_url" != *[[:space:]]* ]] && [[ "$repo_url" != *$'\e'* ]]; then
+    repo="${OSC_OPEN}${repo_url}${OSC_CLOSE}${repo}${OSC_OPEN}${OSC_CLOSE}"
+  fi
 fi
 
 # 6. git branch; uses the ORIGINAL $dir, never the abbreviated display text.
@@ -297,20 +346,35 @@ fi
 # as soon as porcelain output proves the tree dirty.
 # Branch name is always green; a dirty "*" is appended as its own yellow token.
 branch=$(git -C "$dir" --no-optional-locks branch --show-current 2>/dev/null)
+branch_plain=""
 if [ -n "$branch" ]; then
   dirty=$(git -C "$dir" --no-optional-locks status --porcelain 2>/dev/null | head -c1)
+  branch_plain="$branch"
   branch="${GREEN}${branch}${RESET}"
-  [ -n "$dirty" ] && branch="${branch}${YELLOW}*${RESET}"
+  if [ -n "$dirty" ]; then
+    branch="${branch}${YELLOW}*${RESET}"
+    branch_plain="${branch_plain}*"
+  fi
 fi
 
-# 7. PR info: "PR#N" is always magenta; the review state (when present) keeps
-# its own dynamic color: approved green, changes_requested bright red, draft
-# gray, pending or any other value yellow. No state -> just the magenta PR#N.
+# 7. PR info: "PR#N" is always magenta, wrapped in an OSC 8 hyperlink to
+# .pr.url when that's non-empty and passes the whitespace/ESC paranoia
+# guard (plain colored text otherwise); the review state (when present)
+# stays OUTSIDE the link and keeps its own dynamic color: approved green,
+# changes_requested bright red, draft gray, pending or any other value
+# yellow. No state -> just the (possibly linked) magenta PR#N.
 pr_number=$(jqr '.pr.number // empty')
 pr_state=$(jqr '.pr.review_state // empty')
+pr_url=$(jqr '.pr.url // empty')
 pr_seg=""
+pr_plain=""
 if [ -n "$pr_number" ]; then
-  pr_seg="${MAGENTA}PR#${pr_number}${RESET}"
+  pr_num_seg="${MAGENTA}PR#${pr_number}${RESET}"
+  pr_plain="PR#${pr_number}"
+  if [ -n "$pr_url" ] && [[ "$pr_url" != *[[:space:]]* ]] && [[ "$pr_url" != *$'\e'* ]]; then
+    pr_num_seg="${OSC_OPEN}${pr_url}${OSC_CLOSE}${pr_num_seg}${OSC_OPEN}${OSC_CLOSE}"
+  fi
+  pr_seg="$pr_num_seg"
   if [ -n "$pr_state" ]; then
     case "$pr_state" in
       approved) pr_color="$GREEN" ;;
@@ -319,6 +383,7 @@ if [ -n "$pr_number" ]; then
       *) pr_color="$YELLOW" ;;
     esac
     pr_seg="${pr_seg} ${pr_color}${pr_state}${RESET}"
+    pr_plain="${pr_plain} ${pr_state}"
   fi
 fi
 
@@ -336,6 +401,7 @@ in_tokens=$(jqr '.context_window.total_input_tokens // empty')
 win_size=$(jqr '.context_window.context_window_size // empty')
 out_tokens_ctx=$(jqr '.context_window.total_output_tokens // empty')
 ctx_seg=""
+ctx_plain=""
 if [[ "$in_tokens" =~ ^[0-9]+$ ]] && [ "$in_tokens" -gt 0 ] && [[ "$win_size" =~ ^[0-9]+$ ]] && [ "$win_size" -gt 0 ]; then
   # PRIMARY: actual occupancy (input + this response's output), not the
   # input-only remaining_percentage field.
@@ -368,11 +434,17 @@ if [[ "$in_tokens" =~ ^[0-9]+$ ]] && [ "$in_tokens" -gt 0 ] && [[ "$win_size" =~
   done
   bar="${ctx_color}${bar_filled}${RESET}${GRAY}${bar_empty}${RESET}"
   ctx_seg="${GRAY}ctx${RESET} "
-  [ -n "$ctx_warn" ] && ctx_seg="${ctx_seg}${RED_BRIGHT}!${RESET}"
+  ctx_plain="ctx "
+  if [ -n "$ctx_warn" ]; then
+    ctx_seg="${ctx_seg}${RED_BRIGHT}!${RESET}"
+    ctx_plain="${ctx_plain}!"
+  fi
   ctx_seg="${ctx_seg}${bar} ${ctx_color}${ctx_remaining}%${RESET}"
+  ctx_plain="${ctx_plain}${bar_filled}${bar_empty} ${ctx_remaining}%"
   occ_fmt=$(fmt_k_or_m "$occupied")
   total_fmt=$(fmt_k_or_m "$win_size")
   ctx_seg="${ctx_seg} ${WHITE}${occ_fmt}${RESET}${GRAY}/${total_fmt}${RESET}"
+  ctx_plain="${ctx_plain} ${occ_fmt}/${total_fmt}"
 elif [ -n "$remaining" ]; then
   # FALLBACK: token fields unavailable, drive everything off the
   # (input-only) remaining_percentage field instead, no token text.
@@ -402,8 +474,14 @@ elif [ -n "$remaining" ]; then
   done
   bar="${ctx_color}${bar_filled}${RESET}${GRAY}${bar_empty}${RESET}"
   ctx_seg="${GRAY}ctx${RESET} "
-  [ -n "$ctx_warn" ] && ctx_seg="${ctx_seg}${RED_BRIGHT}!${RESET}"
-  ctx_seg="${ctx_seg}${bar} ${ctx_color}$(printf '%.0f' "$remaining")%${RESET}"
+  ctx_plain="ctx "
+  if [ -n "$ctx_warn" ]; then
+    ctx_seg="${ctx_seg}${RED_BRIGHT}!${RESET}"
+    ctx_plain="${ctx_plain}!"
+  fi
+  remaining_disp=$(printf '%.0f' "$remaining")
+  ctx_seg="${ctx_seg}${bar} ${ctx_color}${remaining_disp}%${RESET}"
+  ctx_plain="${ctx_plain}${bar_filled}${bar_empty} ${remaining_disp}%"
 fi
 
 # 9. token rate + sparkline, from the history file above (needs >=2
@@ -518,6 +596,7 @@ cache_r=$(jqr '.context_window.current_usage.cache_read_input_tokens // empty')
 cache_w=$(jqr '.context_window.current_usage.cache_creation_input_tokens // empty')
 cache_i=$(jqr '.context_window.current_usage.input_tokens // empty')
 cache_seg=""
+cache_plain=""
 if [[ "$cache_r" =~ ^[0-9]+$ ]] && [[ "$cache_w" =~ ^[0-9]+$ ]] && [[ "$cache_i" =~ ^[0-9]+$ ]]; then
   cache_denom=$(( cache_i + cache_w + cache_r ))
   if [ "$cache_denom" -gt 0 ]; then
@@ -530,6 +609,7 @@ if [[ "$cache_r" =~ ^[0-9]+$ ]] && [[ "$cache_w" =~ ^[0-9]+$ ]] && [[ "$cache_i"
       cache_color="$RED_BRIGHT"
     fi
     cache_seg="${GRAY}cache${RESET} ${cache_color}${cache_hit}%${RESET}"
+    cache_plain="cache ${cache_hit}%"
   fi
 fi
 
@@ -542,6 +622,7 @@ fi
 # parsed to integer cents in pure bash - see cost_to_cents above).
 cost=$(jqr '.cost.total_cost_usd // empty')
 cost_seg=""
+cost_plain=""
 if [ -n "$cost" ]; then
   cost_int="${cost%%.*}"
   cost_color="$GRAY"
@@ -554,8 +635,10 @@ if [ -n "$cost" ]; then
   fi
   cost_amount=$(printf '%.2f' "$cost")
   cost_seg="\$${cost_color}${cost_amount}${RESET}"
+  cost_plain="\$${cost_amount}"
 
   costrate_seg=""
+  costrate_plain=""
   cost_hist_count=${#cost_values[@]}
   if [ "$cost_hist_count" -ge 2 ]; then
     newest_cost=${cost_values[$((cost_hist_count-1))]}
@@ -587,12 +670,16 @@ if [ -n "$cost" ]; then
           else
             costrate_color="$GRAY"
           fi
-          costrate_seg="${costrate_color}\$${cph_x}.${cph_y}/h${RESET}"
+          costrate_seg="\$${costrate_color}${cph_x}.${cph_y}/h${RESET}"
+          costrate_plain="\$${cph_x}.${cph_y}/h"
         fi
       fi
     fi
   fi
-  [ -n "$costrate_seg" ] && cost_seg="${cost_seg} ${costrate_seg}"
+  if [ -n "$costrate_seg" ]; then
+    cost_seg="${cost_seg} ${costrate_seg}"
+    cost_plain="${cost_plain} ${costrate_plain}"
+  fi
 fi
 
 # 12. lines changed (shown once either field is present; missing side defaults
@@ -600,10 +687,12 @@ fi
 added=$(jqr '.cost.total_lines_added // empty')
 removed=$(jqr '.cost.total_lines_removed // empty')
 lines_seg=""
+lines_plain=""
 if [ -n "$added" ] || [ -n "$removed" ]; then
   [ -z "$added" ] && added=0
   [ -z "$removed" ] && removed=0
   lines_seg="${GREEN}+${added}${RESET}/${RED}-${removed}${RESET}"
+  lines_plain="+${added}/-${removed}"
 fi
 
 # 13. rate limits (each window independently optional, each with an optional
@@ -617,6 +706,7 @@ five_reset=$(jqr '.rate_limits.five_hour.resets_at // empty')
 week=$(jqr '.rate_limits.seven_day.used_percentage // empty')
 week_reset=$(jqr '.rate_limits.seven_day.resets_at // empty')
 rl_seg=""
+rl_plain=""
 if [ -n "$five" ]; then
   five_int="${five%%.*}"
   five_color="$GREEN"
@@ -627,9 +717,16 @@ if [ -n "$five" ]; then
       five_color="$YELLOW"
     fi
   fi
-  five_part="${CYAN}5h${RESET} ${five_color}$(printf '%.0f' "$five")%${RESET}"
-  [[ "$five_reset" =~ ^[0-9]+$ ]] && five_part="${five_part}${WHITE}→$(date -d "@$five_reset" +%H:%M)${RESET}"
+  five_pct=$(printf '%.0f' "$five")
+  five_part="${CYAN}5h${RESET} ${five_color}${five_pct}%${RESET}"
+  five_part_plain="5h ${five_pct}%"
+  if [[ "$five_reset" =~ ^[0-9]+$ ]]; then
+    five_clock=$(date -d "@$five_reset" +%H:%M)
+    five_part="${five_part}${WHITE}→${five_clock}${RESET}"
+    five_part_plain="${five_part_plain}→${five_clock}"
+  fi
   rl_seg="$five_part"
+  rl_plain="$five_part_plain"
 fi
 if [ -n "$week" ]; then
   week_int="${week%%.*}"
@@ -641,12 +738,20 @@ if [ -n "$week" ]; then
       week_color="$YELLOW"
     fi
   fi
-  week_part="${CYAN}7d${RESET} ${week_color}$(printf '%.0f' "$week")%${RESET}"
-  [[ "$week_reset" =~ ^[0-9]+$ ]] && week_part="${week_part}${WHITE}→$(date -d "@$week_reset" +%m-%d)${RESET}"
+  week_pct=$(printf '%.0f' "$week")
+  week_part="${CYAN}7d${RESET} ${week_color}${week_pct}%${RESET}"
+  week_part_plain="7d ${week_pct}%"
+  if [[ "$week_reset" =~ ^[0-9]+$ ]]; then
+    week_clock=$(date -d "@$week_reset" +%m-%d)
+    week_part="${week_part}${WHITE}→${week_clock}${RESET}"
+    week_part_plain="${week_part_plain}→${week_clock}"
+  fi
   if [ -n "$rl_seg" ]; then
     rl_seg="${rl_seg} ${week_part}"
+    rl_plain="${rl_plain} ${week_part_plain}"
   else
     rl_seg="$week_part"
+    rl_plain="$week_part_plain"
   fi
 fi
 
@@ -654,60 +759,105 @@ fi
 # same gray span) so the AI-generated name doesn't read like a bare stray
 # system message at the end of the line.
 session_name=$(jqr '.session_name // empty')
-[ -n "$session_name" ] && session_name="${GRAY}» ${session_name}${RESET}"
+session_name_plain=""
+if [ -n "$session_name" ]; then
+  session_name_plain="» ${session_name}"
+  session_name="${GRAY}» ${session_name}${RESET}"
+fi
 
-# Three thematic lines, each assembled independently with the same gray
-# " | " separator and its own trailing RESET. Line 1 always has at least
-# the clock, so it always prints; lines 2 and 3 are skipped entirely (no
-# blank line) when every one of their segments is absent.
+# Three thematic lines, each assembled independently - Line 1 always has
+# at least the clock, so it always prints; lines 2 and 3 are skipped
+# entirely (no blank line) when every one of their segments is absent -
+# but the " | " separators are aligned into columns ACROSS all three
+# lines: for column index i, the padding width is the widest PLAIN-TEXT
+# (no ANSI/OSC 8) cell among whichever lines have a cell at i; a line's
+# last cell is never padded (no trailing spaces). This uses the
+# parts*_plain arrays built alongside every colored segment above (OSC 8
+# sequences and color codes are never part of those plain strings, so
+# hyperlinks/colors can't skew alignment). Recomputed fresh every refresh.
+# Caveat: plain length is a bash CHARACTER count, not a terminal cell
+# count - CJK glyphs (e.g. in session_name) occupy two terminal cells, so
+# a column containing CJK text would align only approximately; none of
+# this script's non-last-cell segments are expected to contain CJK text
+# in practice (session_name is always the last cell on line 3 anyway, so
+# it is never padded regardless).
 SEP="${RESET}${GRAY} | ${RESET}"
 
 # Line 1: identity/location
 parts1=()
-[ -n "$clock" ]        && parts1+=("$clock")
-[ -n "$model_seg" ]    && parts1+=("$model_seg")
-[ -n "$dir_display" ]  && parts1+=("$dir_display")
-[ -n "$wt_seg" ]       && parts1+=("$wt_seg")
-[ -n "$repo" ]         && parts1+=("$repo")
-[ -n "$branch" ]       && parts1+=("$branch")
-[ -n "$pr_seg" ]       && parts1+=("$pr_seg")
-line1=""
-for part in "${parts1[@]}"; do
-  if [ -z "$line1" ]; then
-    line1="$part"
-  else
-    line1="${line1}${SEP}${part}"
-  fi
-done
+parts1_plain=()
+[ -n "$clock" ]        && { parts1+=("$clock"); parts1_plain+=("$clock_plain"); }
+[ -n "$model_seg" ]    && { parts1+=("$model_seg"); parts1_plain+=("$model_plain"); }
+[ -n "$dir_display" ]  && { parts1+=("$dir_display"); parts1_plain+=("$dir_plain"); }
+[ -n "$wt_seg" ]       && { parts1+=("$wt_seg"); parts1_plain+=("$wt_plain"); }
+[ -n "$repo" ]         && { parts1+=("$repo"); parts1_plain+=("$repo_plain"); }
+[ -n "$branch" ]       && { parts1+=("$branch"); parts1_plain+=("$branch_plain"); }
+[ -n "$pr_seg" ]       && { parts1+=("$pr_seg"); parts1_plain+=("$pr_plain"); }
 
 # Line 2: context engine
 parts2=()
-[ -n "$ctx_seg" ]     && parts2+=("$ctx_seg")
-[ -n "$tokrate_seg" ] && parts2+=("$tokrate_seg")
-[ -n "$cache_seg" ]   && parts2+=("$cache_seg")
-line2=""
-for part in "${parts2[@]}"; do
-  if [ -z "$line2" ]; then
-    line2="$part"
-  else
-    line2="${line2}${SEP}${part}"
-  fi
-done
+parts2_plain=()
+[ -n "$ctx_seg" ]     && { parts2+=("$ctx_seg"); parts2_plain+=("$ctx_plain"); }
+[ -n "$tokrate_seg" ] && { parts2+=("$tokrate_seg"); parts2_plain+=("$tokrate_plain"); }
+[ -n "$cache_seg" ]   && { parts2+=("$cache_seg"); parts2_plain+=("$cache_plain"); }
 
 # Line 3: spend/quota
 parts3=()
-[ -n "$cost_seg" ]     && parts3+=("$cost_seg")
-[ -n "$lines_seg" ]    && parts3+=("$lines_seg")
-[ -n "$rl_seg" ]       && parts3+=("$rl_seg")
-[ -n "$session_name" ] && parts3+=("$session_name")
-line3=""
-for part in "${parts3[@]}"; do
-  if [ -z "$line3" ]; then
-    line3="$part"
-  else
-    line3="${line3}${SEP}${part}"
+parts3_plain=()
+[ -n "$cost_seg" ]     && { parts3+=("$cost_seg"); parts3_plain+=("$cost_plain"); }
+[ -n "$lines_seg" ]    && { parts3+=("$lines_seg"); parts3_plain+=("$lines_plain"); }
+[ -n "$rl_seg" ]       && { parts3+=("$rl_seg"); parts3_plain+=("$rl_plain"); }
+[ -n "$session_name" ] && { parts3+=("$session_name"); parts3_plain+=("$session_name_plain"); }
+
+max_cols=${#parts1[@]}
+[ "${#parts2[@]}" -gt "$max_cols" ] && max_cols=${#parts2[@]}
+[ "${#parts3[@]}" -gt "$max_cols" ] && max_cols=${#parts3[@]}
+
+col_widths=()
+for ((ci=0; ci<max_cols; ci++)); do
+  w=0
+  if [ "$ci" -lt "${#parts1_plain[@]}" ]; then
+    l=${#parts1_plain[$ci]}
+    [ "$l" -gt "$w" ] && w=$l
   fi
+  if [ "$ci" -lt "${#parts2_plain[@]}" ]; then
+    l=${#parts2_plain[$ci]}
+    [ "$l" -gt "$w" ] && w=$l
+  fi
+  if [ "$ci" -lt "${#parts3_plain[@]}" ]; then
+    l=${#parts3_plain[$ci]}
+    [ "$l" -gt "$w" ] && w=$l
+  fi
+  col_widths+=("$w")
 done
+
+# Renders one line: $1/$2 are the NAMES of its colored/plain arrays
+# (nameref, bash 4.3+). Every cell but the last is right-padded with
+# spaces to col_widths[i] before the separator; the last cell is bare.
+render_line() {
+  local -n cparts="$1"
+  local -n pparts="$2"
+  local n=${#cparts[@]}
+  local out="" ci cell plen w pad padding
+  for ((ci=0; ci<n; ci++)); do
+    cell="${cparts[$ci]}"
+    if [ "$ci" -lt "$((n-1))" ]; then
+      plen=${#pparts[$ci]}
+      w="${col_widths[$ci]}"
+      pad=$(( w - plen ))
+      padding=""
+      [ "$pad" -gt 0 ] && padding=$(printf '%*s' "$pad" '')
+      out="${out}${cell}${padding}${SEP}"
+    else
+      out="${out}${cell}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+line1=$(render_line parts1 parts1_plain)
+line2=$(render_line parts2 parts2_plain)
+line3=$(render_line parts3 parts3_plain)
 
 printf '%s\n' "${line1}${RESET}"
 [ -n "$line2" ] && printf '%s\n' "${line2}${RESET}"

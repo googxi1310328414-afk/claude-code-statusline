@@ -1,4 +1,14 @@
 #!/bin/bash
+# Force a UTF-8 locale: this environment's LANG is empty (POSIX/C locale),
+# under which bash's ${#var}, ${var:0:N}, and =~ character classes are all
+# BYTE-based, silently over-counting every multibyte glyph used below
+# (▸ ● ✓ ✗ · █ ░ ▁-█ … ⎇ » Σ →) and throwing off column alignment. Must be
+# set before any string measurement happens (i.e. before every other line
+# in this script). The CJK width-2-terminal-cells limitation (documented
+# below) is unrelated and unaffected - characters are now counted
+# correctly, but a CJK character still occupies two terminal cells while
+# counting as one character.
+export LC_ALL=C.UTF-8
 # Claude Code SUBAGENT status line
 #
 # Contract (differs from the main statusLine!): stdin is ONE JSON object per
@@ -12,58 +22,64 @@
 # effort, model, tokenSamples (undocumented structure, defensively parsed).
 # cwd is part of the contract but unused here.
 #
-# Row segments, each cleanly omitted when its data is absent, joined with
-# the same gray " | " separator as the main script. Order:
-# identity(+status icon) | battery-or-rawtokens | sparkline+burn-rate | token-share | elapsed(+start clock) | description
+# Column layout: 6 FIXED semantic columns, 1=identity 2=spend 3=sparkline+
+# rate 4=share 5=elapsed 6=description. Unlike the main script (which
+# omits-and-shifts), this script column-ALIGNS every row's " | "
+# separators against every OTHER row in the same payload: a two-pass
+# design first computes every task's 6 cells (colored + a parallel plain
+# twin, no ANSI/OSC 8, used only for width measurement), tracks the max
+# plain width per column (1-5; description is always last and never
+# padded) across ALL rows, then a second pass pads and emits each row. A
+# task missing a MIDDLE column (e.g. no token share) still renders an
+# EMPTY padded cell there (spaces + separator) so later present columns
+# stay aligned; only TRAILING absent columns (nothing from there to the
+# end of that row) are dropped entirely, and a row's last rendered cell is
+# never padded. Column widths are recomputed fresh every payload/refresh.
+# Caveat: plain length is a bash CHARACTER count, not a terminal cell
+# count - CJK glyphs (identity names, descriptions) occupy two terminal
+# cells, so a column carrying CJK text aligns only approximately; ASCII/
+# number/glyph-only columns (spend, sparkline+rate, share, elapsed) align
+# exactly.
 #
 #   1  identity segment: "▸ " (gray) + identity text (bright magenta, first
 #      non-empty of name/label/type; identity absent -> the WHOLE segment
-#      is omitted) + "(type)" in gray when .type is non-empty and differs
-#      from the chosen identity text + "·" + short model name (cyan 36)
-#      when .model is non-empty and differs from the payload-wide majority
-#      model (majority computed once before the loop; if every task shares
-#      one model, or none have one, this marker never shows anywhere) +
-#      "·" + effort (heat-colored: low gray / medium green / high yellow /
-#      xhigh bright magenta / max bright red / anything else incl. numeric
-#      budgets yellow) + " " + a status glyph: running/in_progress "●"
-#      green, pending/queued/starting "○" yellow, failed/error/cancelled/
-#      killed "✗" bright red, completed/done/finished "✓" green (same
-#      green as running - the glyph shape, not the color, differentiates
-#      them), any other non-empty value "?" yellow, absent status -> no
-#      glyph. Short model
+#      is empty for this row, i.e. a padded blank column here unless it's
+#      also this row's trailing-absent point) + "(type)" in gray when
+#      .type is non-empty and differs from the chosen identity text + "·"
+#      + short model name (cyan 36) when .model is non-empty and differs
+#      from the payload-wide majority model (majority computed once
+#      before pass 1; if every task shares one model, or none have one,
+#      this marker never shows anywhere) + "·" + effort (heat-colored: low
+#      gray / medium green / high yellow / xhigh bright magenta / max
+#      bright red / anything else incl. numeric budgets yellow) + " " + a
+#      status glyph: running/in_progress "●" green, pending/queued/
+#      starting "○" yellow, failed/error/cancelled/killed "✗" bright red,
+#      completed/done/finished "✓" green (same green as running - the
+#      glyph shape, not the color, differentiates them), any other
+#      non-empty value "?" yellow, absent status -> no glyph. Short model
 #      name = id with a leading "claude-" and a trailing "-20"+6-digits
 #      date suffix both stripped (e.g. "claude-haiku-4-5-20251001" ->
 #      "haiku-4-5").
-#   2  context battery, or raw cumulative spend. .tokenCount is the task's
-#      CUMULATIVE token spend, not a context-window occupancy figure - a
-#      long-running agent can burn far past its context window, since the
-#      window gets compacted/reset along the way. So: only when tokenCount
-#      and contextWindowSize are both present/numeric/positive AND
-#      tokenCount <= contextWindowSize is a battery rendered (same bar
-#      math as the main script's ctx segment: 5-cell bar, "!" + bright red
-#      when remaining <20%, "Nk" white, "/Nk" gray) - that's a valid
-#      occupancy approximation early in the window's life. Once tokenCount
-#      > contextWindowSize there's no percentage claim left to make: this
-#      slot instead renders a full bright-red bar "█████" (no "!" - that's
-#      an occupancy signal, not a spend signal) followed by the raw
-#      cumulative spend "<Nk> tok" (white/gray, e.g. "█████ 447k tok").
-#      When contextWindowSize is absent/not >0 but tokenCount alone is
-#      present/numeric, this slot falls back to the same raw-spend form,
-#      "<Nk> tok".
+#   2  raw cumulative spend - unconditional whenever tokenCount is
+#      numeric: "<Nk>" white 37 + space + "tok" gray 90, e.g. "221k tok".
+#      (There is deliberately no context-window battery/percentage here
+#      anymore: tokenCount is cumulative spend, not window occupancy, so a
+#      percentage claim would be misleading on a long-running agent;
+#      contextWindowSize is no longer read at all.)
 #   3  sparkline + burn rate, ONE combined segment (each half
-#      independently optional; both absent -> segment omitted), joined by
-#      a single space when both are present. Sparkline (cyan) from
-#      .tokenSamples - defensively parsed (any failure or fewer than 2
-#      usable numeric samples -> omitted silently, never crashes the row).
-#      Numbers come from raw numeric entries or from an object entry's
-#      .tokens/.tokenCount/.count/.value/.v field; the last 8 are kept; if
-#      that subsequence is non-decreasing (a cumulative counter) it's
-#      converted to consecutive deltas first; the result is normalized
-#      min..max onto the 8 glyphs ▁▂▃▄▅▆▇█ (all-equal -> all ▄). Burn rate
-#      - only when tokenCount is numeric and elapsed seconds >= 60:
-#      tokens/minute, shown as "N/m" or, at or above 1000/min, one decimal
-#      in k as "N.Nk/m"; colored by the integer per-minute rate: <5000
-#      gray, 5000-14999 yellow, >=15000 bright red
+#      independently optional; both absent -> segment empty for this
+#      row), joined by a single space when both are present. Sparkline
+#      (cyan) from .tokenSamples - defensively parsed (any failure or
+#      fewer than 2 usable numeric samples -> omitted silently, never
+#      crashes the row). Numbers come from raw numeric entries or from an
+#      object entry's .tokens/.tokenCount/.count/.value/.v field; the last
+#      8 are kept; if that subsequence is non-decreasing (a cumulative
+#      counter) it's converted to consecutive deltas first; the result is
+#      normalized min..max onto the 8 glyphs ▁▂▃▄▅▆▇█ (all-equal -> all
+#      ▄). Burn rate - only when tokenCount is numeric and elapsed seconds
+#      >= 60: tokens/minute, shown as "N/m" or, at or above 1000/min, one
+#      decimal in k as "N.Nk/m"; colored by the integer per-minute rate:
+#      <5000 gray, 5000-14999 yellow, >=15000 bright red
 #   4  token share "Σ<N>%" of this payload's total tokens - only when at
 #      least 2 tasks have a positive tokenCount and this task's own
 #      tokenCount and the payload total are both positive: "Σ" gray, "N%"
@@ -73,15 +89,17 @@
 #      milliseconds; "<N>s" under 1 minute, "<N>m<N>s" under 1 hour, else
 #      "<N>h<N>m<N>s"; when shown, immediately (no space) followed by
 #      "@HH:MM:SS" in gray - the local clock time startTime normalizes to
-#   6  description - gray, width-budgeted against `columns` (default 120):
-#      budget = columns - (plain width of segments 1-5 incl. separators,
-#      "▸ " included) - 3; omitted if budget < 8, else cut to budget-1
-#      chars + "…" when longer than budget
+#   6  description - gray, width-budgeted against `columns` (default 120).
+#      Because alignment forces columns 1-5 to their globally padded
+#      widths whenever description follows, the budget is UNIFORM across
+#      every row in the payload (not per-row): budget = columns - (sum of
+#      the five columns' max plain widths) - 15 (5 columns' worth of " | "
+#      separators, one between each pair plus one before the description
+#      itself). Omitted if budget < 8, else cut to budget-1 chars + "…"
+#      when longer than budget.
 #
 # Example row content (id omitted here):
-#   ▸ code-reviewer(general)·haiku-4-5·max ● | ███░░ 66% 68k/200k | ▂▃▅█▆ 22.6k/m | Σ68% | 3m0s@14:32:07 | Review auth module for…
-# Cumulative-spend-exceeds-window example (battery slot only):
-#   █████ 447k tok
+#   ▸ 0.2.79 收尾与发布(local_agent) ● | 221k tok | ▁▂▄ 11.2k/m | Σ84% | 19m41s@07:41:30 | 描述…
 #
 # Colors are the basic 16-color ANSI palette via bash ANSI-C quoting
 # ($'\e[..m'); output is always plain %s - jq's -cn/--arg handles JSON
@@ -118,12 +136,25 @@ short_model() {
   printf '%s' "$m"
 }
 
-printf '%s' "$input" | jq -c '.tasks[]?' | while IFS= read -r task; do
+mapfile -t all_tasks < <(printf '%s' "$input" | jq -c '.tasks[]?' 2>/dev/null | tr -d '\r')
+
+# ---------- PASS 1: compute every row's 6 cells + track column maxima ----------
+ids=()
+descriptions=()
+col0_c=(); col0_p=()   # identity
+col1_c=(); col1_p=()   # raw spend
+col2_c=(); col2_p=()   # sparkline+rate
+col3_c=(); col3_p=()   # token share
+col4_c=(); col4_p=()   # elapsed
+col_max=(0 0 0 0 0)
+
+for task in "${all_tasks[@]}"; do
   id=$(tjq '.id // empty')
   [ -z "$id" ] && continue
 
-  # 1. identity segment: "▸ " + identity (bright magenta) + "(type)" (gray)
-  # + "·"+short-model (cyan, only when minority) + "·"+effort (heat-colored)
+  # column 1: identity segment: "▸ " + identity (bright magenta) + "(type)"
+  # (gray) + "·"+short-model (cyan, only when minority) + "·"+effort
+  # (heat-colored) + " "+status glyph
   identity_plain=$(tjq 'if (.name != null and .name != "") then .name elif (.label != null and .label != "") then .label elif (.type != null and .type != "") then .type else empty end')
   task_type=$(tjq '.type // empty')
   model=$(tjq '.model // empty')
@@ -172,66 +203,21 @@ printf '%s' "$input" | jq -c '.tasks[]?' | while IFS= read -r task; do
     fi
   fi
 
-  # 2. context battery, or (when contextWindowSize is absent/not >0 but
-  # tokenCount is present/numeric) the raw-token fallback "Nk tok" in this
-  # same slot. tokenCount is the task's CUMULATIVE token spend, which can
-  # exceed contextWindowSize on a long-running agent - the battery is only
-  # a valid occupancy approximation while spend <= window. When spend >
-  # window there's no percentage claim to make: render a full bright-red
-  # bar plus the raw cumulative spend instead (no "!" - that's an
-  # occupancy signal, and this isn't one).
+  # column 2: raw cumulative spend - unconditional whenever tokenCount is
+  # numeric; no context-window battery/percentage (tokenCount is
+  # cumulative spend, not occupancy; contextWindowSize is not read).
   token_count=$(tjq '.tokenCount // empty')
-  ctx_window_size=$(tjq '.contextWindowSize // empty')
-  battery_seg=""
-  battery_plain=""
-  if [ -n "$token_count" ] && [ -n "$ctx_window_size" ] && [[ "$token_count" =~ ^[0-9]+$ ]] && [[ "$ctx_window_size" =~ ^[0-9]+$ ]] && [ "$ctx_window_size" -gt 0 ]; then
-    if [ "$token_count" -gt "$ctx_window_size" ]; then
-      spend_k=$(( (token_count + 500) / 1000 ))
-      battery_seg="${RED_BRIGHT}█████${RESET} ${WHITE}${spend_k}k${RESET} ${GRAY}tok${RESET}"
-      battery_plain="█████ ${spend_k}k tok"
-    else
-      used_pct=$(( token_count * 100 / ctx_window_size ))
-      [ "$used_pct" -lt 0 ] && used_pct=0
-      [ "$used_pct" -gt 100 ] && used_pct=100
-      remaining=$(( 100 - used_pct ))
-      ctx_color="$GREEN"
-      ctx_warn=""
-      if [ "$remaining" -lt 20 ]; then
-        ctx_warn="1"
-        ctx_color="$RED_BRIGHT"
-      elif [ "$remaining" -lt 50 ]; then
-        ctx_color="$YELLOW"
-      fi
-      filled=$(( (remaining + 10) / 20 ))
-      [ "$filled" -lt 0 ] && filled=0
-      [ "$filled" -gt 5 ] && filled=5
-      bar_filled=""
-      bar_empty=""
-      for ((bi=0; bi<5; bi++)); do
-        if [ "$bi" -lt "$filled" ]; then
-          bar_filled="${bar_filled}█"
-        else
-          bar_empty="${bar_empty}░"
-        fi
-      done
-      bar="${ctx_color}${bar_filled}${RESET}${GRAY}${bar_empty}${RESET}"
-      used_k=$(( (token_count + 500) / 1000 ))
-      total_k=$(( (ctx_window_size + 500) / 1000 ))
-      warn_plain=""
-      [ -n "$ctx_warn" ] && warn_plain="!"
-      [ -n "$ctx_warn" ] && battery_seg="${RED_BRIGHT}!${RESET}"
-      battery_seg="${battery_seg}${bar} ${ctx_color}${remaining}%${RESET} ${WHITE}${used_k}k${RESET}${GRAY}/${total_k}k${RESET}"
-      battery_plain="${warn_plain}${bar_filled}${bar_empty} ${remaining}% ${used_k}k/${total_k}k"
-    fi
-  elif [ -n "$token_count" ] && [[ "$token_count" =~ ^[0-9]+$ ]]; then
-    tok_k=$(( (token_count + 500) / 1000 ))
-    battery_seg="${WHITE}${tok_k}k${RESET} ${GRAY}tok${RESET}"
-    battery_plain="${tok_k}k tok"
+  spend_seg=""
+  spend_plain=""
+  if [[ "$token_count" =~ ^[0-9]+$ ]]; then
+    spend_k=$(( (token_count + 500) / 1000 ))
+    spend_seg="${WHITE}${spend_k}k${RESET} ${GRAY}tok${RESET}"
+    spend_plain="${spend_k}k tok"
   fi
 
   # (shared) elapsed seconds since startTime; values > 1e12 treated as ms.
-  # Computed here (ahead of the burn-rate half of segment 3, which needs
-  # elapsed_s) even though the elapsed segment itself is displayed later.
+  # Computed here (ahead of the burn-rate half of column 3, which needs
+  # elapsed_s) even though the elapsed segment itself sits in column 5.
   start_time=$(tjq '.startTime // empty')
   elapsed_s=""
   elapsed_seg=""
@@ -261,9 +247,8 @@ printf '%s' "$input" | jq -c '.tasks[]?' | while IFS= read -r task; do
     fi
   fi
 
-  # 3. sparkline + burn rate, ONE combined segment (each half independently
-  # optional; both absent -> segment omitted), matching the main script's
-  # token-rate segment layout.
+  # column 3: sparkline + burn rate, ONE combined segment (each half
+  # independently optional), matching the main script's token-rate layout.
   spark_seg=""
   spark_plain=""
   numbers=$(printf '%s' "$task" | jq -c '[.tokenSamples[]? | if type=="number" then . elif type=="object" then (.tokens // .tokenCount // .count // .value // .v // empty) else empty end | select(type=="number")]' 2>/dev/null)
@@ -353,9 +338,7 @@ printf '%s' "$input" | jq -c '.tasks[]?' | while IFS= read -r task; do
     sparkburn_plain="$burn_plain"
   fi
 
-  # 4. token share of the whole payload's tokens - only when at least 2
-  # tasks have a positive tokenCount and this task's own tokenCount is a
-  # positive number and the payload total is positive.
+  # column 4: token share of the whole payload's tokens
   share_seg=""
   share_plain=""
   if [ "$tokened_count" -ge 2 ] && [ -n "$token_count" ] && [[ "$token_count" =~ ^[0-9]+$ ]] && [ "$token_count" -gt 0 ] && [ "$total_tokens" -gt 0 ]; then
@@ -371,56 +354,90 @@ printf '%s' "$input" | jq -c '.tasks[]?' | while IFS= read -r task; do
     share_plain="Σ${share}%"
   fi
 
-  # 6. description - gray, width-budgeted against columns so the row fits;
-  # the plain-text width must account for every segment above (5. elapsed
-  # is computed earlier, above, but still counted here).
   description=$(tjq '.description // empty')
+
+  ids+=("$id")
+  descriptions+=("$description")
+  col0_c+=("$seg1");          col0_p+=("$seg1_plain")
+  col1_c+=("$spend_seg");     col1_p+=("$spend_plain")
+  col2_c+=("$sparkburn_seg"); col2_p+=("$sparkburn_plain")
+  col3_c+=("$share_seg");     col3_p+=("$share_plain")
+  col4_c+=("$elapsed_seg");   col4_p+=("$elapsed_plain")
+
+  [ "${#seg1_plain}" -gt "${col_max[0]}" ]       && col_max[0]=${#seg1_plain}
+  [ "${#spend_plain}" -gt "${col_max[1]}" ]      && col_max[1]=${#spend_plain}
+  [ "${#sparkburn_plain}" -gt "${col_max[2]}" ]  && col_max[2]=${#sparkburn_plain}
+  [ "${#share_plain}" -gt "${col_max[3]}" ]      && col_max[3]=${#share_plain}
+  [ "${#elapsed_plain}" -gt "${col_max[4]}" ]    && col_max[4]=${#elapsed_plain}
+done
+
+# ---------- PASS 2: build the uniform description budget, pad, emit ----------
+desc_budget=$(( columns - (col_max[0]+col_max[1]+col_max[2]+col_max[3]+col_max[4]) - 15 ))
+
+row_total=${#ids[@]}
+for ((r=0; r<row_total; r++)); do
+  id="${ids[$r]}"
+
+  present0=0; [ -n "${col0_p[$r]}" ] && present0=1
+  present1=0; [ -n "${col1_p[$r]}" ] && present1=1
+  present2=0; [ -n "${col2_p[$r]}" ] && present2=1
+  present3=0; [ -n "${col3_p[$r]}" ] && present3=1
+  present4=0; [ -n "${col4_p[$r]}" ] && present4=1
+
+  # description - gray, cut to the UNIFORM budget computed above (same for
+  # every row, since alignment pads columns 1-5 to the same widths
+  # whenever description follows)
+  description="${descriptions[$r]}"
   desc_seg=""
-  if [ -n "$description" ]; then
-    plain_parts=()
-    [ -n "$seg1_plain" ] && plain_parts+=("$seg1_plain")
-    [ -n "$battery_plain" ] && plain_parts+=("$battery_plain")
-    [ -n "$sparkburn_plain" ] && plain_parts+=("$sparkburn_plain")
-    [ -n "$share_plain" ] && plain_parts+=("$share_plain")
-    [ -n "$elapsed_plain" ] && plain_parts+=("$elapsed_plain")
-    plain_row=""
-    for pp in "${plain_parts[@]}"; do
-      if [ -z "$plain_row" ]; then
-        plain_row="$pp"
-      else
-        plain_row="${plain_row} | ${pp}"
-      fi
-    done
-    used_width=${#plain_row}
-    budget=$(( columns - used_width - 3 ))
-    if [ "$budget" -ge 8 ]; then
-      desc_len=${#description}
-      if [ "$desc_len" -gt "$budget" ]; then
-        cut=$(( budget - 1 ))
-        desc_text="${description:0:$cut}…"
-      else
-        desc_text="$description"
-      fi
-      desc_seg="${GRAY}${desc_text}${RESET}"
+  if [ -n "$description" ] && [ "$desc_budget" -ge 8 ]; then
+    desc_len=${#description}
+    if [ "$desc_len" -gt "$desc_budget" ]; then
+      cut=$(( desc_budget - 1 ))
+      desc_text="${description:0:$cut}…"
+    else
+      desc_text="$description"
     fi
+    desc_seg="${GRAY}${desc_text}${RESET}"
   fi
 
-  row_parts=()
-  [ -n "$seg1" ]          && row_parts+=("$seg1")
-  [ -n "$battery_seg" ]   && row_parts+=("$battery_seg")
-  [ -n "$sparkburn_seg" ] && row_parts+=("$sparkburn_seg")
-  [ -n "$share_seg" ]     && row_parts+=("$share_seg")
-  [ -n "$elapsed_seg" ]   && row_parts+=("$elapsed_seg")
-  [ -n "$desc_seg" ]      && row_parts+=("$desc_seg")
+  # last_idx = highest column index (0-4 mid columns, 5 = description)
+  # that has real content for this row; only trailing-absent columns past
+  # it are dropped, everything up to it renders (empty-padded if absent).
+  last_idx=-1
+  [ "$present0" -eq 1 ] && last_idx=0
+  [ "$present1" -eq 1 ] && last_idx=1
+  [ "$present2" -eq 1 ] && last_idx=2
+  [ "$present3" -eq 1 ] && last_idx=3
+  [ "$present4" -eq 1 ] && last_idx=4
+  [ -n "$desc_seg" ]    && last_idx=5
 
   row=""
-  for rp in "${row_parts[@]}"; do
-    if [ -z "$row" ]; then
-      row="$rp"
-    else
-      row="${row}${SEP}${rp}"
-    fi
-  done
+  if [ "$last_idx" -ge 0 ]; then
+    for ((i=0; i<=last_idx; i++)); do
+      if [ "$i" -lt 5 ]; then
+        case $i in
+          0) cell_c="${col0_c[$r]}"; cell_p="${col0_p[$r]}" ;;
+          1) cell_c="${col1_c[$r]}"; cell_p="${col1_p[$r]}" ;;
+          2) cell_c="${col2_c[$r]}"; cell_p="${col2_p[$r]}" ;;
+          3) cell_c="${col3_c[$r]}"; cell_p="${col3_p[$r]}" ;;
+          4) cell_c="${col4_c[$r]}"; cell_p="${col4_p[$r]}" ;;
+        esac
+      else
+        cell_c="$desc_seg"
+        cell_p=""
+      fi
+      if [ "$i" -eq "$last_idx" ]; then
+        row="${row}${cell_c}"
+      else
+        plen=${#cell_p}
+        w="${col_max[$i]}"
+        pad=$(( w - plen ))
+        padding=""
+        [ "$pad" -gt 0 ] && padding=$(printf '%*s' "$pad" '')
+        row="${row}${cell_c}${padding}${SEP}"
+      fi
+    done
+  fi
   row="${row}${RESET}"
 
   jq -cn --arg id "$id" --arg content "$row" '{id:$id, content:$content}'
