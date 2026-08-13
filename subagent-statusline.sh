@@ -165,7 +165,10 @@ export LC_ALL=C.UTF-8
 # is done inline in pure bash at the emit site (PASS 2, bottom of this
 # file), not via `jq -cn`/--arg - seeing PERF comment there for why.
 
-input=$(cat)
+# Zero-fork stdin slurp - `input=$(cat)` cost a subshell + a cat exec per
+# render; read -d '' takes everything to EOF in-process (JSON carries no
+# raw NUL) and its nonzero at-EOF return is guarded, var filled either way.
+IFS= read -r -d '' input || :
 
 # jq guard: if jq is missing, every row below is unusable - emit nothing
 # useful is impossible in this contract (no id to key a line on), so just
@@ -366,16 +369,20 @@ subagent_samples_file="${STATUSLINE_SUBAGENT_SAMPLES_FILE:-$HOME/.claude/statusl
 printf -v samp_now '%(%s)T' -1
 declare -A samp_tokens_by_id samp_last_by_id
 samp_kept_lines=()
+samp_new_lines=()
 samp_new_rows=0
+samp_stale=0
 if [ -r "$subagent_samples_file" ]; then
   mapfile -t samp_raw_lines < "$subagent_samples_file" 2>/dev/null
   for samp_line in "${samp_raw_lines[@]}"; do
     IFS=$'\x1f' read -r s_epoch s_id s_tok s_extra <<< "$samp_line"
-    [[ "$s_epoch" =~ ^[0-9]+$ ]] || continue
-    [ -n "$s_id" ] || continue
-    [[ "$s_tok" =~ ^[0-9]+$ ]] || continue
-    [ -n "$s_extra" ] && continue
-    [ $(( samp_now - s_epoch )) -gt 21600 ] && continue
+    # any dropped row (malformed or expired) flags the file as needing the
+    # full rewrite below; clean reads take the cheap append path instead
+    [[ "$s_epoch" =~ ^[0-9]+$ ]] || { samp_stale=1; continue; }
+    [ -n "$s_id" ] || { samp_stale=1; continue; }
+    [[ "$s_tok" =~ ^[0-9]+$ ]] || { samp_stale=1; continue; }
+    [ -n "$s_extra" ] && { samp_stale=1; continue; }
+    [ $(( samp_now - s_epoch )) -gt 21600 ] && { samp_stale=1; continue; }
     samp_kept_lines+=("$samp_line")
     samp_tokens_by_id[$s_id]="${samp_tokens_by_id[$s_id]:-} $s_tok"
     samp_last_by_id[$s_id]="$s_epoch"
@@ -503,6 +510,7 @@ for ((ti=0; ti<task_count_total; ti++)); do
     samp_prev_epoch="${samp_last_by_id[$id]:-}"
     if [ -z "$samp_prev_epoch" ] || [ $(( samp_now - samp_prev_epoch )) -ge 10 ]; then
       samp_kept_lines+=("${samp_now}"$'\x1f'"${id}"$'\x1f'"${token_count}")
+      samp_new_lines+=("${samp_now}"$'\x1f'"${id}"$'\x1f'"${token_count}")
       samp_tokens_by_id[$id]="${samp_tokens_by_id[$id]:-} $token_count"
       samp_last_by_id[$id]="$samp_now"
       samp_new_rows=1
@@ -685,11 +693,20 @@ done
 # the in-memory rows ARE the post-trim file; the count cap is a runaway
 # backstop only. Per-PID tmp + atomic mv, same pattern as every other
 # state writer in this pair; all failure modes silenced.
+# Append-first write, same policy as the main script's history file: the
+# full rewrite (which doubles as the retention trim) runs only when the
+# read pass actually dropped something (expired/malformed) or the cap
+# trips; clean steady state sends the fresh samples as one O_APPEND
+# write, which concurrent sessions interleave safely.
 if [ "$samp_new_rows" -eq 1 ]; then
   samp_total=${#samp_kept_lines[@]}
-  [ "$samp_total" -gt 4000 ] && samp_kept_lines=("${samp_kept_lines[@]: -4000}")
-  printf '%s\n' "${samp_kept_lines[@]}" > "${subagent_samples_file}.tmp.$$" 2>/dev/null &&
-    mv -f "${subagent_samples_file}.tmp.$$" "$subagent_samples_file" 2>/dev/null
+  if [ "$samp_stale" -eq 1 ] || [ "$samp_total" -gt 4000 ]; then
+    [ "$samp_total" -gt 4000 ] && samp_kept_lines=("${samp_kept_lines[@]: -4000}")
+    printf '%s\n' "${samp_kept_lines[@]}" > "${subagent_samples_file}.tmp.$$" 2>/dev/null &&
+      mv -f "${subagent_samples_file}.tmp.$$" "$subagent_samples_file" 2>/dev/null
+  else
+    printf '%s\n' "${samp_new_lines[@]}" >> "$subagent_samples_file" 2>/dev/null
+  fi
 fi
 
 # ---------- PASS 2: build the uniform description budget, pad, emit ----------

@@ -67,6 +67,8 @@ exec 2>>"$statusline_err_log"
 #     transcript_path is set, the file exists, and `tail` is on PATH)
 #   - date: 0 or 1 (N4's ISO-8601 parse; only when the tail scan above
 #     actually found a candidate cache-activity line to parse)
+#   - cat: 0 - the stdin payload is slurped by the `read -d ''` builtin,
+#     never `$(cat)` (which cost a subshell + a cat exec per render)
 #   - detached background jobs (never block this render, may spawn gh/
 #     curl/jq/grep internally on their OWN next-render cadence): the PR
 #     CI refresh and N2's OAuth usage refresh
@@ -335,7 +337,13 @@ NBSP=$'\xc2\xa0'
 OSC_OPEN=$'\e]8;;'
 OSC_CLOSE=$'\e\\'
 
-input=$(cat)
+# Zero-fork stdin slurp: `input=$(cat)` forked a subshell AND exec'd an
+# external cat - 2 spawns per render just to read the payload. read -d ''
+# takes everything up to EOF in-process (JSON never carries a raw NUL);
+# it returns nonzero when EOF arrives without a NUL, so the guard keeps
+# that from tripping anything - the variable is filled either way. (The
+# trailing newline $(cat) used to strip is irrelevant to jq.)
+IFS= read -r -d '' input || :
 
 # jq guard: if jq is missing, every segment below is unusable - degrade to
 # one line (clock via the bash date builtin, no process spawn) and exit
@@ -714,6 +722,7 @@ fi
 
 hist_time_cutoff=$(( now_epoch - 10800 ))
 hist_trimmed=()
+hist_oldest_epoch=""
 daily_dirty=0
 for hline in "${hist_all_lines[@]}"; do
   hline=${hline//$'\r'/}
@@ -727,6 +736,7 @@ for hline in "${hist_all_lines[@]}"; do
   [ "${#hfields[@]}" -eq 4 ] || continue
   h_epoch="${hfields[0]}"; h_sid="${hfields[1]}"; h_tok="${hfields[2]}"; h_cost="${hfields[3]}"
   [[ "$h_epoch" =~ ^[0-9]+$ ]] || continue
+  [ -z "$hist_oldest_epoch" ] && hist_oldest_epoch="$h_epoch"
 
   [ "$h_epoch" -ge "$hist_time_cutoff" ] && hist_trimmed+=("$hline")
 
@@ -788,16 +798,37 @@ if [ "$daily_dirty" -eq 1 ]; then
   fi
 fi
 
+# APPEND-FIRST WRITE: a full trim+rewrite used to run on EVERY appending
+# render (~25KB tmp+mv every 20s per session) even though it only added
+# one row - and in steady state the 3h cutoff expires roughly one row per
+# tick, so "rewrite whenever anything expired" would still rewrite every
+# time. Instead the on-disk file gets 30min of SLACK past the 3h read
+# window (every consumer filters by its own window, so stale-but-present
+# rows cost nothing), and the full rewrite runs only when the oldest row
+# exceeds window+slack (~every 30min) or the row cap trips; malformed
+# rows just wait for that pass (they're skipped at read time anyway).
+# Between rewrites the new row goes out as ONE O_APPEND write, which
+# concurrent sessions interleave safely - and a rare rewrite clobbering
+# a concurrent append now costs one sparkline point at worst (the spend
+# is already carried by the rollup), ~90x less often than the old
+# every-tick rewrite race.
 if [ -n "$session_id" ] && [ "$should_append" -eq 1 ]; then
-  hist_trimmed_count=${#hist_trimmed[@]}
-  if [ "$hist_trimmed_count" -gt 10000 ]; then
-    hist_trimmed=("${hist_trimmed[@]: -10000}")
+  hist_rewrite_due=0
+  [ -n "$hist_oldest_epoch" ] && [ $(( now_epoch - hist_oldest_epoch )) -gt 12600 ] && hist_rewrite_due=1
+  [ "${#hist_trimmed[@]}" -gt 10000 ] && hist_rewrite_due=1
+  if [ "$hist_rewrite_due" -eq 1 ]; then
+    hist_trimmed_count=${#hist_trimmed[@]}
+    if [ "$hist_trimmed_count" -gt 10000 ]; then
+      hist_trimmed=("${hist_trimmed[@]: -10000}")
+    fi
+    # Per-PID tmp name: two concurrent sessions rewriting at the same tick
+    # collided on a shared fixed ".tmp" (Windows: "Device or resource
+    # busy", loser dropped its freshly-appended row). Same $$ pattern as
+    # the CI/usage cache writers below; the mv stays atomic either way.
+    printf '%s\n' "${hist_trimmed[@]}" > "${history_file}.tmp.$$" 2>/dev/null && mv -f "${history_file}.tmp.$$" "$history_file" 2>/dev/null
+  else
+    printf '%s\n' "$new_hist_line" >> "$history_file" 2>/dev/null
   fi
-  # Per-PID tmp name: two concurrent sessions trimming at the same tick
-  # collided on a shared fixed ".tmp" (Windows: "Device or resource busy",
-  # loser dropped its freshly-appended row). Same $$ pattern as the CI/
-  # usage cache writers below; the mv stays atomic either way.
-  printf '%s\n' "${hist_trimmed[@]}" > "${history_file}.tmp.$$" 2>/dev/null && mv -f "${history_file}.tmp.$$" "$history_file" 2>/dev/null
 fi
 
 current_cost_cents=0

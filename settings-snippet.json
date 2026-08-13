@@ -1,12 +1,12 @@
 {
   "statusLine": {
     "type": "command",
-    "command": "bash ~/.claude/statusline-command.sh",
+    "command": "exec bash ~/.claude/statusline-command.sh",
     "refreshInterval": 10
   },
   "subagentStatusLine": {
     "type": "command",
-    "command": "bash ~/.claude/subagent-statusline.sh",
+    "command": "exec bash ~/.claude/subagent-statusline.sh",
     "refreshInterval": 3
   }
 }
