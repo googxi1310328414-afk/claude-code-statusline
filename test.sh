@@ -114,10 +114,12 @@ if [ "$1" = "--assert" ]; then
   printf '%s' "$wkonly" | grep -q 'week \$7.50' && ok "week from rollup alone" || bad "rollup-only week wrong"
   # append-first write: an over-slack (4h) row must trigger the full
   # rewrite and get purged, while fresh rows survive (last fresh row is
-  # >=20s old so the render actually appends and hits the write path)
+  # comfortably >=30s old - the sampling throttle - even on a fast CI
+  # runner that reaches this assert seconds after `now` was captured,
+  # so the render actually appends and hits the write path)
   {
     printf "%s\x1fabc\x1f100\x1f0.01\n" "$((now-14400))"
-    printf "%s\x1fabc\x1f%s\x1f%s\n" "$((now-240))" 50000 0.10 "$((now-120))" 58000 0.22 "$((now-25))" 66000 0.38
+    printf "%s\x1fabc\x1f%s\x1f%s\n" "$((now-240))" 50000 0.10 "$((now-120))" 58000 0.22 "$((now-45))" 66000 0.38
   } > "$STATUSLINE_HISTORY_FILE"
   bash ./statusline-command.sh < fixtures/full.json >/dev/null
   if grep -q "^$((now-14400))" "$STATUSLINE_HISTORY_FILE"; then bad "over-slack row survived rewrite"; else ok "aged row purged by rewrite trigger"; fi
