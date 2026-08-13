@@ -10,6 +10,10 @@ cd "$(dirname "$0")" || exit 1
 export STATUSLINE_HISTORY_FILE="$(mktemp -u)/test-hist.tsv" 2>/dev/null || export STATUSLINE_HISTORY_FILE="/tmp/statusline-test-hist.$$"
 mkdir -p "$(dirname "$STATUSLINE_HISTORY_FILE")"
 export STATUSLINE_SUBAGENT_TREND_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-subtrend.tsv"
+export STATUSLINE_PANEL_DIR="$(dirname "$STATUSLINE_HISTORY_FILE")/panel.d"
+export STATUSLINE_PANEL_DAEMON=/dev/null
+export STATUSLINE_PANEL_RENDERER="$PWD/subagent-statusline.sh"
+mkdir -p "$STATUSLINE_PANEL_DIR"
 export STATUSLINE_DAILY_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-daily.tsv"
 trap 'rm -rf "$(dirname "$STATUSLINE_HISTORY_FILE")"' EXIT
 
@@ -155,6 +159,17 @@ if [ "$1" = "--assert" ]; then
   printf "ms\x1f%s\x1f1000,3000,4000\n" "$((now-10))" > "$STATUSLINE_SUBAGENT_TREND_FILE"
   spark=$(subagent_payload "$now" | bash ./subagent-statusline.sh | jq -r 'select(.id=="ms") | .content' | strip)
   printf '%s' "$spark" | grep -qE '[▁▂▃▄▅▆]' && ok "subagent sparkline from own samples" || bad "own-sample sparkline missing"
+
+  # panel daemon architecture: the hook must spool the payload, stay
+  # silent on a cold cache, serve the cached frame instantly, and the
+  # daemon (--once) must render a spool into that cache
+  hookout=$(subagent_payload "$now" | bash ./statusline-panel-hook.sh)
+  [ -f "$STATUSLINE_PANEL_DIR/spool.ms.new" ] && ok "panel hook spools payload" || bad "hook spool missing"
+  [ -n "$hookout" ] && bad "hook emitted on cold cache" || ok "hook silent on cold cache"
+  printf '%s\n' '{"id":"ms","content":"CACHED_MARKER"}' > "$STATUSLINE_PANEL_DIR/cache.ms"
+  subagent_payload "$now" | bash ./statusline-panel-hook.sh | grep -q CACHED_MARKER && ok "panel hook serves cache" || bad "hook cache serve failed"
+  bash ./statusline-panel-daemon.sh --once
+  grep -q '"id":"ms"' "$STATUSLINE_PANEL_DIR/cache.ms" && ! grep -q CACHED_MARKER "$STATUSLINE_PANEL_DIR/cache.ms" && ok "panel daemon renders spool to cache" || bad "daemon render failed"
 
   rm -rf "$tmpd"
   echo "----"

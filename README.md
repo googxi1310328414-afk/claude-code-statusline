@@ -46,7 +46,7 @@ $0.42 $4.8/h                        | today $55.97      | week $89.20           
 
 Claude Code ≥ 2.1.221（子代理 effort 字段）、Git Bash（bash ≥ 4.3，UTF-8）、`jq`、`git`（stash 段需 ≥2.35，更旧仅少这一段）；`gh` 可选（CI 徽记）。
 
-1. 两个 `.sh` 复制到 `~/.claude/`（主目录自动检测，无需改路径）。
+1. 四个 `.sh`（两个渲染脚本 + `statusline-panel-hook.sh`/`statusline-panel-daemon.sh`）复制到 `~/.claude/`（主目录自动检测，无需改路径），并创建目录 `~/.claude/statusline-panel.d/`。
 2. `~/.claude/settings.json` 合并 `settings-snippet.json`（statusLine 与 subagentStatusLine 两块，含各自的 `refreshInterval`）。
 3. 保存即生效。**推荐**：把 [`AI-GUIDE.md`](AI-GUIDE.md) 全文发给 Claude Code 让它替你装并按机器适配。
 
@@ -55,7 +55,7 @@ Claude Code ≥ 2.1.221（子代理 effort 字段）、Git Bash（bash ≥ 4.3�
 ```bash
 bash test.sh            # 渲染演示（终端看真色彩）
 bash test.sh --codes    # ANSI 码可视化
-bash test.sh --assert   # 33 项断言（CI 用，含性能门槛）
+bash test.sh --assert   # 37 项断言（CI 用，含性能门槛）
 ```
 
 GitHub Actions 在每次 push 自动跑断言套件。
@@ -71,6 +71,7 @@ GitHub Actions 在每次 push 自动跑断言套件。
 5. **忙碌回合**：主栏**画面**冻结在回合开始帧，但**调用照常**（状态文件持续新鲜，回合结束瞬间回正）；子代理面板不受此限、全程实时。
 6. **采样与刷新的配比**：主栏 10s 刷新 × 20s 采样节流 = 每两帧记一次历史（走势每格≈20s）；面板宿主 ~5s 节拍 × 10s 采样 = 每两帧一样（每格≈10s）。调 `refreshInterval` 时记得连同脚本内节流一起配比。
 7. **自愈层（可选，Windows）**：`statusline-watchdog.ps1` 由计划任务每 2 分钟清理挂死 >30s 的渲染 bash（fork 枯竭下的兜底）；**必须经 `statusline-watchdog.vbs`（wscript）拉起**——计划任务直接跑 powershell 会在 `-WindowStyle Hidden` 生效前闪一下控制台窗口。两文件复制到 `~/.claude/`（vbs 内路径按机器改）后：`schtasks /Create /SC MINUTE /MO 2 /TN claude-statusline-watchdog /TR "wscript.exe C:\Users\<你>\.claude\statusline-watchdog.vbs"`。
+8. **面板常驻 daemon**：subagentStatusLine 命令指向 `statusline-panel-hook.sh`——钩子只做"倒载荷 + 秒回上一帧缓存"（纯内建，稳态零派生，延迟≈bash 启动的毫秒级），真正的渲染由 `statusline-panel-daemon.sh` 异步完成（内容滞后一拍 ~5s，对累计 token/用时无感知）。宿主重画面板是"先默认行、钩子返回才替换"，钩子延迟=默认行闪烁窗口——daemon 化把它从整段渲染耗时（~300ms）压到毫秒级。缓存键=载荷首任务 id（并发会话任务集不相交，天然各用各的缓存）；daemon 单实例（noclobber 抢占+活性探测）、无活 2 分钟自灭、死了由下一拍钩子拉起、挂死的渲染子进程由第 7 条看门狗兜底——全链路自愈，无需手工管理。状态目录 `~/.claude/statusline-panel.d/`。
 
 ## 已知边界
 

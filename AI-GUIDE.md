@@ -111,6 +111,8 @@
 
 ## 4. 子代理面板行（subagentStatusLine）
 
+**常驻 daemon 架构（必须）**：宿主重画面板时先出默认行、钩子返回才替换——钩子延迟即"闪回默认"窗口。因此 subagentStatusLine 命令指向轻钩子 `statusline-panel-hook.sh`（纯内建：分块读 stdin → 按**载荷首任务 id** 派生缓存键 → 原子 spool 交接 `spool.<key>.new` → mapfile 秒回 `cache.<key>` 上一帧 → `kill -0` 探测 daemon、死则游离拉起），渲染由 `statusline-panel-daemon.sh` 异步跑真渲染脚本完成（单实例 noclobber 抢占+活性接管；0.3s fifo `read -t` 零派生轮询；无活 2 分钟自灭；`--once` 供测试）。并发会话任务集不相交→缓存键天然隔离；一切竞争丢失都由下一拍自愈。状态目录 `$STATUSLINE_PANEL_DIR`（默认 `~/.claude/statusline-panel.d/`），renderer/daemon 路径可用 `STATUSLINE_PANEL_RENDERER`/`STATUSLINE_PANEL_DAEMON` 覆盖（测试用）。
+
 ### 4.1 契约（与主状态栏不同！）
 
 每次刷新 stdin 收到**一个**JSON：`{"columns": <可用宽度>, "tasks": [<每个子代理一个对象>]}`。实测：只有常规 Agent 子代理（type=`local_agent`，身份在 `label` 字段、通常无 `name`）会出现；workflow/ultracode 编队渲染在 /workflows 专属 UI，不经过此钩子。任务字段：`id`、`name`、`type`、`status`、`description`、`label`、`startTime`（Unix 时间戳，**可能是毫秒**：>10^12 则除以 1000）、`tokenCount`（**累计消耗**，可远超窗口！）、`model`、`contextWindowSize`（≥2.1.205）、`effort`（≥2.1.214，缺席=继承主会话）、`tokenSamples`（结构未文档化）。对 `.tasks[]` 每个元素向 stdout 输出一行紧凑 JSON `{"id":…,"content":…}`（`jq -cn --arg` 构造）；无 `id` 跳过（保持默认渲染）；tasks 空则无输出。
@@ -126,7 +128,7 @@
 
 ## 5. 验证（必须实际执行）
 
-**首选**：仓库根目录 `bash test.sh --assert` —— 33 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、双层花费存储、追加优先裁剪触发、列对齐、TSV 列序、空列裁剪、性能 <3s 门槛），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
+**首选**：仓库根目录 `bash test.sh --assert` —— 37 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、双层花费存储、追加优先裁剪触发、面板钩子 spool/缓存秒回/daemon 渲染、列对齐、TSV 列序、空列裁剪、性能 <3s 门槛），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
 
 主状态栏（`fixtures/` 三份 + 状态文件人工历史）：
 - **full.json**：三行齐全；电池 `ctx ███░░ 66% 70k/200k`（占用 69671=68471+1200→70k，非 68k！）；`cache 92%` 绿；`» my-session`。

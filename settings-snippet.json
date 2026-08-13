@@ -6,6 +6,6 @@
   },
   "subagentStatusLine": {
     "type": "command",
-    "command": "exec bash ~/.claude/subagent-statusline.sh"
+    "command": "exec bash ~/.claude/statusline-panel-hook.sh"
   }
 }
