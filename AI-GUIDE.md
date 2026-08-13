@@ -52,7 +52,7 @@
 
 > **权威规格说明**：下面的分段表描述核心形态；每段的最终权威细节（含后续增量：today/week 跨会话统计、`wk` 按模型周配额、`extra` 溢出、压缩计数 `↻`、缓存倒计时、80% 压缩线 `│`、`·t` 节奏游标及其变色覆盖）以参考实现 `statusline-command.sh` **头部注释**为准——实现时先通读那份头注。
 
-四行分组：**1 身份与位置**（时钟|模型|目录|worktree|仓库|分支|⚑stash|PR+CI）；**2 上下文引擎**（ctx 电池|走势+速率|cache 三件套|↻压缩）；**3 花费**（$+$/h|today|week|行数）；**4 限额与会话**（5h/7d 节奏游标|wk 模型配额|extra|»会话名）。每行独立拼装，段间分隔符为灰色 ` | `（前后 reset），行尾补一次 reset；**一行内无任何段时该行不打印**（第 1 行有时钟兜底恒在）。settings.json 的 statusLine 键配 `"refreshInterval": 10`、subagentStatusLine 配 `3`（渲染实测 0.4–1.3s；间隔必须显著大于最坏渲染耗时——新触发会取消在途渲染，见前置检查 5）。
+四行分组：**1 身份与位置**（时钟|模型|目录|worktree|仓库|分支|⚑stash|PR+CI）；**2 上下文引擎**（ctx 电池|走势+速率|cache 三件套|↻压缩）；**3 花费**（$+$/h|today|week|行数）；**4 限额与会话**（5h/7d 节奏游标|wk 模型配额|extra|»会话名）。每行独立拼装，段间分隔符为灰色 ` | `（前后 reset），行尾补一次 reset；**一行内无任何段时该行不打印**（第 1 行有时钟兜底恒在）。settings.json 的 statusLine 键配 `"refreshInterval": 10`（间隔必须显著大于最坏渲染耗时——新触发会取消在途渲染，见前置检查 5）；**subagentStatusLine 配 refreshInterval 无效**（2.1.229 实测：配 3 仍精确 5.000s 一拍——面板节拍由宿主固定 ~5s 驱动，勿写该键）。
 
 **第 1 行 · 身份与位置**
 1. 时钟：`date +%H:%M:%S`，亮白。
@@ -85,11 +85,12 @@
 0b. **历史文件双层**：细粒度 `~/.claude/statusline-history.tsv`（0x1F 4 列 `epoch␟session_id␟tokens␟cost`；读取端先 `${line//$'\t'/$'\x1f'}` 兼容旧 TAB；**整行形状校验**，恰好 4 列+逐列数值正则，否则整行丢弃——严禁部分字段泄入求和；按 **3 小时**窗+1 万行帽裁剪重写）只服务走势/速率/$每小时。today/week 走日聚合 `statusline-daily.tsv`（0x1F 6 列 `day␟sid␟closed␟peak␟prev␟last_epoch`：单调段状态机增量前推 + **last_epoch 水位线**——重放不双计、并发丢写由细粒度行自愈、首跑自动从存量行播种同一代码路径；week=含今日的近 7 个自然日，文件留 9 日）。两文件写入**追加优先**：平时新行走单次 O_APPEND 追加（并发天然安全）；仅当最老行超出读窗 30 分钟（细粒度）、行帽触顶或读到脏行/过期行时才全量裁剪重写（`$$` 临时名+原子 mv）——稳态下细粒度文件约每 30 分钟才重写一次，而非旧的每次追加都重写。
 0c. **抗资源枯竭·永不白屏三件套**（Windows 大进程树下 fork 枯竭真实存在——bash 报 `fork: retry: Resource temporarily unavailable`、子进程 0xC0000142——届时 jq spawn 会失败）：(a) **stderr 黑匣子**：`export LC_ALL` 后立即 `exec 2>>~/.claude/statusline-err.log`（超 500 行先自轮转再重定向），任何 stderr 泄给宿主都会整栏白屏，黑匣子既保白屏防线又留尸检证据；(b) **哨兵形状校验**：单次 jq 输出 N 个字段后**必须再追加一个字面量哨兵字段 `("__END__")`**——裸行数检查不可靠，因为 `$(...)` 命令替换会剥掉**全部**尾随换行，末字段（如 transcript_path）为空时 jq 输出以连续换行结尾、被整体剥除，健康载荷凭空少行而误判（真机踩过：无 transcript_path 的载荷 100% 误触发假降级）；哨兵永不为空、必幸存剥除，检查 `[ "${#F[@]}" -lt N+1 ] || [ "${F[N]}" != "__END__" ]` 才可靠；(c) **降级行**：形状校验失败时输出一行 `HH:MM:SS | statusline: degraded (fork)`（`printf '%(%H:%M:%S)T' -1`，零进程）并 `exit 0`——绝不空输出、绝不非零退出。
 
+0d. **语句预算**：MSYS 下 bash 每条语句 ~20-40μs（解释器本身的价格，与语句内容几乎无关）——热路径"每行 × 每帧"的循环体语句数就是毫秒账。**禁止任何随历史/日志增长的每帧重扫**：跨帧记忆一律用规模有界的紧凑状态文件承载（日聚合按天×会话、趋势态按活跃任务，皆此模式）。
 1. 无浮点：比较一律"截断小数→整数比"（非负数等价 floor）；显示另行 printf。
 2. printf/算术前必须 `[ -n ]` + `[[ =~ ^[0-9]+$ ]]` 守卫。
 3. 先判段非空再包颜色，禁止"只有颜色码的空段"进入拼装。
 4. git 全部 `--no-optional-locks` + stderr 静默；目录非法时整段静默消失。
-5. stdin 用零 fork 方式一次读入：`IFS= read -r -d '' input || :`（**禁 `input=$(cat)`**——那是每帧白烧一个子壳+一个 cat）；jq 用 herestring 喂入 `jq -r '…' <<< "$input"`（免 printf 管道的子壳 fork；不用 echo）。settings 命令写成 `exec bash ~/.claude/…`，省掉宿主 `-c` 壳那层进程。
+5. stdin 零 fork **分块**读入：`input=""; while IFS= read -r -N 65536 c; do input+="$c"; done; input+="$c"`。**禁 `read -d ''` 单次读**（管道上逐字节 read，实测 100KB 慢 5 倍——面板载荷带 tokenSamples 会放大）、**禁 `$(cat)`**（子壳+cat 两个进程）；`-N` 按字符计数不会撕裂多字节。jq 用 herestring 喂入 `jq -r '…' <<< "$input"`（免 printf 管道的子壳 fork；不用 echo）。settings 命令写成 `exec bash ~/.claude/…`，省掉宿主 `-c` 壳那层进程。
 6. **逐行读 jq/awk 输出必须 `| tr -d '\r'`**（见前置检查 4）。
 7. 两脚本 shebang 后第一句 `export LC_ALL=C.UTF-8`——所有 `${#}` 长度、`${var:0:N}` 切片、正则类按**字符**而非字节算，对齐才成立。
 8. **列对齐**：每段维护无转义纯文本孪生串（颜色与 OSC 8 序列不计宽）。主状态栏三行按列索引取最大宽度补空格成网格（每行最后一格不垫）；子代理面板两遍法——第一遍算出所有行 5 个定位列的内容与宽度并取列最大值，第二遍统一垫宽后输出（缺中间列的行垫空格占位，尾部缺列丢弃；描述列共用统一预算 = columns − 各列最大宽及分隔符 − 15）。CJK 字符占两格的近似误差如实文档化。
@@ -102,7 +103,7 @@
 ```json
 {
   "statusLine":         { "type": "command", "command": "exec bash ~/.claude/statusline-command.sh", "refreshInterval": 10 },
-  "subagentStatusLine": { "type": "command", "command": "exec bash ~/.claude/subagent-statusline.sh", "refreshInterval": 3 }
+  "subagentStatusLine": { "type": "command", "command": "exec bash ~/.claude/subagent-statusline.sh" }
 }
 ```
 
@@ -118,7 +119,7 @@
 
 1. 身份：灰`▸ ` + name/label/type 三选一**亮紫**（区别于主行的亮青）+ 灰`(type)`（type 非空且≠身份文本时）+ 灰`·`+青·短模型名（**仅当该行模型 ≠ 面板多数模型**；短名=剥 `claude-` 前缀和 `-20`+6位日期后缀，预扫描 `group_by` 求多数）+ 灰`·`+热度色 effort（仅显式存在时；数字型预算值用黄）+ 空格+状态图标：`●`运行绿32 / `○`pending|queued|starting 黄 / `✗`failed|error|cancelled|killed 亮红 / `✓`completed|done|finished **绿**（不是灰——灰在深色主题上如同无色）/ `?`未知黄。
 2. 消耗：tokenCount 为数值即显示白`Nk` + 灰` tok`（**累计消耗**，不读 contextWindowSize、不做任何占用/百分比近似——tokenCount 是累计口径，画电池必然失真，用户明确宁精勿滥）。
-3. 走势+速率（一段，与主行第 9 段同构）：走势**主源**=脚本自建 10s 采样——`~/.claude/statusline-subagent-samples.tsv`（可用 `STATUSLINE_SUBAGENT_SAMPLES_FILE` 覆盖），0x1F 三列 `epoch␟task_id␟tokenCount`，每任务 ≥10s 才追加、读时 6h 窗+整行形状校验、`$$` 临时名原子重写（多会话共存安全），取末 ≤9 样本→≤8 格、**每格≈10s**；<2 个自建样本时回退 tokenSamples 防御式解析（数字直接用；对象试 `.tokens//.tokenCount//.count//.value//.v`；<2 个数或解析失败→静默省略，取末 8 个）。两种源同走：非递减序列先转相邻差值，归一到 ▁-▆ 六档（封顶防行间粘连）青色；速率=`tokenCount*60/(elapsed*100)` 十倍值（elapsed ≥60s 才显示），档色同主行。
+3. 走势+速率（一段，与主行第 9 段同构）：走势**主源**=脚本自建 10s 采样——**紧凑趋势态文件** `~/.claude/statusline-subagent-trend.tsv`（可用 `STATUSLINE_SUBAGENT_TREND_FILE` 覆盖），**每任务一行** `task_id␟last_epoch␟末≤9个累计值csv`：每任务 ≥10s 推进一样（csv 尾追加、逗号计数裁到末 9），读写规模=活跃任务数、**永不随采样历史增长**（前一版"每样本一行追加日志"每帧重扫数百行——MSYS 下 bash 每条语句 ~20-40μs，实测吃掉面板大半帧预算，见硬性要求 0d）；≥30 分钟无更新的死任务行下次重写清除；`$$` 临时名原子重写、多会话读合并写、丢写自愈。**每格≈10s**；<2 个值时回退 tokenSamples 防御式解析（数字直接用；对象试 `.tokens//.tokenCount//.count//.value//.v`；<2 个数或解析失败→静默省略，取末 8 个）。两种源同走：非递减序列先转相邻差值，归一到 ▁-▆ 六档（封顶防行间粘连）青色；速率=`tokenCount*60/(elapsed*100)` 十倍值（elapsed ≥60s 才显示），档色同主行。
 4. 份额：预扫描全 tasks 的 tokenCount 总和；有 token 的任务 ≥2 个才显示：灰`Σ` + `N%`（本行/总量，<50灰/50–74黄/≥75亮红）。
 5. 用时：秒级——`<60s`→`42s`、`<1h`→`5m12s`、否则`1h23m45s`，白；+灰`@HH:MM:SS`（启动时刻）。
 6. 描述：灰，宽度预算 = columns（缺省 120）−前五段纯文本长度（含 `▸ ` 与分隔符）−3；预算 <8 省略，超长截到预算−1 字符+`…`。

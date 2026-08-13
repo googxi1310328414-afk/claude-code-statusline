@@ -165,10 +165,14 @@ export LC_ALL=C.UTF-8
 # is done inline in pure bash at the emit site (PASS 2, bottom of this
 # file), not via `jq -cn`/--arg - seeing PERF comment there for why.
 
-# Zero-fork stdin slurp - `input=$(cat)` cost a subshell + a cat exec per
-# render; read -d '' takes everything to EOF in-process (JSON carries no
-# raw NUL) and its nonzero at-EOF return is guarded, var filled either way.
-IFS= read -r -d '' input || :
+# Zero-fork stdin slurp, CHUNKED (see the main script's identical block
+# for the full rationale): `read -d ''` byte-reads pipes (~550ms/100KB on
+# MSYS - and THIS script's payload carries tokenSamples, which can get
+# big); `read -N` buffers (~114ms/100KB), zero spawns. Final partial
+# chunk arrives with read's nonzero EOF return, hence the trailing append.
+input=""
+while IFS= read -r -N 65536 slurp_chunk; do input+="$slurp_chunk"; done
+input+="$slurp_chunk"
 
 # jq guard: if jq is missing, every row below is unusable - emit nothing
 # useful is impossible in this contract (no id to key a line on), so just
@@ -356,36 +360,49 @@ tokened_count="${JL[3]}"
 # for the session chart at a 20s step). Row shape: epoch/task_id/count,
 # 0x1F-separated like every other state file in this pair. Reads apply
 # strict whole-row validation (exactly 3 columns, numeric epoch/count -
-# malformed rows dropped whole, never partially trusted) plus a 6h
-# retention window (agent tasks live minutes-to-hours, not days); rows
-# outside it vanish for good at the next rewrite. Multiple concurrent
+# malformed rows dropped whole, never partially trusted) plus a 1h read
+# window (the trend needs ~90s of samples; churned-away task ids age out
+# with it); expired rows vanish for good at the next slack-triggered
+# rewrite. Multiple concurrent
 # sessions share the file: task ids are globally unique so rows never
 # clash logically, and the rewrite (after PASS 1) goes through a per-PID
 # tmp + atomic mv, so a same-tick race is last-writer-wins with the
 # loser's newest sample simply re-taken ~10s later - no corruption, no
 # error spam. Fully guarded end to end: an unreadable/unwritable file
 # only costs the sparkline its preferred source, never the row.
-subagent_samples_file="${STATUSLINE_SUBAGENT_SAMPLES_FILE:-$HOME/.claude/statusline-subagent-samples.tsv}"
+subagent_trend_file="${STATUSLINE_SUBAGENT_TREND_FILE:-$HOME/.claude/statusline-subagent-trend.tsv}"
 printf -v samp_now '%(%s)T' -1
-declare -A samp_tokens_by_id samp_last_by_id
-samp_kept_lines=()
-samp_new_lines=()
-samp_new_rows=0
-samp_stale=0
-if [ -r "$subagent_samples_file" ]; then
-  mapfile -t samp_raw_lines < "$subagent_samples_file" 2>/dev/null
-  for samp_line in "${samp_raw_lines[@]}"; do
-    IFS=$'\x1f' read -r s_epoch s_id s_tok s_extra <<< "$samp_line"
-    # any dropped row (malformed or expired) flags the file as needing the
-    # full rewrite below; clean reads take the cheap append path instead
-    [[ "$s_epoch" =~ ^[0-9]+$ ]] || { samp_stale=1; continue; }
-    [ -n "$s_id" ] || { samp_stale=1; continue; }
-    [[ "$s_tok" =~ ^[0-9]+$ ]] || { samp_stale=1; continue; }
-    [ -n "$s_extra" ] && { samp_stale=1; continue; }
-    [ $(( samp_now - s_epoch )) -gt 21600 ] && { samp_stale=1; continue; }
-    samp_kept_lines+=("$samp_line")
-    samp_tokens_by_id[$s_id]="${samp_tokens_by_id[$s_id]:-} $s_tok"
-    samp_last_by_id[$s_id]="$s_epoch"
+declare -A trend_csv_by_id trend_epoch_by_id
+trend_dirty=0
+if [ -r "$subagent_trend_file" ]; then
+  mapfile -t trend_raw_lines < "$subagent_trend_file" 2>/dev/null
+  # COMPACT TREND STATE - one row per task: id / last-sample epoch / csv
+  # of the last <=9 cumulative counts. The per-render cost is bounded by
+  # the LIVE task count and never scales with sampling history: the
+  # previous design (an append log of one row per sample) re-scanned
+  # hundreds of rows on every 5s panel tick, and on MSYS bash costs
+  # ~20-40us PER STATEMENT, so a ~10-statement row loop burned ~0.3ms
+  # per row - measured at ~330-400ms of every frame, i.e. most of the
+  # visible "default rows flash" window while the host waits for us.
+  # Rows are split/validated with parameter expansions and glob tests
+  # (exactly 3 columns; csv strictly digits+commas); a row whose task
+  # went >=30min without an update is a dead churned-away agent - it's
+  # skipped here and (trend_dirty) swept out by the next rewrite.
+  for trend_line in "${trend_raw_lines[@]}"; do
+    t_id=${trend_line%%$'\x1f'*}
+    trend_rest=${trend_line#*$'\x1f'}
+    t_epoch=${trend_rest%%$'\x1f'*}
+    t_csv=${trend_rest#*$'\x1f'}
+    [[ "$trend_line" != *$'\x1f'* ]] && continue
+    [[ "$trend_rest" != *$'\x1f'* ]] && continue
+    [[ "$t_csv" == *$'\x1f'* ]] && continue
+    [ -n "$t_id" ] || continue
+    [[ "$t_epoch" =~ ^[0-9]+$ ]] || continue
+    [ -n "$t_csv" ] || continue
+    [[ "$t_csv" == *[!0-9,]* ]] && continue
+    [ $(( samp_now - t_epoch )) -gt 1800 ] && { trend_dirty=1; continue; }
+    trend_csv_by_id[$t_id]=$t_csv
+    trend_epoch_by_id[$t_id]=$t_epoch
   done
 fi
 
@@ -501,19 +518,24 @@ for ((ti=0; ti<task_count_total; ti++)); do
     fi
   fi
 
-  # Sample this task's cumulative tokenCount into the own-samples state
-  # (at most one row per task every 10s - see the state block above PASS
-  # 1). Taken BEFORE the sparkline below so a just-taken sample is part
-  # of this very render's chart, mirroring the main script's "reflect
-  # the just-appended row" behavior.
+  # Advance this task's trend state (at most one sample every 10s - see
+  # the state block above PASS 1): append the cumulative count to the
+  # csv, keep only the last 9 values (comma-count trim, pure expansions).
+  # Taken BEFORE the sparkline below so a just-taken sample is part of
+  # this very render's chart, mirroring the main script's "reflect the
+  # just-appended row" behavior.
   if [[ "$token_count" =~ ^[0-9]+$ ]]; then
-    samp_prev_epoch="${samp_last_by_id[$id]:-}"
-    if [ -z "$samp_prev_epoch" ] || [ $(( samp_now - samp_prev_epoch )) -ge 10 ]; then
-      samp_kept_lines+=("${samp_now}"$'\x1f'"${id}"$'\x1f'"${token_count}")
-      samp_new_lines+=("${samp_now}"$'\x1f'"${id}"$'\x1f'"${token_count}")
-      samp_tokens_by_id[$id]="${samp_tokens_by_id[$id]:-} $token_count"
-      samp_last_by_id[$id]="$samp_now"
-      samp_new_rows=1
+    trend_prev_epoch="${trend_epoch_by_id[$id]:-}"
+    if [ -z "$trend_prev_epoch" ] || [ $(( samp_now - trend_prev_epoch )) -ge 10 ]; then
+      trend_new_csv="${trend_csv_by_id[$id]:+${trend_csv_by_id[$id]},}${token_count}"
+      while :; do
+        trend_commas=${trend_new_csv//[!,]/}
+        [ "${#trend_commas}" -lt 9 ] && break
+        trend_new_csv=${trend_new_csv#*,}
+      done
+      trend_csv_by_id[$id]=$trend_new_csv
+      trend_epoch_by_id[$id]=$samp_now
+      trend_dirty=1
     fi
   fi
 
@@ -539,16 +561,15 @@ for ((ti=0; ti<task_count_total; ti++)); do
   if [ "${#sfields[@]}" -ge 1 ] && [ "${sfields[0]}" = "S${ti}" ]; then
     nums=("${sfields[@]:1}")
   fi
-  # PRIMARY sparkline source: the own 10s samples loaded above (>=2 for
-  # this task id; last 9 kept -> up to 8 bars of ~10s each). The host
-  # .tokenSamples parse above remains as the cold-start fallback so a
-  # just-spawned task can still chart before two own samples exist.
-  if [ -n "${samp_tokens_by_id[$id]:-}" ]; then
-    read -r -a samp_own_all <<< "${samp_tokens_by_id[$id]}"
-    samp_own_n=${#samp_own_all[@]}
-    if [ "$samp_own_n" -ge 2 ]; then
-      samp_own_start=$(( samp_own_n > 9 ? samp_own_n - 9 : 0 ))
-      nums=("${samp_own_all[@]:$samp_own_start}")
+  # PRIMARY sparkline source: the own 10s trend state advanced above
+  # (>=2 values for this task id; already capped at the last 9 -> up to
+  # 8 bars of ~10s each). The host .tokenSamples parse above remains as
+  # the cold-start fallback so a just-spawned task can still chart
+  # before two own samples exist.
+  if [ -n "${trend_csv_by_id[$id]:-}" ]; then
+    IFS=, read -r -a samp_own_all <<< "${trend_csv_by_id[$id]}"
+    if [ "${#samp_own_all[@]}" -ge 2 ]; then
+      nums=("${samp_own_all[@]}")
     fi
   fi
   if [ "${#nums[@]}" -ge 1 ]; then
@@ -693,19 +714,20 @@ done
 # the in-memory rows ARE the post-trim file; the count cap is a runaway
 # backstop only. Per-PID tmp + atomic mv, same pattern as every other
 # state writer in this pair; all failure modes silenced.
-# Append-first write, same policy as the main script's history file: the
-# full rewrite (which doubles as the retention trim) runs only when the
-# read pass actually dropped something (expired/malformed) or the cap
-# trips; clean steady state sends the fresh samples as one O_APPEND
-# write, which concurrent sessions interleave safely.
-if [ "$samp_new_rows" -eq 1 ]; then
-  samp_total=${#samp_kept_lines[@]}
-  if [ "$samp_stale" -eq 1 ] || [ "$samp_total" -gt 4000 ]; then
-    [ "$samp_total" -gt 4000 ] && samp_kept_lines=("${samp_kept_lines[@]: -4000}")
-    printf '%s\n' "${samp_kept_lines[@]}" > "${subagent_samples_file}.tmp.$$" 2>/dev/null &&
-      mv -f "${subagent_samples_file}.tmp.$$" "$subagent_samples_file" 2>/dev/null
-  else
-    printf '%s\n' "${samp_new_lines[@]}" >> "$subagent_samples_file" 2>/dev/null
+# Persist the trend state: one row per live task, so the file is tiny
+# (task count, not history length) and a plain rewrite IS the cheap
+# path - no append/rewrite split needed. Cross-session rows were loaded
+# and re-emitted above, so concurrent sessions merge; a lost race is
+# re-derived from the loser's own next sample tick. Per-PID tmp +
+# atomic mv, all failures silenced.
+if [ "$trend_dirty" -eq 1 ]; then
+  trend_out_lines=()
+  for t_key in "${!trend_csv_by_id[@]}"; do
+    trend_out_lines+=("${t_key}"$'\x1f'"${trend_epoch_by_id[$t_key]:-0}"$'\x1f'"${trend_csv_by_id[$t_key]}")
+  done
+  if [ "${#trend_out_lines[@]}" -gt 0 ]; then
+    printf '%s\n' "${trend_out_lines[@]}" > "${subagent_trend_file}.tmp.$$" 2>/dev/null &&
+      mv -f "${subagent_trend_file}.tmp.$$" "$subagent_trend_file" 2>/dev/null
   fi
 fi
 

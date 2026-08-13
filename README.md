@@ -2,7 +2,7 @@
 
 [![test](https://github.com/googxi1310328414-afk/claude-code-statusline/actions/workflows/test.yml/badge.svg)](https://github.com/googxi1310328414-afk/claude-code-statusline/actions/workflows/test.yml)
 
-Claude Code 的信息密集型彩色状态栏（Windows / Git Bash，POSIX 兼容）：主会话四行主题网格 + 子代理面板表格行，`refreshInterval` 常驻自动刷新（默认主 10s/面板 3s，机理见专章），数据缺失的段自动隐藏、整行为空时该行消失，关键指标随状态动态变色。MIT 协议；[English](README.en.md)。
+Claude Code 的信息密集型彩色状态栏（Windows / Git Bash，POSIX 兼容）：主会话四行主题网格 + 子代理面板表格行，`refreshInterval` 常驻自动刷新（主 10s；面板为宿主固定 ~5s 节拍，机理见专章），数据缺失的段自动隐藏、整行为空时该行消失，关键指标随状态动态变色。MIT 协议；[English](README.en.md)。
 
 ![效果预览](assets/preview.svg)
 
@@ -66,10 +66,10 @@ GitHub Actions 在每次 push 自动跑断言套件。
 
 1. **事件驱动打底**：宿主在新助手消息、`/compact`、权限切换等时刻重跑脚本（约 300ms 防抖）。只有这层时，空闲期状态栏静止不动。
 2. **`refreshInterval: N`（秒）常驻定时器**：settings.json 配上后，空闲时宿主也每 N 秒把最新 stdin JSON 喂给脚本**整个重跑一遍**、用输出重画。每帧都是全新进程、无常驻驻留——跨帧记忆（走势/速率/today/week/子代理采样）全部依赖 `~/.claude` 下的状态文件续命，这是"无状态脚本 + 有状态文件"的刻意设计。命令写成 `exec bash ~/.claude/…`（见 settings-snippet）可省掉宿主 `-c` 包装壳那一层进程。
-3. **取消规则（生死线）**：新触发到来时宿主会 **taskkill 杀掉仍在跑的上一帧**。因此 **N 必须显著大于最坏渲染耗时**——一旦机器负载把渲染拖过 N 秒，就进入"帧帧被杀→输出永远到不了终点→整栏空白"的取消风暴（2026-08-13 双会话 fork 枯竭实锤：渲染被拖过 2s 间隔，黑匣子与进程启动追踪均有存证）。本仓库默认主栏 **10s**、子代理面板 **3s**，渲染实测 0.4–1.3s，余量约 8×。
+3. **取消规则（生死线）**：新触发到来时宿主会 **taskkill 杀掉仍在跑的上一帧**。因此 **N 必须显著大于最坏渲染耗时**——一旦机器负载把渲染拖过 N 秒，就进入"帧帧被杀→输出永远到不了终点→整栏空白"的取消风暴（2026-08-13 双会话 fork 枯竭实锤：渲染被拖过 2s 间隔，黑匣子与进程启动追踪均有存证）。本仓库默认主栏 **10s**；子代理面板的节拍**由宿主固定**（2.1.229 实测精确 ~5s 一拍，`refreshInterval` 键对 subagentStatusLine 无效，勿配）。渲染实测 0.4–1.3s，余量充足。
 4. **配置热重载**：宿主对 settings.json 做**内容**监听——改任意值保存，渲染循环 1 秒内重建（仅 touch mtime **无效**）。渲染循环因挂死彻底卡住时，这也是唯一免重启的复活手段。
 5. **忙碌回合**：主栏**画面**冻结在回合开始帧，但**调用照常**（状态文件持续新鲜，回合结束瞬间回正）；子代理面板不受此限、全程实时。
-6. **采样与刷新的配比**：主栏 10s 刷新 × 20s 采样节流 = 每两帧记一次历史（走势每格≈20s）；面板 3s 刷新 × 10s 采样 = 约每三帧一样（每格≈10s）。调 `refreshInterval` 时记得连同脚本内节流一起配比。
+6. **采样与刷新的配比**：主栏 10s 刷新 × 20s 采样节流 = 每两帧记一次历史（走势每格≈20s）；面板宿主 ~5s 节拍 × 10s 采样 = 每两帧一样（每格≈10s）。调 `refreshInterval` 时记得连同脚本内节流一起配比。
 7. **自愈层（可选，Windows）**：`statusline-watchdog.ps1` 由计划任务每 2 分钟清理挂死 >30s 的渲染 bash（fork 枯竭下的兜底）；**必须经 `statusline-watchdog.vbs`（wscript）拉起**——计划任务直接跑 powershell 会在 `-WindowStyle Hidden` 生效前闪一下控制台窗口。两文件复制到 `~/.claude/`（vbs 内路径按机器改）后：`schtasks /Create /SC MINUTE /MO 2 /TN claude-statusline-watchdog /TR "wscript.exe C:\Users\<你>\.claude\statusline-watchdog.vbs"`。
 
 ## 已知边界

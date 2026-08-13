@@ -6,7 +6,6 @@
   },
   "subagentStatusLine": {
     "type": "command",
-    "command": "exec bash ~/.claude/subagent-statusline.sh",
-    "refreshInterval": 3
+    "command": "exec bash ~/.claude/subagent-statusline.sh"
   }
 }

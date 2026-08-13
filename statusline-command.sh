@@ -337,13 +337,19 @@ NBSP=$'\xc2\xa0'
 OSC_OPEN=$'\e]8;;'
 OSC_CLOSE=$'\e\\'
 
-# Zero-fork stdin slurp: `input=$(cat)` forked a subshell AND exec'd an
-# external cat - 2 spawns per render just to read the payload. read -d ''
-# takes everything up to EOF in-process (JSON never carries a raw NUL);
-# it returns nonzero when EOF arrives without a NUL, so the guard keeps
-# that from tripping anything - the variable is filled either way. (The
-# trailing newline $(cat) used to strip is irrelevant to jq.)
-IFS= read -r -d '' input || :
+# Zero-fork stdin slurp, CHUNKED: `$(cat)` cost a subshell + a cat exec
+# per render, but the obvious builtin replacement (`read -d ''`) does
+# BYTE-AT-A-TIME reads on pipes - measured ~550ms per 100KB on MSYS,
+# a regression for big payloads. `read -N` never has to push back past
+# a delimiter, so bash buffers its reads: ~114ms for the same 100KB
+# (vs ~139ms for $(cat)), with zero spawns. The loop appends full
+# 64Ki-char chunks; read returns nonzero at EOF with the final partial
+# chunk still delivered, hence the trailing append (an exact-multiple
+# payload just appends ""). Multibyte chars can't tear: -N counts
+# characters, not bytes, under the UTF-8 locale set above.
+input=""
+while IFS= read -r -N 65536 slurp_chunk; do input+="$slurp_chunk"; done
+input+="$slurp_chunk"
 
 # jq guard: if jq is missing, every segment below is unusable - degrade to
 # one line (clock via the bash date builtin, no process spawn) and exit
@@ -576,12 +582,25 @@ cost_epochs=(); cost_values=()
 
 if [ -n "$session_id" ]; then
   last_hist_epoch=""
+  # HOT LOOP (and the fold loop further down, same treatment): rows are
+  # split with parameter expansions, NOT `IFS read -a <<<` - a herestring
+  # materializes a pipe/temp per use (~0.25ms each on MSYS), which across
+  # hundreds of rows in BOTH loops was several hundred ms of EVERY
+  # render. The expansion chain + "no separator left in the last field"
+  # test is exactly the old exactly-4-fields shape check.
   for hline in "${hist_all_lines[@]}"; do
     hline=${hline//$'\r'/}
     hline=${hline//$'\t'/$'\x1f'}
-    IFS=$'\x1f' read -r -a hfields <<< "$hline"
-    [ "${#hfields[@]}" -eq 4 ] || continue
-    h_epoch="${hfields[0]}"; h_sid="${hfields[1]}"; h_tok="${hfields[2]}"; h_cost="${hfields[3]}"
+    h_epoch=${hline%%$'\x1f'*}
+    h_rest=${hline#*$'\x1f'}
+    h_sid=${h_rest%%$'\x1f'*}
+    h_rest2=${h_rest#*$'\x1f'}
+    h_tok=${h_rest2%%$'\x1f'*}
+    h_cost=${h_rest2#*$'\x1f'}
+    [[ "$hline" != *$'\x1f'* ]] && continue
+    [[ "$h_rest" != *$'\x1f'* ]] && continue
+    [[ "$h_rest2" != *$'\x1f'* ]] && continue
+    [[ "$h_cost" == *$'\x1f'* ]] && continue
     [[ "$h_epoch" =~ ^[0-9]+$ ]] || continue
     [ "$h_sid" != "$session_id" ] && continue
     last_hist_epoch="$h_epoch"
@@ -727,14 +746,22 @@ daily_dirty=0
 for hline in "${hist_all_lines[@]}"; do
   hline=${hline//$'\r'/}
   hline=${hline//$'\t'/$'\x1f'}
-  IFS=$'\x1f' read -r -a hfields <<< "$hline"
-  # WHOLE-ROW shape check (see the history-file comment above) - a line
-  # that doesn't split into exactly 4 fields is dropped here entirely,
-  # both from the rollup folds AND from the trimmed rewrite below, since
-  # its epoch can't be trusted enough to even decide whether it's within
-  # the trim window.
-  [ "${#hfields[@]}" -eq 4 ] || continue
-  h_epoch="${hfields[0]}"; h_sid="${hfields[1]}"; h_tok="${hfields[2]}"; h_cost="${hfields[3]}"
+  # WHOLE-ROW shape check via expansions (see the HOT LOOP comment on the
+  # per-session scan above for why not `read <<<`): exactly 4 fields =
+  # 3 separators present, none left in the cost field. A malformed line
+  # is dropped entirely, both from the rollup folds AND from the trimmed
+  # rewrite below, since its epoch can't be trusted enough to even decide
+  # whether it's within the trim window.
+  h_epoch=${hline%%$'\x1f'*}
+  h_rest=${hline#*$'\x1f'}
+  h_sid=${h_rest%%$'\x1f'*}
+  h_rest2=${h_rest#*$'\x1f'}
+  h_tok=${h_rest2%%$'\x1f'*}
+  h_cost=${h_rest2#*$'\x1f'}
+  [[ "$hline" != *$'\x1f'* ]] && continue
+  [[ "$h_rest" != *$'\x1f'* ]] && continue
+  [[ "$h_rest2" != *$'\x1f'* ]] && continue
+  [[ "$h_cost" == *$'\x1f'* ]] && continue
   [[ "$h_epoch" =~ ^[0-9]+$ ]] || continue
   [ -z "$hist_oldest_epoch" ] && hist_oldest_epoch="$h_epoch"
 

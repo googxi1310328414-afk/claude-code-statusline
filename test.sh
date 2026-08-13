@@ -9,7 +9,7 @@ cd "$(dirname "$0")" || exit 1
 # 全程使用隔离历史文件——绝不触碰真实 ~/.claude/statusline-history.tsv
 export STATUSLINE_HISTORY_FILE="$(mktemp -u)/test-hist.tsv" 2>/dev/null || export STATUSLINE_HISTORY_FILE="/tmp/statusline-test-hist.$$"
 mkdir -p "$(dirname "$STATUSLINE_HISTORY_FILE")"
-export STATUSLINE_SUBAGENT_SAMPLES_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-subsamp.tsv"
+export STATUSLINE_SUBAGENT_TREND_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-subtrend.tsv"
 export STATUSLINE_DAILY_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-daily.tsv"
 trap 'rm -rf "$(dirname "$STATUSLINE_HISTORY_FILE")"' EXIT
 
@@ -147,11 +147,12 @@ if [ "$1" = "--assert" ]; then
   printf '%s' "$solo" | grep -q '| |' && bad "solo row empty cell" || ok "solo row clean"
   printf '%s' "$solo" | grep -q 'Σ' && bad "solo row shows share" || ok "solo hides share"
 
-  # own 10s sampling: the two renders above took one sample per tokened
-  # task (3 from the panel payload + 1 from solo)
-  [ "$(grep -c . "$STATUSLINE_SUBAGENT_SAMPLES_FILE" 2>/dev/null)" -eq 4 ] && ok "subagent samples captured" || bad "subagent samples file wrong"
-  # pre-seeded own samples (10s apart) drive the sparkline as primary source
-  printf "%s\x1fms\x1f%s\n" "$((now-30))" 1000 "$((now-20))" 3000 "$((now-10))" 4000 > "$STATUSLINE_SUBAGENT_SAMPLES_FILE"
+  # own 10s trend state: the two renders above created one row per
+  # tokened task (3 from the panel payload + 1 from solo)
+  [ "$(grep -c . "$STATUSLINE_SUBAGENT_TREND_FILE" 2>/dev/null)" -eq 4 ] && ok "subagent trend rows captured" || bad "subagent trend file wrong"
+  # pre-seeded trend csv (plus this render's fresh sample) drives the
+  # sparkline as primary source
+  printf "ms\x1f%s\x1f1000,3000,4000\n" "$((now-10))" > "$STATUSLINE_SUBAGENT_TREND_FILE"
   spark=$(subagent_payload "$now" | bash ./subagent-statusline.sh | jq -r 'select(.id=="ms") | .content' | strip)
   printf '%s' "$spark" | grep -qE '[▁▂▃▄▅▆]' && ok "subagent sparkline from own samples" || bad "own-sample sparkline missing"
 
