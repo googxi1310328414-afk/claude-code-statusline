@@ -20,22 +20,17 @@ export LC_ALL=C.UTF-8
 # - there's no id to key a fallback line on in this contract, unlike the
 # main script's single-line fallback.
 #
-# PERFORMANCE: THREE whole-payload jq invocations, not one per field/
-# task: one for the four payload-wide scalars (columns, majority_model,
-# total_tokens, tokened_count), one that emits a row of Unit-Separator-
-# delimited fields per task for every per-task field except tokenSamples
-# (id, identity, type, model, effort, status, startTime, tokenCount,
-# description - split per row via `read`, not a tjq() call per field; NOT
-# literal TSV/tab-delimited - see the extraction site's comment for why),
-# and one raw-JSON-per-task pass (`.tasks[]?` again, same order, indexed
-# in lockstep) kept only because tokenSamples' array-slicing/type-
-# checking doesn't fit a flat delimited row - PLUS one more small jq call
-# PER TASK for that tokenSamples parse specifically (disclosed exception:
-# "three total" is the whole-payload calls; a payload of N tasks is
-# 3+N jq invocations, not 3, because that one sub-parse doesn't fit a
-# flat row - see its own PERF comment further down). `date` is never
-# called - bash's own `printf '%(fmt)T' epoch` builtin (4.2+, zero
-# process spawns) is used everywhere a timestamp is needed.
+# PERFORMANCE: ONE jq invocation for the ENTIRE payload - previously 3
+# whole-payload calls (scalars, raw-JSON-per-task, per-task TSV rows)
+# PLUS one more small jq call PER TASK for the tokenSamples sub-parse
+# (3+N total). That per-task call is now folded into the SAME single
+# invocation, inside the same per-task iteration that builds each task's
+# row - see the extraction site's own PERF comment (right above the jq
+# call itself) for exactly how the two are interleaved in one output
+# stream and split back apart in bash with zero further jq/awk/grep
+# calls. `date` is never called - bash's own `printf '%(fmt)T' epoch`
+# builtin (4.2+, zero process spawns) is used everywhere a timestamp is
+# needed.
 #
 # NO-FORK HELPER RETURNS: disp_width() and short_model() write to the
 # global REPLY variable instead of printf-to-stdout, and every call site
@@ -51,11 +46,11 @@ export LC_ALL=C.UTF-8
 # not just %()T dates.
 #
 # EXPECTED REMAINING SPAWN INVENTORY per render, after this pass: exactly
-# 3 + N jq invocations (N = task count, for the per-task tokenSamples
-# parse - see above; this is the one still-open item from the prior de-
-# spawn round, not new). Nothing else in this script forks: every helper
-# call, every %()T/%*s format, every per-task/per-character loop is a
-# bash builtin or parameter expansion.
+# ONE jq invocation, full stop, regardless of task count - the 3+N
+# per-task jq exception from the prior de-spawn round is fully closed.
+# Nothing else in this script forks: every helper call, every %()T/%*s
+# format, every per-task/per-character loop is a bash builtin or
+# parameter expansion.
 #
 # Per-task fields consumed: id, name, type, status, description, label,
 # startTime (unix seconds or milliseconds), tokenCount, contextWindowSize,
@@ -188,26 +183,6 @@ MAGENTA_BRIGHT=$'\e[95m'
 NBSP=$'\xc2\xa0'
 SEP="${RESET}${GRAY}${NBSP}|${NBSP}${RESET}"
 
-# PERF: one jq call for the four payload-wide scalars instead of four; a
-# here-string (<<<) feeds jq without an extra forked stage (unlike a pipe
-# from another command), and the CR-strip is a parameter expansion instead
-# of `tr`, and the split is a here-string mapfile instead of a piped one.
-jq_g_out=$(jq -r '
-  (.columns // ""),
-  ([.tasks[]? | .model // empty | select(length>0)] | group_by(.) | max_by(length) | .[0] // ""),
-  ([.tasks[]? | .tokenCount // 0 | select(type=="number")] | add // 0 | tostring),
-  ([.tasks[]? | .tokenCount // empty | select(type=="number" and . > 0)] | length | tostring)
-' <<< "$input" 2>/dev/null)
-jq_g_out=${jq_g_out//$'\r'/}
-mapfile -t G <<< "$jq_g_out"
-columns="${G[0]}"
-majority_model="${G[1]}"
-total_tokens="${G[2]}"
-tokened_count="${G[3]}"
-[[ "$columns" =~ ^[0-9]+$ ]] || columns=120
-[[ "$total_tokens" =~ ^[0-9]+$ ]] || total_tokens=0
-[[ "$tokened_count" =~ ^[0-9]+$ ]] || tokened_count=0
-
 # NO-FORK RETURN via global REPLY (see disp_width's comment below for the
 # full rationale - every pure-bash helper in this script follows the same
 # pattern now: call sites do `short_model "$x"; y="$REPLY"`, never
@@ -274,14 +249,28 @@ disp_width() {
   REPLY="$total"
 }
 
-# PERF: two jq calls total for the whole task list (not per-field, not
-# per-task): raw compact JSON per task (all_tasks, needed only for the
-# tokenSamples sub-parse below, which stays its own small per-task call
-# since its array-slicing/type-checking logic doesn't fit a flat delimited
-# row), and ONE combined extraction (task_rows) for every other per-task
-# field, split per row via `read` instead of one tjq() call per field.
-# .tasks[]? is iterated identically (no filtering) by both queries, so
-# index i of all_tasks and task_rows always describe the same task.
+# PERF: ONE jq invocation for the ENTIRE payload - the four payload-wide
+# scalars, every per-task field, AND the tokenSamples sub-parse are all
+# emitted by this single call now (previously 3 whole-payload calls +
+# 1 more per task, i.e. 3+N total). The tokenSamples slicing/type-
+# checking that used to need its own small per-task call (it doesn't fit
+# a flat delimited row) is done here too, inside the SAME `range($tcount)`
+# iteration that builds each task's row, emitting a companion "samples
+# line" tagged "S<index>" right after that task's row line. A tag (not
+# just position) is used deliberately: a task with fewer than 2 usable
+# samples still emits a samples line (just the bare tag, no numbers), so
+# every task ALWAYS contributes exactly 2 output lines - if that ever
+# stopped being true for any reason, the tag lets the bash side detect
+# and reject a misaligned line instead of silently reading garbage into
+# the wrong task's sparkline.
+#
+# Output line order: columns, majority_model, total_tokens, tokened_count,
+# then per task (i = 0..tcount-1, same order as .tasks[]): row_i,
+# samples_i. Bash captures ALL of it into one array (JL); JL[0..3] are the
+# four scalars, JL[4+2*i] is task i's row, JL[4+2*i+1] is task i's samples
+# line - task_count_total is derived from (total line count - 4) / 2, not
+# read from anywhere else, so it can never disagree with the array it
+# indexes into.
 #
 # CANONICAL COLUMN ORDER - the jq array below and the `read` variable
 # list in the PASS 1 loop MUST stay exactly parallel; if a field is ever
@@ -295,36 +284,61 @@ disp_width() {
 # row or misalign a column); every real separator tab @tsv inserts
 # BETWEEN fields (never inside one - an embedded one is the 2-char escape
 # by then) is then rewritten, in BASH after capture (a plain parameter-
-# expansion replace, matches a raw tab BYTE only - see below), to the
-# ASCII Unit Separator 0x1F. This rewrite is required, not cosmetic:
-# space/tab/newline are BASH "IFS-whitespace" characters, so
-# `IFS=$'\t' read -r a b c <<<...` silently COLLAPSES any run of
-# consecutive tabs - i.e. every empty field, and most tasks have several
-# (no type/model/effort is common) - into a single delimiter, shifting
-# every field after the first empty one into the wrong variable (this hit
-# production: status landing in the type slot, startTime in the model
-# slot, etc). 0x1F is not IFS-whitespace, so empty fields between two
-# 0x1F bytes are preserved exactly; the `read` below uses IFS=$'\x1f' to
-# match.
-all_tasks_out=$(jq -c '.tasks[]?' <<< "$input" 2>/dev/null)
-all_tasks_out=${all_tasks_out//$'\r'/}
-mapfile -t all_tasks <<< "$all_tasks_out"
-task_rows_out=$(jq -r '
-  .tasks[]? | [
-    (.id // ""),
-    (if (.name != null and .name != "") then .name elif (.label != null and .label != "") then .label elif (.type != null and .type != "") then .type else "" end),
-    (.type // ""),
-    (.model // ""),
-    (.effort // "" | tostring),
-    (.status // ""),
-    (.startTime // "" | tostring),
-    (.tokenCount // "" | tostring),
-    (.description // "")
-  ] | @tsv #z")
+# expansion replace, matches a raw tab BYTE only), to the ASCII Unit
+# Separator 0x1F, ACROSS THE WHOLE captured blob in one shot (cheaper than
+# per-line, and correct either way since the replace only ever touches
+# raw tab bytes, never the newlines mapfile splits on). This rewrite is
+# required, not cosmetic: space/tab/newline are BASH "IFS-whitespace"
+# characters, so `IFS=$'\t' read -r a b c <<<...` silently COLLAPSES any
+# run of consecutive tabs - i.e. every empty field, and most tasks have
+# several (no type/model/effort is common) - into a single delimiter,
+# shifting every field after the first empty one into the wrong variable
+# (this hit production: status landing in the type slot, startTime in the
+# model slot, etc). 0x1F is not IFS-whitespace, so empty fields between
+# two 0x1F bytes are preserved exactly; every `read` below uses
+# IFS=$'\x1f' to match.
+jq_all_out=$(jq -r '
+  (.columns // "") as $columns
+  | (.tasks // []) as $tasks_raw
+  | ($tasks_raw | if type == "array" then . else [] end) as $tasks
+  | ($tasks | length) as $tcount
+  | ([$tasks[]? | .model // empty | select(length>0)] | group_by(.) | max_by(length) | .[0] // "") as $majority_model
+  | ([$tasks[]? | .tokenCount // 0 | select(type=="number")] | add // 0 | tostring) as $total_tokens
+  | ([$tasks[]? | .tokenCount // empty | select(type=="number" and . > 0)] | length | tostring) as $tokened_count
+  | $columns, $majority_model, $total_tokens, $tokened_count,
+    (
+      range(0; $tcount) as $i
+      | ($tasks[$i]) as $task
+      | (
+          [
+            ($task.id // ""),
+            (if ($task.name != null and $task.name != "") then $task.name elif ($task.label != null and $task.label != "") then $task.label elif ($task.type != null and $task.type != "") then $task.type else "" end),
+            ($task.type // ""),
+            ($task.model // ""),
+            ($task.effort // "" | tostring),
+            ($task.status // ""),
+            ($task.startTime // "" | tostring),
+            ($task.tokenCount // "" | tostring),
+            ($task.description // "")
+          ] | @tsv
+        ),
+        (
+          ([$task.tokenSamples[]? | if type=="number" then . elif type=="object" then (.tokens // .tokenCount // .count // .value // .v // empty) else empty end | select(type=="number")]) as $n
+          | (["S" + ($i|tostring)] + (if ($n|length) >= 2 then ($n[-8:] | map(tostring)) else [] end)) | @tsv
+        )
+    )
+# #z")
 ' <<< "$input" 2>/dev/null)
-task_rows_out=${task_rows_out//$'\r'/}
-task_rows_out=${task_rows_out//$'\t'/$'\x1f'}
-mapfile -t task_rows <<< "$task_rows_out"
+jq_all_out=${jq_all_out//$'\r'/}
+jq_all_out=${jq_all_out//$'\t'/$'\x1f'}
+mapfile -t JL <<< "$jq_all_out"
+columns="${JL[0]}"
+majority_model="${JL[1]}"
+total_tokens="${JL[2]}"
+tokened_count="${JL[3]}"
+[[ "$columns" =~ ^[0-9]+$ ]] || columns=120
+[[ "$total_tokens" =~ ^[0-9]+$ ]] || total_tokens=0
+[[ "$tokened_count" =~ ^[0-9]+$ ]] || tokened_count=0
 
 # ---------- PASS 1: compute every row's 6 cells + track column maxima ----------
 ids=()
@@ -336,13 +350,15 @@ col3_c=(); col3_p=()   # token share
 col4_c=(); col4_p=()   # elapsed
 col_max=(0 0 0 0 0)
 
-task_count_total=${#all_tasks[@]}
+jl_count=${#JL[@]}
+task_count_total=$(( (jl_count - 4) / 2 ))
+[ "$task_count_total" -lt 0 ] && task_count_total=0
 for ((ti=0; ti<task_count_total; ti++)); do
-  task="${all_tasks[$ti]}"
+  row_idx=$(( 4 + 2*ti ))
   # Field order matches the CANONICAL COLUMN ORDER comment above exactly.
   # IFS is the Unit Separator (0x1F), NOT tab - see that comment for why a
   # literal tab here would silently corrupt any row with an empty field.
-  IFS=$'\x1f' read -r id identity_plain task_type model effort status start_time token_count description <<< "${task_rows[$ti]}"
+  IFS=$'\x1f' read -r id identity_plain task_type model effort status start_time token_count description <<< "${JL[$row_idx]}"
   [ -z "$id" ] && continue
 
   # column 1: identity segment: "▸ " + identity (bright magenta) + "(type)"
@@ -439,23 +455,26 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # column 3: sparkline + burn rate, ONE combined segment (each half
   # independently optional), matching the main script's token-rate layout.
   # PERF: the tokenSamples extraction, the >=2-usable-numbers check, and
-  # the last-8 slice are now ONE jq call (this is the only per-task jq
-  # call left; it can't be folded into the whole-payload TSV extraction
-  # above because its array-slicing/type-checking doesn't fit a flat
-  # field). If fewer than 2 valid numbers exist, this jq program
-  # deliberately produces no output at all; the resulting empty herestring
-  # still yields one empty-string array element after mapfile, which the
-  # numeric-regex validation below naturally rejects, so no special-casing
-  # is needed for that case.
+  # the last-8 slice are now computed by the SAME single consolidated jq
+  # call above (no per-task jq call left at all - see that call's own PERF
+  # comment). Its companion "samples line" for this task is JL[row_idx+1],
+  # tagged "S<ti>"; the tag is checked against this row's own index before
+  # trusting the numbers, so a shifted/misaligned line (which should never
+  # happen, but costs nothing to guard) degrades to "no sparkline" instead
+  # of feeding a wrong task's samples into this one's chart. A task with
+  # fewer than 2 usable samples still has a samples line (bare tag, no
+  # numbers), so nums ends up empty and the numeric-regex/count checks
+  # below naturally reject it - no special-casing needed for that case.
   spark_seg=""
   spark_plain=""
-  nums_out=$(jq -r '
-    [.tokenSamples[]? | if type=="number" then . elif type=="object" then (.tokens // .tokenCount // .count // .value // .v // empty) else empty end | select(type=="number")] as $n
-    | if ($n|length) >= 2 then ($n[-8:] | .[]) else empty end
-  ' <<< "$task" 2>/dev/null)
-  nums_out=${nums_out//$'\r'/}
-  if [ -n "$nums_out" ]; then
-    mapfile -t nums <<< "$nums_out"
+  samp_idx=$(( row_idx + 1 ))
+  samples_line="${JL[$samp_idx]:-}"
+  IFS=$'\x1f' read -r -a sfields <<< "$samples_line"
+  nums=()
+  if [ "${#sfields[@]}" -ge 1 ] && [ "${sfields[0]}" = "S${ti}" ]; then
+    nums=("${sfields[@]:1}")
+  fi
+  if [ "${#nums[@]}" -ge 1 ]; then
     n_ok=1
     for nv in "${nums[@]}"; do
       [[ "$nv" =~ ^-?[0-9]+$ ]] || n_ok=0

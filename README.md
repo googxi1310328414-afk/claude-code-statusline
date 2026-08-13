@@ -1,5 +1,7 @@
 # claude-code-statusline
 
+[![test](https://github.com/googxi1310328414-afk/claude-code-statusline/actions/workflows/test.yml/badge.svg)](https://github.com/googxi1310328414-afk/claude-code-statusline/actions/workflows/test.yml)
+
 Claude Code 的信息密集型彩色状态栏（Windows / Git Bash，POSIX 兼容）：主会话四行主题网格 + 子代理面板表格行，每 2 秒自动刷新，数据缺失的段自动隐藏、整行为空时该行消失，关键指标随状态动态变色。MIT 协议；[English](README.en.md)。
 
 ![效果预览](assets/preview.svg)
@@ -15,7 +17,7 @@ $0.42 $4.8/h                        | today $55.97      | week $89.20           
 
 | 行 | 主题 | 段 |
 |---|---|---|
-| 1 | 身份与位置 | 秒级时钟 · 模型`·`思考档位（热度色）`·`think · 目录缩写（`~`/折叠，末级亮蓝）· `⎇`worktree · 仓库（**OSC 8 超链接**）· 分支+脏`*` · PR（**超链接** + 评审状态 + CI 徽记）|
+| 1 | 身份与位置 | 秒级时钟 · 模型`·`思考档位（热度色）`·`think · 目录缩写（`~`/折叠，末级亮蓝）· `⎇`worktree · 仓库（**OSC 8 超链接**）· 分支+脏`*` · PR（**超链接** + 评审状态 + CI 徽记）· `⚡bypass` 权限警示（settings 配置近似）|
 | 2 | 上下文引擎 | `ctx` 五格电池（**占用=输入+最新输出**，`│`=80% 压缩线惯例标记，k/M 单位）· 消耗走势`▁▂▃▄▅▆`+速率（同段同色）· `cache 命中率一位小数 r/w量 新鲜度(hot→倒计时→cold)` · `↻`压缩次数`↓`回收量 |
 | 3 | 花费 | `$`金额+`$X.X/h`速率 · `today` 今日跨会话总花费 · `week` 近 7 天总花费 · `+增/-删`行数 |
 | 4 | 限额与会话 | `5h`/`7d` 用量%`·t`时间游标`→`重置时刻 · `wk` 按模型周配额（当前模型常显，他模型 ≥50% 才现身）· `extra` 付费溢出 · `»`会话名 |

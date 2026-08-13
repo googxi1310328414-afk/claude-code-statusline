@@ -107,6 +107,20 @@ export LC_ALL=C.UTF-8
 #      row ~/.claude/statusline-ci-cache entry <60s old that matches this
 #      repo+PR; otherwise no glyph this render, and a detached `gh pr
 #      checks` background job refreshes the cache for next time
+#   (BYPASS WARNING, last on line 1: bright red "⚡bypass", only when
+#   ~/.claude/settings.json's raw text contains both "defaultMode" and
+#   "bypassPermissions" as independent substrings, checked with zero
+#   process spawns - two plain bash [[ == *pattern* ]] tests, not a JSON
+#   parse. APPROXIMATION, not ground truth: the stdin payload has no live
+#   per-session permission_mode field at all, so this reads the
+#   CONFIGURED default from disk instead of the actual live mode for this
+#   session - a session that started before a settings change, or had its
+#   mode toggled after starting, will show a stale value; the substring
+#   check is also proximity-free (checks the two strings appear ANYWHERE
+#   in the file, not that they're part of the same key/value pair), so it
+#   could in theory false-positive if "bypassPermissions" appeared
+#   elsewhere in the file unrelated to defaultMode. Accepted tradeoffs
+#   for a zero-spawn check - see the inline comment above its code.)
 #
 # LINE 2 (context engine), joined with " | ":
 #   8  context battery, always led by a gray "ctx" label + space (so it
@@ -920,6 +934,38 @@ if [ -n "$pr_number" ]; then
       ) >/dev/null 2>&1 &
       disown
     fi
+  fi
+fi
+
+# BYPASS WARNING: the main stdin payload has NO live per-session
+# permission_mode field, so this APPROXIMATES it from the CONFIGURED
+# default in ~/.claude/settings.json instead - this is NOT the live mode
+# for this session (a session could have started before a settings
+# change, or have its mode toggled at runtime after starting; this only
+# reflects what's on disk right now, re-checked fresh every render). File
+# is read whole via `read -r -d ''` (reads to EOF/NUL into one variable
+# in the current shell, zero forks - deliberately not $(< file), which
+# isn't guaranteed fork-free the way redirecting straight into a builtin
+# is); `read`'s own non-zero exit at EOF-without-a-delimiter is expected
+# and ignored (`|| true`) - the variable is populated either way.
+# Detection is two INDEPENDENT substring checks ANDed together (not one
+# combined pattern), so incidental JSON formatting/whitespace differences
+# (key on its own line vs. inline, spacing, key order) can't defeat the
+# match; this is a deliberate proximity-free approximation, not a real
+# JSON parse (no jq call here - this must stay a zero-process check), so
+# it could in theory false-positive if "bypassPermissions" appeared
+# anywhere else in the file for an unrelated reason - an accepted
+# tradeoff for a zero-spawn check. Rendered at the END of line 1, after
+# PR, only when both substrings are found.
+bypass_seg=""
+bypass_plain=""
+settings_file="$HOME/.claude/settings.json"
+if [ -f "$settings_file" ]; then
+  settings_raw=""
+  IFS= read -r -d '' settings_raw < "$settings_file" || true
+  if [[ "$settings_raw" == *'"defaultMode"'* ]] && [[ "$settings_raw" == *'"bypassPermissions"'* ]]; then
+    bypass_seg="${RED_BRIGHT}⚡bypass${RESET}"
+    bypass_plain="⚡bypass"
   fi
 fi
 
@@ -1906,6 +1952,7 @@ else
   [ -n "$repo" ]         && { parts1+=("$repo"); parts1_plain+=("$repo_plain"); }
   [ -n "$branch" ]       && { parts1+=("$branch"); parts1_plain+=("$branch_plain"); }
   [ -n "$pr_seg" ]       && { parts1+=("$pr_seg"); parts1_plain+=("$pr_plain"); }
+  [ -n "$bypass_seg" ]   && { parts1+=("$bypass_seg"); parts1_plain+=("$bypass_plain"); }
 
   # Line 2: context engine
   parts2=()

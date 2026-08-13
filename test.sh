@@ -72,6 +72,18 @@ if [ "$1" = "--assert" ]; then
   done <<< "$plain"
   [ "$aligned" -eq 1 ] && ok "first separator aligned (byte-wise)" || bad "first separator misaligned"
   awk -v a="$t0" -v b="$t1" 'BEGIN{exit (b-a < 3.0) ? 0 : 1}' && ok "render < 3s" || bad "render too slow"
+  printf '%s' "$plain" | grep -q '·t60%' && ok "pace cursor value (t60%)" || bad "pace value wrong"
+
+  narrow=$(COLUMNS=80 bash ./statusline-command.sh < fixtures/full.json | strip)
+  [ "$(printf '%s\n' "$narrow" | wc -l)" -eq 1 ] && ok "narrow mode single line" || bad "narrow mode line count"
+  printf '%s' "$narrow" | grep -q 'today' && bad "narrow leaks wide segments" || ok "narrow drops wide segments"
+
+  hotout=$(make_transcript "$tmpd/tr2.jsonl"; jq --arg tp "$tmpd/tr2.jsonl" '.transcript_path=$tp' fixtures/full.json | bash ./statusline-command.sh | strip)
+  printf '%s' "$hotout" | grep -q ' hot' && ok "cache hot state" || bad "hot state missing"
+  oldts=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -v-2H +%Y-%m-%dT%H:%M:%S.000Z)
+  printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"usage\":{\"cache_read_input_tokens\":50000}},\"timestamp\":\"$oldts\"}" > "$tmpd/tr3.jsonl"
+  coldout=$(jq --arg tp "$tmpd/tr3.jsonl" '.transcript_path=$tp' fixtures/full.json | bash ./statusline-command.sh | strip)
+  printf '%s' "$coldout" | grep -q 'cold' && ok "cache cold state" || bad "cold state missing"
 
   sub=$(subagent_payload "$now" | bash ./subagent-statusline.sh)
   [ "$(printf '%s\n' "$sub" | wc -l)" -eq 3 ] && ok "subagent 3 rows" || bad "subagent row count"
