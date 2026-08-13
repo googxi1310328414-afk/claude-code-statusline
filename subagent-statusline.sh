@@ -102,9 +102,9 @@ export LC_ALL=C.UTF-8
 #      name = id with a leading "claude-" and a trailing "-20"+6-digits
 #      date suffix both stripped (e.g. "claude-haiku-4-5-20251001" ->
 #      "haiku-4-5").
-#   1b model cell: the short model name (cyan; "claude-" prefix, a
-#      trailing "[1m]"-style capacity tag and the "-20"+date suffix all
-#      stripped) as its OWN standalone column right after identity -
+#   1b model cell: the short model name (cyan; "claude-" prefix and the
+#      "-20"+date suffix stripped, a trailing "[1m]"-style capacity tag
+#      KEPT verbatim) as its OWN standalone column right after identity -
 #      user request: not glued to the task name. Unconditional whenever
 #      .model is present; when no task in the payload has a model the
 #      whole column is dropped by the active-column pass. majority_model
@@ -207,10 +207,9 @@ SEP="${RESET}${GRAY}${NBSP}|${NBSP}${RESET}"
 # around a pure-bash function).
 short_model() {
   local m="${1#claude-}"
-  # strip a trailing "[1m]"-style capacity tag FIRST (it would defeat the
-  # date-suffix match below, and on the row it reads as a stray bracket
-  # box after the name), then the "-20"+date suffix
-  m="${m%%\[*}"
+  # a trailing "[1m]"-style capacity tag is KEPT verbatim (user likes it);
+  # note it also makes the date-suffix regex a no-op on tagged ids, which
+  # is fine - tagged ids don't carry date suffixes in practice
   if [[ "$m" =~ ^(.*)-20[0-9]{6}$ ]]; then
     m="${BASH_REMATCH[1]}"
   fi
