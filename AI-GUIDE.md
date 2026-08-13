@@ -119,7 +119,7 @@
 
 ### 4.2 行规格（6 段，同款分隔符/守卫）
 
-1. 身份：灰`▸ ` + name/label/type 三选一**亮紫**（区别于主行的亮青）+ 灰`(type)`（type 非空且≠身份文本时）+ 灰`·`+青·短模型名（**恒显**，model 非空即显示——短名=剥 `claude-` 前缀和 `-20`+6位日期后缀；majority_model 仍由 jq 产出以保持 JL 标量位序，但不再作显示门槛）+ 灰`·`+热度色 effort（仅显式存在时；数字型预算值用黄）+ 空格+状态图标：`●`运行绿32 / `○`pending|queued|starting 黄 / `✗`failed|error|cancelled|killed 亮红 / `✓`completed|done|finished **绿**（不是灰——灰在深色主题上如同无色）/ `?`未知黄。
+1. 身份：灰`▸ ` + name/label/type 三选一**亮紫**（区别于主行的亮青）+ 灰`(type)`（type 非空且≠身份文本时）+ 灰`·`+青·短模型名（**恒显**，model 非空即显示——短名=剥 `claude-` 前缀、尾部 `[1m]` 类容量标记与 `-20`+6位日期后缀；majority_model 仍由 jq 产出以保持 JL 标量位序，但不再作显示门槛）+ 灰`·`+热度色 effort（仅显式存在时；数字型预算值用黄）+ 空格+状态图标：`●`运行绿32 / `○`pending|queued|starting 黄 / `✗`failed|error|cancelled|killed 亮红 / `✓`completed|done|finished **绿**（不是灰——灰在深色主题上如同无色）/ `?`未知黄。
 2. 消耗：tokenCount 为数值即显示白`Nk` + 灰` tok`（**累计消耗**，不读 contextWindowSize、不做任何占用/百分比近似——tokenCount 是累计口径，画电池必然失真，用户明确宁精勿滥）。
 3. 走势+速率（一段，与主行第 9 段同构）：走势**主源**=脚本自建 10s 采样——**紧凑趋势态文件** `~/.claude/statusline-subagent-trend.tsv`（可用 `STATUSLINE_SUBAGENT_TREND_FILE` 覆盖），**每任务一行** `task_id␟last_epoch␟末≤9个累计值csv`：每任务 ≥10s 推进一样（csv 尾追加、逗号计数裁到末 9），读写规模=活跃任务数、**永不随采样历史增长**（前一版"每样本一行追加日志"每帧重扫数百行——MSYS 下 bash 每条语句 ~20-40μs，实测吃掉面板大半帧预算，见硬性要求 0d）；≥30 分钟无更新的死任务行下次重写清除；`$$` 临时名原子重写、多会话读合并写、丢写自愈。**每格≈10s**；<2 个值时回退 tokenSamples 防御式解析（数字直接用；对象试 `.tokens//.tokenCount//.count//.value//.v`；<2 个数或解析失败→静默省略，取末 8 个）。两种源同走：非递减序列先转相邻差值，归一到 ▁-▆ 六档（封顶防行间粘连）青色；速率=`tokenCount*60/(elapsed*100)` 十倍值（elapsed ≥60s 才显示），档色同主行。
 4. 份额：预扫描全 tasks 的 tokenCount 总和；有 token 的任务 ≥2 个才显示：灰`Σ` + `N%`（本行/总量，<50灰/50–74黄/≥75亮红）。

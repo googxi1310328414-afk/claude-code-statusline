@@ -203,6 +203,10 @@ SEP="${RESET}${GRAY}${NBSP}|${NBSP}${RESET}"
 # around a pure-bash function).
 short_model() {
   local m="${1#claude-}"
+  # strip a trailing "[1m]"-style capacity tag FIRST (it would defeat the
+  # date-suffix match below, and on the row it reads as a stray bracket
+  # box after the name), then the "-20"+date suffix
+  m="${m%%\[*}"
   if [[ "$m" =~ ^(.*)-20[0-9]{6}$ ]]; then
     m="${BASH_REMATCH[1]}"
   fi

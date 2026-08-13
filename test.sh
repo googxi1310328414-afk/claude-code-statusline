@@ -151,13 +151,13 @@ if [ "$1" = "--assert" ]; then
   printf '%s' "$solo" | grep -q '| |' && bad "solo row empty cell" || ok "solo row clean"
   printf '%s' "$solo" | grep -q 'Σ' && bad "solo row shows share" || ok "solo hides share"
   # model marker is UNCONDITIONAL now: a solo task (its model IS the
-  # majority) must still show it
-  modrow=$(jq -n --argjson now "$now" '{columns:120,tasks:[{id:"m1",label:"a",status:"running",tokenCount:5,model:"claude-fable-5",startTime:(($now-30)*1000),description:"d"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
-  printf '%s' "$modrow" | grep -q '·fable-5' && ok "model always shown" || bad "model marker hidden"
+  # majority) must still show it, with the "[1m]" capacity tag stripped
+  modrow=$(jq -n --argjson now "$now" '{columns:120,tasks:[{id:"m1",label:"a",status:"running",tokenCount:5,model:"claude-fable-5[1m]",startTime:(($now-30)*1000),description:"d"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  printf '%s' "$modrow" | grep -q '·fable-5' && ! printf '%s' "$modrow" | grep -q '\[1m\]' && ok "model always shown, tag stripped" || bad "model marker wrong"
 
-  # own 10s trend state: the two renders above created one row per
-  # tokened task (3 from the panel payload + 1 from solo)
-  [ "$(grep -c . "$STATUSLINE_SUBAGENT_TREND_FILE" 2>/dev/null)" -eq 4 ] && ok "subagent trend rows captured" || bad "subagent trend file wrong"
+  # own 10s trend state: the renders above created one row per tokened
+  # task (3 from the panel payload + solo t1 + the model-marker probe m1)
+  [ "$(grep -c . "$STATUSLINE_SUBAGENT_TREND_FILE" 2>/dev/null)" -eq 5 ] && ok "subagent trend rows captured" || bad "subagent trend file wrong"
   # pre-seeded trend csv (plus this render's fresh sample) drives the
   # sparkline as primary source
   printf "ms\x1f%s\x1f1000,3000,4000\n" "$((now-10))" > "$STATUSLINE_SUBAGENT_TREND_FILE"
