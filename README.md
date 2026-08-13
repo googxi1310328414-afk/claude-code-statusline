@@ -55,7 +55,7 @@ Claude Code ≥ 2.1.221（子代理 effort 字段）、Git Bash（bash ≥ 4.3�
 ```bash
 bash test.sh            # 渲染演示（终端看真色彩）
 bash test.sh --codes    # ANSI 码可视化
-bash test.sh --assert   # 17 项断言（CI 用，含性能门槛）
+bash test.sh --assert   # 22 项断言（CI 用，含性能门槛）
 ```
 
 GitHub Actions 在每次 push 自动跑断言套件。
