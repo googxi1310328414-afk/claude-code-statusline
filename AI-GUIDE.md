@@ -1,123 +1,132 @@
-# AI 复刻指导：Claude Code 彩色状态栏
+# AI 复刻指导：Claude Code 三行彩色状态栏 + 子代理面板行
 
-> **用法**：把本文件全文发给 Claude Code（或任何能读写文件、执行 shell 的 AI agent），并说"按这份指导给我配置状态栏"。本文包含完整规格：数据契约、11 段的精确格式与颜色、动态阈值、健壮性要求、安装与验证步骤。参考实现见仓库根目录 `statusline-command.sh`，但你（AI）应按本规格在目标机器上适配重建，而不是盲目复制。
+> **用法**：把本文件全文发给 Claude Code（或任何能读写文件、执行 shell 的 AI agent），说"按这份指导配置状态栏"。本文是完整规格：数据契约、每段的格式/颜色/阈值、状态文件、健壮性要求、安装与验证。仓库根目录有参考实现（`statusline-command.sh`、`subagent-statusline.sh`），但你（AI）应按规格在目标机器上适配重建，而不是盲目复制。
 
 ## 0. 前置检查
 
-1. 确认环境：脚本运行于 **bash**（Windows 上是 Git Bash；bash ≥ 4，需要 `${var,,}` 小写化）。`jq`、`git` 必须可用。
-2. 确认目标机器的**主目录**（如 `C:\Users\<用户名>` 或 `/home/<用户名>`），第 3 段的缩写逻辑要用它，不要硬编码别人机器的路径。
-3. 时间格式化：`date -d "@epoch"` 是 GNU date（Git Bash / Linux）；macOS/BSD 用 `date -r epoch`。
-4. Claude Code 通过 **stdin 传入一个 JSON**（每次状态栏刷新执行一次脚本），脚本把最终的一行文本输出到 stdout。ANSI 颜色受支持。
+1. 环境：bash ≥ 4（Windows 用 Git Bash），`jq`、`git` 可用；`locale charmap` 应为 UTF-8（否则多字节字符宽度计数会提前截断）。
+2. 确认目标机器**主目录**，目录缩写逻辑用它，不要硬编码别人的路径。
+3. `date -d "@epoch"` 是 GNU 语法（Git Bash/Linux）；macOS/BSD 用 `date -r epoch`。
+4. **Windows 陷阱**：Windows 版 jq 输出 CRLF。`$(...)` 命令替换在 MSYS bash 会剥掉尾部 `\r`，**但 `mapfile`/`read` 逐行读不会**——凡逐行读 jq 输出，必须管过 `tr -d '\r'`，否则数值校验全部静默失败。
+5. 刷新机制：状态栏是**事件驱动**（会话状态变化时重跑脚本，约 300ms 防抖），无定时器。秒级时钟空闲时不走、"实时"效果只在模型活动期间成立——这是宿主行为，提前告知用户。
+6. 颜色一律基础 16 色 ANSI（30–37/90–97），bash ANSI-C quoting 常量（`GREEN=$'\e[32m'`），输出只用 `printf '%s\n'`（永不 `%b`）；每个着色 token 独立 reset。本文颜色记号：灰90、红31、绿32、黄33、蓝34、紫35、青36、白37、亮蓝94、亮紫95、亮青96、亮红91、亮白97。
 
-## 1. stdin JSON 数据契约（只列用到的字段）
+## 1. 主状态栏（statusLine）
+
+### 1.1 stdin JSON 契约（每次刷新一个对象，只列用到的字段）
 
 ```jsonc
 {
-  "session_name": "my-session",            // 可选：会话名
-  "model":   { "display_name": "Fable 5" },
-  "effort":  { "level": "max" },           // 可选：low|medium|high|xhigh|max
-  "thinking":{ "enabled": true },          // 可选
+  "session_id": "…",                       // 状态文件按它分会话
+  "session_name": "…",                     // 可选
+  "model":    { "display_name": "Fable 5" },
+  "effort":   { "level": "max" },          // 可选 low|medium|high|xhigh|max
+  "thinking": { "enabled": true },         // 可选
   "workspace": {
-    "current_dir": "C:\\Users\\me\\proj\\webapp",
-    "repo": { "owner": "acme", "name": "webapp" }   // 可选：来自 origin 远程
+    "current_dir": "C:\\Users\\me\\proj",
+    "repo": { "owner": "acme", "name": "webapp" }   // 可选
   },
-  "pr": { "number": 42, "review_state": "approved" }, // 可选；review_state 可能缺失
+  "worktree": { "name": "wt-fix", "branch": "main" }, // 仅 --worktree 会话
+  "pr": { "number": 42, "review_state": "approved" }, // 可选
   "context_window": {
-    "remaining_percentage": 65.8,          // 可能为 null
-    "total_input_tokens": 68471,           // 可选
-    "context_window_size": 200000          // 可选
+    "remaining_percentage": 65.8,          // 可能 null；官方口径为 input-only
+    "total_input_tokens": 68471,
+    "total_output_tokens": 1200,
+    "context_window_size": 200000,
+    "current_usage": {                     // 可能 null
+      "input_tokens": 2000, "cache_creation_input_tokens": 3000,
+      "cache_read_input_tokens": 60000
+    }
   },
-  "cost": {                                // 整个对象可能缺失
-    "total_cost_usd": 0.4231,
-    "total_lines_added": 156,
-    "total_lines_removed": 23
-  },
-  "rate_limits": {                         // 可选；两个窗口各自独立可选
+  "cost": { "total_cost_usd": 0.4231, "total_lines_added": 156, "total_lines_removed": 23 },
+  "rate_limits": {                         // 两窗口各自独立可选
     "five_hour": { "used_percentage": 37.4, "resets_at": 1770000000 },
     "seven_day": { "used_percentage": 12.1, "resets_at": 1770500000 }
   }
 }
 ```
 
-**铁律**：任何字段都可能缺失或为 null。取值一律 `jq -r '<path> // empty'`；某段没有数据就整段消失，绝不显示 "null"、不留空段、不产生多余分隔符。
+**铁律**：任何字段都可能缺失或为 null；取值一律 `// empty` + 数值校验；缺数据的段整段消失，绝不显示 null、不留悬空分隔符。
 
-## 2. 输出规格：11 段，按序拼接
+### 1.2 输出：三行主题式布局
 
-分隔符为灰色 ` | `（前后各带 reset）。整行末尾追加一次 reset。
+每行独立拼装，段间分隔符为灰色 ` | `（前后 reset），行尾补一次 reset；**一行内无任何段时该行不打印**（第 1 行有时钟兜底恒在）。
 
-颜色一律用基础 16 色 ANSI（30–37 / 90–97），以 bash ANSI-C quoting 定义常量（如 `GREEN=$'\e[32m'`），字符串里直接嵌入真实 ESC 字节，最终 `printf '%s\n'` 输出（**永远不用 `%b`**）。每个着色 token 单独 reset。
+**第 1 行 · 身份与位置**
+1. 时钟：`date +%H:%M:%S`，亮白。
+2. 模型：名称亮青 + 灰`·` + 档位热度色（low灰/medium绿/high黄/xhigh亮紫/max亮红/未知黄）+ 灰`·` + `think` 紫（仅 `.thinking.enabled == true`）。各部分独立可缺。
+3. 目录：显示副本三步变换——主目录前缀（大小写不敏感，反斜杠/正斜杠都匹配）→`~`；`/`→`\`；组件数>3 折叠为 `首\…\倒数第二\末尾`。末级组件亮蓝，其余（含所有 `\` 和 `…`）蓝；单组件整体亮蓝。**git 命令必须用原始未变换路径**。
+4. worktree：`.worktree.name` 存在才显示：灰`⎇ ` + 名称亮蓝 + （branch 存在时）灰`→` + 分支绿。
+5. 仓库：owner 与 name 都存在才显示：owner青 + `/`灰 + name亮青。
+6. 分支：`git -C "$dir" --no-optional-locks branch --show-current 2>/dev/null` 非空才显示，名称恒绿；脏检测（`status --porcelain | head -c1` 非空）追加独立黄`*`。
+7. PR：`.pr.number` 存在才显示：`PR#N` 紫；有 review_state 加空格+状态词（approved绿/changes_requested亮红/draft灰/其他黄）。
 
-本文颜色记号：灰=90、红=31、绿=32、黄=33、蓝=34、紫=35、青=36、白=37、亮蓝=94、亮紫=95、亮青=96、亮红=91、亮白=97。
+**第 2 行 · 上下文引擎**
+8. 上下文电池：灰`ctx ` 标签起段。**主路径**（total_input_tokens 与 context_window_size 均为正数）：`occupied = total_input_tokens + total_output_tokens(数值时)`，`used=occupied*100/window` 夹 0–100，`remaining=100-used` 统一驱动一切——五格电池（实格数 `(remaining+10)/20` 夹 0–5，实格`█`、空格`░`灰）、档色（≥50绿/20–49黄/<20亮红且加亮红`!`前缀）、百分比数字；token 文本 `占用/窗口`，各数字独立格式化：<1000k 用 `(n+500)/1000` 取 k；≥1000k 用 M（`m10=(n+50000)/100000`，小数为零省略：`1M`、`1.5M`），白`294k`+灰`/1M`。**回退路径**（token 字段不可用但 remaining_percentage 非 null）：按百分比驱动电池，无 token 文本，显示值 `printf '%.0f'`，阈值判断用整数截断（floor）。
+9. 走势+速率（一段，两半各自可选，空格连接）：走势=历史文件同会话行 token 列的相邻差值（负值夹 0，取最近 ≤9 行→≤8 个差值，≥2 个才显示），min..max 归一到 `▁▂▃▄▅▆▇█`（全等→全`▄`），青色；速率=最新 token 值减 5 分钟窗口内最旧值 / 时距（需时距 ≥60s 且差值非负），≥1000/min 显示一位小数 k（整数算法 `delta*60/(span*100)` 得十倍值再拆），否则 `N/m`；档色 <5000灰/5000–14999黄/≥15000亮红。
+10. 缓存命中：`.context_window.current_usage` 的 r=cache_read、w=cache_creation、i=input，denom=i+w+r>0 才显示：灰`cache ` + `N%`（r*100/denom）档色 ≥80绿/50–79黄/<50亮红。
 
-| # | 段 | 规格 |
-|---|---|---|
-| 1 | 时间 | `date +%H:%M`（不来自 stdin）。**亮白**。 |
-| 2 | 模型 | `模型名·思考等级·think`，三部分独立着色：模型名**亮青**；`·` 分隔点**灰**；思考等级按档位热度：low **灰**、medium **绿**、high **黄**、xhigh **亮紫**、max **亮红**、未知值**黄**；`think` 标记（仅当 `.thinking.enabled == true`）**紫**。没有 effort 就没有 `·effort`，thinking 非 true 就没有 `·think`，只剩模型名时就单独显示亮青名字。 |
-| 3 | 目录 | 显示用副本做三步变换：① 前缀等于主目录（大小写不敏感，反斜杠/正斜杠两种写法都要匹配）→ 替换为 `~`；② 所有 `/` 统一为 `\`；③ 按 `\` 拆分后组件数 > 3 → 折叠为 `首\…\倒数第二\末尾`。着色：末级组件**亮蓝**，之前的一切（盘符或 `~`、`…`、所有反斜杠）**蓝**；单组件路径（如 `~`）整体亮蓝。**git 命令必须用原始未变换路径**，显示文本只管显示。 |
-| 4 | 仓库 | `.workspace.repo` 的 owner 和 name 都存在才显示：owner **青** + `/` **灰** + name **亮青**。 |
-| 5 | 分支 | `git -C "$dir" --no-optional-locks branch --show-current 2>/dev/null`，非空才继续。分支名恒**绿**；脏检测 `git -C "$dir" --no-optional-locks status --porcelain 2>/dev/null | head -c1` 非空 → 追加一个独立的**黄**色 `*`。脏检测只在已确认有分支后执行。 |
-| 6 | PR | `.pr.number` 存在才显示。`PR#<号>` **紫**；有 `review_state` 再加空格 + 状态词，状态色：approved **绿**、changes_requested **亮红**、draft **灰**、pending 及其他**黄**。 |
-| 7 | 上下文 | `remaining_percentage` 存在才显示。格式：`[!]<电池条> N% [Xk/Yk]`，如 `███░░ 66% 68k/200k`、`!█░░░░ 12% 176k/200k`。电池条固定 5 格：实格数 = `(remaining_int + 10) / 20`（整数运算，等于四舍五入到五分位），夹在 0–5；实格用 `█`（U+2588），空格用 `░`（U+2591）。阈值判断用**整数截断**（`remaining_int="${v%%.*}"`，等价于 floor）：<20 → 前缀独立**亮红** `!` 且实格与百分比**亮红**；20–49 → 实格与百分比**黄**；≥50 → 实格与百分比**绿**；空格恒**灰**。百分比显示值用 `printf '%.0f'` 四舍五入（显示与阈值判断分离，允许 19.6 显示为 20% 但仍触发警告）。token 数：`total_input_tokens` 与 `context_window_size` 都存在且为纯数字才显示，各自 `(n+500)/1000` 整数运算取 k：`68k` **白** + `/200k`（含斜杠）**灰**。脚本文件须为 UTF-8，方块字符直接字面嵌入。 |
-| 8 | 花费 | `.cost.total_cost_usd` 存在才显示。`$` **不着色**（终端默认前景色，同行数段的 `/`）；金额 `printf '%.2f'`，色由整数部分定：<1 **灰**、1–4 **黄**、≥5 **亮红**。 |
-| 9 | 行数 | added/removed 任一存在就显示（缺的按 0）：`+A` **绿** + `/`（不着色）+ `-R` **红**。 |
-| 10 | 限额 | 两个窗口各自独立可选，窗口间以普通空格连接。每窗口：标签 `5h`/`7d` 固定**青**（与动态百分比、白色重置时间三者互相区分）；百分比 `printf '%.0f'`，色由该窗口自己的 floor(used_percentage) 决定：<50 **绿**、50–79 **黄**、≥80 **亮红**；`resets_at` 通过 `^[0-9]+$` 校验后才交给 date——5h 窗口 `→HH:MM`（本地时间）、7d 窗口 `→MM-DD`，箭头和时间**白**（低调但非灰、非无色）。 |
-| 11 | 会话名 | `.session_name` 存在才显示，**灰**。 |
+**第 3 行 · 开销与限额**
+11. 花费：`$` 不着色（终端默认色）+ 金额 `printf '%.2f'` 档色（整数部分 <1灰/1–4黄/≥5亮红）+ 空格 + `$X.X/h` 速率（历史文件 60 分钟窗口，纯 bash 分转换：整数部分*100+前两位小数，需时距 ≥120s 且差值非负，`cents*3600/span` 得每小时分数，按整美元档色同金额）。速率半独立可缺。
+12. 行数：任一字段存在即显示（缺的按 0）：`+A`绿 `/`不着色 `-R`红。
+13. 限额：两窗口独立可选，空格连接。每窗口：标签 `5h`/`7d` **青**（与动态百分比、白色重置时间三分）+ 百分比 `%.0f` 档色（floor 值 <50绿/50–79黄/≥80亮红）+ `resets_at` 过 `^[0-9]+$` 校验后 `→时刻`白（5h 用 `%H:%M`，7d 用 `%m-%d`）。
+14. 会话名：`.session_name` 存在才显示：灰`» 名称`。
 
-## 3. 实现硬性要求
+### 1.3 状态文件（走势/速率/花费速率的数据源）
 
-1. **无浮点运算**：不用 `bc`/`awk` 做比较。阈值判断一律"截断小数部分 → 整数比较"（对非负数等价于 floor）；显示值另行 `printf '%.0f'` / `'%.2f'`。
-2. **printf 守卫**：任何送进 `printf` 数字格式或 bash 算术的值，先用 `[ -n ... ]` 与 `[[ =~ ^[0-9]+$ ]]` 校验，空串/非数字绝不触发格式化。
-3. **着色不改变存在性判断**：先判断段有无内容，再包颜色——不能出现"只有颜色码的空段"混进最终拼接，那会产生悬空分隔符。
-4. **git 调用**：全部 `--no-optional-locks`、stderr 静默；目录不存在或非仓库时整段静默消失；传给 git 的是原始路径而非显示用缩写。
-5. stdin 只读一次（`input=$(cat)`），后续用 `printf '%s' "$input" | jq -r ...` 取值（不要用 `echo`，防止反斜杠被解释）。
-6. 输出单行，`printf '%s\n'` 收尾，行尾补一次 reset。
+`~/.claude/statusline-history.tsv`，TSV 行：`epoch<TAB>session_id<TAB>tokens<TAB>cost`（tokens 记**占用**=输入+输出，主路径不可用时记 input-only；缺值存空串）。每次调用：同会话最后一行不存在或 ≥5 秒旧才追加；追加后 `tail -n 200` 到临时文件再 `mv` 截断。所有读取按会话过滤、要求恰好 4 列 + 逐列数值校验，损坏/并发行静默跳过；全部文件操作 `2>/dev/null` 包裹，文件不可写绝不能影响其余段。
 
-## 4. 安装
+## 2. 硬性要求（两个脚本通用）
 
-1. 脚本写入 `~/.claude/statusline-command.sh`。
-2. 在 `~/.claude/settings.json` **合并**（不要覆盖其他已有键）：
+1. 无浮点：比较一律"截断小数→整数比"（非负数等价 floor）；显示另行 printf。
+2. printf/算术前必须 `[ -n ]` + `[[ =~ ^[0-9]+$ ]]` 守卫。
+3. 先判段非空再包颜色，禁止"只有颜色码的空段"进入拼装。
+4. git 全部 `--no-optional-locks` + stderr 静默；目录非法时整段静默消失。
+5. stdin 只读一次进变量，jq 取值用 `printf '%s' "$input" | jq -r`（不用 echo）。
+6. **逐行读 jq/awk 输出必须 `| tr -d '\r'`**（见前置检查 4）。
+
+## 3. 安装
+
+两脚本写入 `~/.claude/`；`~/.claude/settings.json` **合并**（勿覆盖其他键）：
 
 ```json
 {
-  "statusLine": {
-    "type": "command",
-    "command": "bash ~/.claude/statusline-command.sh"
-  }
+  "statusLine":         { "type": "command", "command": "bash ~/.claude/statusline-command.sh" },
+  "subagentStatusLine": { "type": "command", "command": "bash ~/.claude/subagent-statusline.sh" }
 }
 ```
 
-3. 状态栏每次刷新重新执行脚本，保存即生效。
+保存即生效，无需重启。
+
+## 4. 子代理面板行（subagentStatusLine）
+
+### 4.1 契约（与主状态栏不同！）
+
+每次刷新 stdin 收到**一个**JSON：`{"columns": <可用宽度>, "tasks": [<每个子代理一个对象>]}`。任务字段：`id`、`name`、`type`、`status`、`description`、`label`、`startTime`（Unix 时间戳，**可能是毫秒**：>10^12 则除以 1000）、`tokenCount`（**累计消耗**，可远超窗口！）、`model`、`contextWindowSize`（≥2.1.205）、`effort`（≥2.1.214，缺席=继承主会话）、`tokenSamples`（结构未文档化）。对 `.tasks[]` 每个元素向 stdout 输出一行紧凑 JSON `{"id":…,"content":…}`（`jq -cn --arg` 构造）；无 `id` 跳过（保持默认渲染）；tasks 空则无输出。
+
+### 4.2 行规格（6 段，同款分隔符/守卫）
+
+1. 身份：灰`▸ ` + name/label/type 三选一**亮紫**（区别于主行的亮青）+ 灰`(type)`（type 非空且≠身份文本时）+ 灰`·`+青·短模型名（**仅当该行模型 ≠ 面板多数模型**；短名=剥 `claude-` 前缀和 `-20`+6位日期后缀，预扫描 `group_by` 求多数）+ 灰`·`+热度色 effort（仅显式存在时；数字型预算值用黄）+ 空格+状态图标：`●`运行绿32 / `○`pending|queued|starting 黄 / `✗`failed|error|cancelled|killed 亮红 / `✓`completed|done|finished **绿**（不是灰——灰在深色主题上如同无色）/ `?`未知黄。
+2. 电池/消耗：window>0 且 `tokenCount ≤ window` → 与主行同款电池（占用近似）+`Xk/Yk`；`tokenCount > window` → **红满条 `█████` + 白`Nk` 灰` tok`**（累计消耗，无百分比、无`!`）；window 缺失但 tokenCount 有 → 白`Nk` 灰` tok`。
+3. 走势+速率（一段，与主行第 9 段同构）：走势=tokenSamples 防御式解析（数字直接用；对象试 `.tokens//.tokenCount//.count//.value//.v`；<2 个数或解析失败→静默省略），取末 8 个，非递减序列先转相邻差值，归一到 8 档青色；速率=`tokenCount*60/(elapsed*100)` 十倍值（elapsed ≥60s 才显示），档色同主行。
+4. 份额：预扫描全 tasks 的 tokenCount 总和；有 token 的任务 ≥2 个才显示：灰`Σ` + `N%`（本行/总量，<50灰/50–74黄/≥75亮红）。
+5. 用时：秒级——`<60s`→`42s`、`<1h`→`5m12s`、否则`1h23m45s`，白；+灰`@HH:MM:SS`（启动时刻）。
+6. 描述：灰，宽度预算 = columns（缺省 120）−前五段纯文本长度（含 `▸ ` 与分隔符）−3；预算 <8 省略，超长截到预算−1 字符+`…`。
 
 ## 5. 验证（必须实际执行）
 
-用仓库 `fixtures/` 下三份 JSON 喂给脚本验证（`bash statusline-command.sh < fixtures/full.json`），或直接 `bash test.sh`。核对以下要点：
+主状态栏（`fixtures/` 三份 + 状态文件人工历史）：
+- **full.json**：三行齐全；电池 `ctx ███░░ 66% 70k/200k`（占用 69671=68471+1200→70k，非 68k！）；`cache 92%` 绿；`» my-session`。
+- 把 window 改 1000000：token 文本变 `70k/1M`。
+- **low-context.json**：`!█░░░░ 12% 176k/200k` 亮红；`$1.07` 黄；`5h` 青标签+`82%`亮红+白重置；`7d 45%` 绿无重置。
+- **minimal.json**：第 2 行消失（新会话无历史时），无悬空分隔符。
+- 人工写 3 行同会话历史（epoch 递增、token 递增）再跑：出现青色走势+速率；花费速率 `$X.X/h`。
+- 干净/脏 git 仓库两态：绿 `main` / 绿 `main`+黄`*`。
 
-- **full.json**（全字段）：11 段齐全、顺序正确；电池条为绿色 `███░░`（66% → 3 实格）；`68471→68k`、`0.4231→$0.42`（`$` 无色、金额灰）、百分比四舍五入正确；`5h`/`7d` 标签青色；重置时间 `→HH:MM`/`→MM-DD` 为白色。
-- **minimal.json**（新会话、主目录、无仓库）：只剩 `时间 | 模型 | ~ | $0.00 | +0/-0`，无多余分隔符。
-- **low-context.json**（剩 12.3%）：`!` 前缀出现且亮红，电池条为红色 `█░░░░`（1 实格）；`~\proj\webapp` 父/末级两色；`$1.07` 无色`$`黄金额；`5h 82%` 标签青、百分比亮红、重置时间白色；`7d 45%` 标签青、百分比绿、不带重置时间。
-- **电池条档位**：用 jq 把剩余百分比改成 95 / 35.5 / 5，分别得到 `█████`（绿满格）、`██░░░`（黄 2 格）、`░░░░░`（红 0 格带 `!`）。
-- **分支两态**：把 `current_dir` 指向一个真实临时 git 仓库（`git init -b main`），干净时绿色 `main`；写入一个未跟踪文件后重跑，出现黄色 `*`。
-- **思考档位**：用 jq 把 `.effort.level` 依次改成 low/medium/high/xhigh/max，确认五档颜色（灰/绿/黄/亮紫/亮红）。
-- **颜色码核对**：输出管过 `sed 's/\x1b/\\e/g'` 逐段比对上表颜色编号。
+子代理行（`fixtures/subagent-tasks.json`，4 任务应输出 3 行有效 JSON）：
+- t1：`▸ code-reviewer(general)·max ●`（紫/灰/亮红/绿）、电池 66%、走势`▄█▁▁`+速率、`Σ`份额、秒级用时`@HH:MM:SS`、描述截断。
+- t2：无窗口→`12k tok`；`✓` **绿**；分钟级速率 `131/m`。
+- t3：label 兜底 + `·haiku-4-5` 青（少数派）+ `·50000` 黄 + `✗` 亮红；把 tokenCount 改 447000（>窗口）→ `█████ 447k tok`；对象形态 tokenSamples 走势正常。
+- 无 id 任务不产生输出行。
 
-边界清单：`remaining_percentage` 为 null（段消失）、`pr` 无 `review_state`（只显示紫色 PR#N）、`rate_limits` 只有一个窗口、`effort`/`thinking`/`session_name`/`repo` 全缺、路径恰好 3 层（不折叠）与 4 层（折叠）、主目录本身（显示 `~`）。
-
-## 6. 子代理面板行（subagentStatusLine，可选但推荐）
-
-第二个脚本 `~/.claude/subagent-statusline.sh` 接管代理面板里每个子代理行的渲染。settings.json 在 `statusLine` 旁**合并**：
-
-```json
-{ "subagentStatusLine": { "type": "command", "command": "bash ~/.claude/subagent-statusline.sh" } }
-```
-
-**契约（与主状态栏不同！）**：每次刷新 stdin 收到**一个**JSON：`{"columns": <可用宽度>, "tasks": [<每个子代理一个对象>]}`。任务字段：`id`、`name`、`type`、`status`、`description`、`label`、`startTime`（Unix 时间戳，**可能是毫秒**）、`tokenCount`、`model`、`contextWindowSize`（≥2.1.205）、`effort`（≥2.1.214；缺席=继承主会话）。脚本对 `.tasks[]` 的每个元素向 stdout 输出一行紧凑 JSON：`{"id":"<task.id>","content":"<含 ANSI 的行文本>"}`（用 `jq -cn --arg` 构造，自动转义 ESC 字节）；无 `id` 的任务跳过（保持默认渲染）；`tasks` 缺失/为空则无任何输出。
-
-**行规格**（分隔符、常量、守卫、无浮点等硬性要求同主脚本；瘦身 + 与主状态栏视觉区分）：
-
-1. 身份：灰 `▸ ` 前缀 + name/label/type 三选一（取第一个非空）**亮紫 95**（刻意区别于主状态栏的亮青身份色）；仅当 `effort` 存在时附加灰 `·` + 热度色 effort（映射同主脚本，数字型预算值用黄）。**不显示模型**（冗余）。
-2. 状态：running/in_progress **绿**；pending/queued/starting **黄**；failed/error/cancelled/killed **亮红**；completed/done/finished **灰**；其他**黄**。
-3. 电池条：`tokenCount` 与 `contextWindowSize` 都为正数才显示；`used_pct = tokenCount*100/contextWindowSize`（夹 0–100），`remaining = 100 - used_pct`，之后与主脚本第 7 段完全同款（5 格、`(remaining+10)/20`、`!` 规则、`Xk/Yk`）。
-4. 用时：`startTime > 10^12` 视为毫秒（除以 1000）；`now - start` 负数夹 0；`<1h` 显示 `Nm`，否则 `XhYm`；**白**。
-5. 描述：**灰**，宽度预算 = `columns`（缺省 120）−（前四段纯文本长度含 `▸ ` 与分隔符）− 3；预算 < 8 整段省略，超长截到预算−1 字符 + `…`。
-
-**验证**：用 `fixtures/subagent-tasks.json`（4 个任务）跑 `bash subagent-statusline.sh < …`，应输出 **3** 行有效 JSON（无 id 的跳过）：t1 = `▸ code-reviewer·max`（紫+亮红）、绿 running、绿 `███░░ 66% 68k/200k`、描述按 columns=100 截断带 `…`；t2 = 无电池段（缺 window）、灰 completed；t3 = label 兜底身份、黄 `50000`、亮红 failed、红 `!░░░░░ 8% 185k/200k`。用时段需用 jq 注入相对当前的 `startTime` 测试（毫秒与秒各一），静态夹具里无 `startTime`（该段省略即为正确）。注意 Git Bash 需 UTF-8 locale（`locale charmap` = UTF-8），否则 `▸`/`█`/`…` 的字符计数会导致提前截断（不致错，但保守）。
+边界清单：remaining null、pr 无状态、单窗口限额、effort/thinking/repo/session_name 全缺、路径 3 层不折叠/4 层折叠、主目录=`~`、历史文件损坏行/不可写、tokenSamples 乱结构、startTime 毫秒与秒、19.6% 显示 20% 仍触发红档。
