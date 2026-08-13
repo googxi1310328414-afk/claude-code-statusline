@@ -1,1 +1,5 @@
-* text=auto eol=lf
+*.sh text eol=lf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf
+*.md text
+*.json text
