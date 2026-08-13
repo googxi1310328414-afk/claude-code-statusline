@@ -171,6 +171,18 @@ if [ "$1" = "--assert" ]; then
   bash ./statusline-panel-daemon.sh --once
   grep -q '"id":"ms"' "$STATUSLINE_PANEL_DIR/cache.ms" && ! grep -q CACHED_MARKER "$STATUSLINE_PANEL_DIR/cache.ms" && ok "panel daemon renders spool to cache" || bad "daemon render failed"
 
+  # one-line installer: local mode into an isolated HOME must install all
+  # files, deep-merge settings WITHOUT clobbering foreign keys, and be
+  # idempotent on a second run
+  ihome=$(mktemp -d)
+  mkdir -p "$ihome/.claude"
+  printf '%s\n' '{"model":"keep-me","statusLine":{"padding":0}}' > "$ihome/.claude/settings.json"
+  HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
+  [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
+  [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer idempotent rerun" || bad "installer rerun failed"
+  rm -rf "$ihome"
+
   rm -rf "$tmpd"
   echo "----"
   [ "$fails" -eq 0 ] && echo "ALL PASS" || echo "$fails FAILURE(S)"

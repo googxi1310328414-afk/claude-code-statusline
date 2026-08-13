@@ -98,7 +98,7 @@
 
 ## 3. 安装
 
-四脚本（两渲染 + 面板钩子/daemon）写入 `~/.claude/` 并建目录 `~/.claude/statusline-panel.d/`；`~/.claude/settings.json` **合并**（勿覆盖其他键）：
+**一行命令**：`curl -fsSL https://raw.githubusercontent.com/googxi1310328414-afk/claude-code-statusline/main/install.sh | bash`（幂等；本地 clone 内离线；settings 合并式带备份；冒烟自检；`--with-watchdog` 注册自愈层）。等价手动步骤：四脚本（两渲染 + 面板钩子/daemon）写入 `~/.claude/` 并建目录 `~/.claude/statusline-panel.d/`；`~/.claude/settings.json` **合并**（勿覆盖其他键）：
 
 ```json
 {
@@ -128,7 +128,7 @@
 
 ## 5. 验证（必须实际执行）
 
-**首选**：仓库根目录 `bash test.sh --assert` —— 37 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、双层花费存储、追加优先裁剪触发、面板钩子 spool/缓存秒回/daemon 渲染、列对齐、TSV 列序、空列裁剪、性能 <3s 门槛），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
+**首选**：仓库根目录 `bash test.sh --assert` —— 41 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、双层花费存储、追加优先裁剪触发、面板钩子 spool/缓存秒回/daemon 渲染、安装器本地模式/合并/幂等、列对齐、TSV 列序、空列裁剪、性能 <3s 门槛），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
 
 主状态栏（`fixtures/` 三份 + 状态文件人工历史）：
 - **full.json**：三行齐全；电池 `ctx ███░░ 66% 70k/200k`（占用 69671=68471+1200→70k，非 68k！）；`cache 92%` 绿；`» my-session`。

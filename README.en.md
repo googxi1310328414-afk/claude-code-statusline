@@ -28,6 +28,14 @@ with bright-magenta identity (vs. the main line's bright cyan), minority-model m
 
 Requirements: Claude Code (≥ 2.1.205 for some subagent fields), Git Bash (bash ≥ 4, UTF-8), `jq`, `git` (≥ 2.35 for the stash segment).
 
+One-liner (idempotent — re-running updates; offline when run inside a local clone):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/googxi1310328414-afk/claude-code-statusline/main/install.sh | bash
+```
+
+It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES settings.json (existing keys preserved, original backed up) and smoke-tests the render; append ` -s -- --with-watchdog` to also register the Windows watchdog task. Manual steps:
+
 1. Copy both `.sh` files into `~/.claude/`.
 2. Merge the two keys from `settings-snippet.json` into `~/.claude/settings.json`.
 3. Done — the status line re-renders on the next refresh.
