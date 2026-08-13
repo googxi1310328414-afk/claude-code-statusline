@@ -114,7 +114,10 @@ exec 2>>"$statusline_err_log"
 #
 # LINE 1 (identity/location), joined with " | ":
 #   1  clock time HH:MM:SS (not from stdin; only advances on refresh)  - bright white
-#   2  model display name + ·effort + ·think, each part colored individually
+#   2  model short id name (panel-synced rule: "claude-" prefix and
+#      "-20"+date suffix stripped, a "[1m]"-style capacity tag kept
+#      verbatim; falls back to display_name when .model.id is absent)
+#      + ·effort + ·think, each part colored individually
 #      (name/·/effort/think - see inline comment below)
 #   3  current directory, abbreviated (home -> ~, collapsed with …); last
 #      component bright blue, everything before it (incl. backslashes) blue
@@ -395,6 +398,7 @@ jq_main_out=$(jq -r '
   (.rate_limits.seven_day.resets_at // ""),
   (.session_name // ""),
   (.transcript_path // ""),
+  (.model.id // ""),
   ("__END__")
 ' <<< "$input" 2>/dev/null)
 jq_main_out=${jq_main_out//$'\r'/}
@@ -425,21 +429,22 @@ mapfile -t F <<< "$jq_main_out"
 # though jq had run fine).
 #
 # FIX: a literal, never-empty SENTINEL ("__END__") is appended as one
-# more field after transcript_path. Because it can never itself be
-# empty, it always survives $()'s trailing-newline stripping regardless
-# of how many REAL fields before it were blank - so its presence at
-# F[29] is a reliable "jq's output stream reached the end intact" signal
-# that the raw line count alone can't give. Degraded when EITHER fewer
-# than 30 elements exist (the sentinel and/or other trailing fields were
-# stripped entirely - spawn produced too little output) OR F[29] isn't
-# literally "__END__" (shouldn't be reachable if the count check passed,
-# but costs nothing to also check directly rather than trust the count
-# alone). F[0..28] indices are unchanged everywhere else in this script.
+# more field after the final real field (model.id). Because it can never
+# itself be empty, it always survives $()'s trailing-newline stripping
+# regardless of how many REAL fields before it were blank - so its
+# presence at F[30] is a reliable "jq's output stream reached the end
+# intact" signal that the raw line count alone can't give. Degraded when
+# EITHER fewer than 31 elements exist (the sentinel and/or other
+# trailing fields were stripped entirely - spawn produced too little
+# output) OR F[30] isn't literally "__END__" (shouldn't be reachable if
+# the count check passed, but costs nothing to also check directly
+# rather than trust the count alone). F[0..29] indices are unchanged
+# everywhere else in this script.
 # Every other internal failure path in this script already degrades to
 # omitting a segment, never to dying - this is the one point where a
 # totally absent/truncated jq result would otherwise fall through to a
 # blank statusline instead of at least one line.
-if [ "${#F[@]}" -lt 30 ] || [ "${F[29]}" != "__END__" ]; then
+if [ "${#F[@]}" -lt 31 ] || [ "${F[30]}" != "__END__" ]; then
   printf '\e[0m\e[97m%(%H:%M:%S)T\e[0m\e[90m | statusline: degraded (fork)\e[0m\n' -1
   exit 0
 fi
@@ -451,7 +456,19 @@ pr_url="${F[12]}";       remaining="${F[13]}"; in_tokens="${F[14]}"; win_size="$
 out_tokens_ctx="${F[16]}"; cache_r="${F[17]}"; cache_w="${F[18]}";  cache_i="${F[19]}"
 cost="${F[20]}";         added="${F[21]}";     removed="${F[22]}"
 five="${F[23]}";         five_reset="${F[24]}"; week="${F[25]}";   week_reset="${F[26]}"
-session_name="${F[27]}"; transcript_path="${F[28]}"
+session_name="${F[27]}"; transcript_path="${F[28]}"; model_id="${F[29]}"
+
+# model display SYNCED with the panel's naming (user request): when
+# .model.id is present, the short id form replaces display_name - strip
+# the "claude-" prefix and any "-20"+date suffix, KEEP a trailing
+# "[1m]"-style capacity tag verbatim (same rule as the panel's
+# short_model). display_name stays as the fallback for id-less payloads;
+# both the 4-line grid and the narrow compact line inherit this via the
+# one $model variable.
+if [ -n "$model_id" ]; then
+  model="${model_id#claude-}"
+  [[ "$model" =~ ^(.*)-20[0-9]{6}$ ]] && model="${BASH_REMATCH[1]}"
+fi
 
 # PERF: bash's printf '%(fmt)T' builtin (bash 4.2+) replaces every `date`
 # call in this script - zero process spawns. -1 means "now".

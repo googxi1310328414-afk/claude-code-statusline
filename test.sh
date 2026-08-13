@@ -70,6 +70,7 @@ if [ "$1" = "--assert" ]; then
   printf '%s' "$plain" | grep -q 'week \$' && ok "week rollup" || bad "week missing"
   printf '%s' "$plain" | grep -q '·t' && ok "pace cursor" || bad "pace cursor missing"
   printf '%s' "$plain" | grep -q '» my-session' && ok "session name marker" || bad "session marker missing"
+  printf '%s' "$plain" | grep -q 'fable-5·max·think' && ok "main model panel-synced short id" || bad "main model name not synced"
   printf '%s' "$plain" | grep -q '| |' && bad "stray empty cell '| |'" || ok "no stray empty cells"
   # first-column separator aligns across all 4 lines
   col=$(printf '%s\n' "$plain" | head -1 | grep -bo ' | ' | head -1 | cut -d: -f1)
