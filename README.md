@@ -78,6 +78,6 @@ GitHub Actions 在每次 push 自动跑断言套件。
 - 渲染实测 0.4–1.3 秒（隔离基准 0.4–0.6s，真实载荷 ~1.2s）；刷新机理与取消规则见上一章。
 - **忙碌回合中主状态栏绘制完全挂起**（实测：脚本仍按节奏被调用、数据保持新鲜，但画面冻结在回合开始帧；resize/交互均无法强制重画；回合结束瞬间回正）。同屏子代理面板不受此限、全程实时。根治需官方支持，可 `/feedback` 提"busy 期间按 refreshInterval 重绘 statusLine"。
 - workflow/ultracode 编队渲染在 `/workflows` 专属 UI，**不经过** subagentStatusLine（实测）；面板行只承载常规子代理。
-- 压缩计数/缓存倒计时读 transcript 尾部 128KiB（超出窗口的旧边界不计）；缓存倒计时的 TTL 是假设值（`STATUSLINE_CACHE_TTL_SECONDS`，默认 3600）。
+- 压缩计数/缓存倒计时读 transcript 尾部窗口（默认 512KiB，`STATUSLINE_TRANSCRIPT_TAIL_BYTES` 可调；重会话单条 JSONL 实测已达 114KiB——单条超窗会让两段静默消失，故留 ~4× 余量），超出窗口的旧边界不计；缓存倒计时的 TTL 是假设值（`STATUSLINE_CACHE_TTL_SECONDS`，默认 3600）。
 - 电池上的 `│` 压缩线是 80% 社区惯例，非官方阈值。
 - `date -d`（GNU）与 `printf '%(...)T'`（bash ≥4.2）；macOS 需改 `date -r`。

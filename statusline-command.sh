@@ -222,7 +222,8 @@ exec 2>>"$statusline_err_log"
 #      true`) seen in the same transcript tail-read as N4 above; when the
 #      sum of (preTokens-postTokens) across those boundaries is > 0, a
 #      gray " ↓" + white k-or-M-formatted total follows. Hidden when the
-#      count is 0. Both this and N4 read from ONE shared `tail -c 128KiB`
+#      count is 0. Both this and N4 read from ONE shared tail read (512KiB
+#      default, STATUSLINE_TRANSCRIPT_TAIL_BYTES overrides)
 #      of .transcript_path - the only two accepted external-process
 #      exceptions in this script (see that shared read's own comment for
 #      why, and its documented "may miss data outside the tail window"
@@ -1555,14 +1556,25 @@ fi
 # the window; that would cost up to 5 `tail` spawns in the worst case,
 # which conflicts with this script's whole performance mandate, and the
 # same request separately concedes "1 tail spawn accepted" - so this
-# implementation takes ONE fixed 128KiB read instead. Both features
+# implementation takes ONE fixed-size read instead (512KiB default,
+# STATUSLINE_TRANSCRIPT_TAIL_BYTES to override - see its comment). Both features
 # already accept and document a "may miss data outside the window"
 # limitation, so this is a difference of degree, not of kind. Silently
 # absent (both segments) when transcript_path is empty, unreadable, or
 # `tail` itself is missing.
 tail_lines=()
 if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && command -v tail >/dev/null 2>&1; then
-  tail_block=$(tail -c 131072 -- "$transcript_path" 2>/dev/null)
+  # Window default 512KiB (was 128KiB), env-overridable via
+  # STATUSLINE_TRANSCRIPT_TAIL_BYTES: single JSONL entries were measured
+  # at 114KiB on a heavy session - ONE entry bigger than the window
+  # would leave zero parseable lines inside it and silently blank the
+  # freshness/compaction segments. 512KiB keeps ~4x headroom over the
+  # largest entry seen while still being one cheap seek+read; the
+  # per-LINE scans below scale with line count (a few dozen either
+  # way), not window bytes.
+  tail_bytes="${STATUSLINE_TRANSCRIPT_TAIL_BYTES:-524288}"
+  [[ "$tail_bytes" =~ ^[0-9]+$ ]] || tail_bytes=524288
+  tail_block=$(tail -c "$tail_bytes" -- "$transcript_path" 2>/dev/null)
   tail_block=${tail_block//$'\r'/}
   [ -n "$tail_block" ] && mapfile -t tail_lines <<< "$tail_block"
 fi
@@ -1576,8 +1588,8 @@ fi
 # with a numeric regex, else silently skip" pattern used everywhere else
 # in this script). LIMITATION (by design, documented): only boundaries
 # that happen to fall inside the tail window above are counted - a long-
-# running session's older compactions can scroll out of a 128KiB tail and
-# simply won't be seen; this is a lower bound, not an exact count.
+# running session's older compactions can scroll out of the tail window
+# and simply won't be seen; this is a lower bound, not an exact count.
 compact_count=0
 compact_reclaimed=0
 for tline in "${tail_lines[@]}"; do
