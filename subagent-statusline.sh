@@ -35,11 +35,13 @@ export LC_ALL=C.UTF-8
 # stay aligned; only TRAILING absent columns (nothing from there to the
 # end of that row) are dropped entirely, and a row's last rendered cell is
 # never padded. Column widths are recomputed fresh every payload/refresh.
-# Caveat: plain length is a bash CHARACTER count, not a terminal cell
-# count - CJK glyphs (identity names, descriptions) occupy two terminal
-# cells, so a column carrying CJK text aligns only approximately; ASCII/
-# number/glyph-only columns (spend, sparkline+rate, share, elapsed) align
-# exactly.
+# Width is measured in true terminal DISPLAY cells via disp_width() (see
+# its own comment below), not raw character count, so East Asian wide/
+# fullwidth identity names and descriptions (this script's most likely
+# carriers of CJK text) align correctly rather than just approximately.
+# The glyphs this script draws itself count as 1 cell, matching Windows
+# Terminal's default profile - see disp_width()'s comment if your terminal
+# is configured for East-Asian ambiguous-wide instead.
 #
 #   1  identity segment: "▸ " (gray) + identity text (bright magenta, first
 #      non-empty of name/label/type; identity absent -> the WHOLE segment
@@ -89,13 +91,15 @@ export LC_ALL=C.UTF-8
 #      milliseconds; "<N>s" under 1 minute, "<N>m<N>s" under 1 hour, else
 #      "<N>h<N>m<N>s"; when shown, immediately (no space) followed by
 #      "@HH:MM:SS" in gray - the local clock time startTime normalizes to
-#   6  description - gray, width-budgeted against `columns` (default 120).
-#      Because alignment forces columns 1-5 to their globally padded
-#      widths whenever description follows, the budget is UNIFORM across
-#      every row in the payload (not per-row): budget = columns - (sum of
-#      the five columns' max plain widths) - 15 (5 columns' worth of " | "
+#   6  description - gray, width-budgeted against `columns` (default 120),
+#      the budget measured in display CELLS, not characters. Because
+#      alignment forces columns 1-5 to their globally padded widths
+#      whenever description follows, the budget is UNIFORM across every
+#      row in the payload (not per-row): budget = columns - (sum of the
+#      five columns' max display widths) - 15 (5 columns' worth of " | "
 #      separators, one between each pair plus one before the description
-#      itself). Omitted if budget < 8, else cut to budget-1 chars + "…"
+#      itself). Omitted if budget < 8, else cut - by accumulating each
+#      character's disp_width() until budget-1 cells are used - + "…"
 #      when longer than budget.
 #
 # Example row content (id omitted here):
@@ -134,6 +138,54 @@ short_model() {
     m="${BASH_REMATCH[1]}"
   fi
   printf '%s' "$m"
+}
+
+# True terminal DISPLAY width of a plain (no ANSI) string, in cells, for
+# column-alignment math and description-budget truncation - ${#s} alone
+# is a character count, which under-counts East Asian wide/fullwidth text
+# (2 cells each; identity names and descriptions are the columns most
+# likely to carry it). Fast path: pure-ASCII strings return ${#s} (cheap,
+# covers the common case). Otherwise walks characters (relies on
+# LC_ALL=C.UTF-8 above so ${s:i:1}/${#s} are character-, not byte-,
+# based), looks up each non-ASCII character's Unicode codepoint via
+# printf's "'c" numeric-value extension, and adds 2 for the standard
+# wide/fullwidth ranges, else 1. The glyphs this script uses on its own
+# (▸ ● ✓ ✗ · → Σ █ ░ ▁-█ …) are all deliberately counted as 1 cell here,
+# matching how Windows Terminal's default (non-East-Asian-ambiguous-wide)
+# profile renders them - a terminal configured for East-Asian
+# ambiguous-wide would need those bumped to 2 to match its own rendering.
+disp_width() {
+  local s="$1"
+  if [[ "$s" != *[![:ascii:]]* ]]; then
+    printf '%s' "${#s}"
+    return
+  fi
+  local len=${#s} i c cp w total=0
+  for ((i=0; i<len; i++)); do
+    c="${s:i:1}"
+    if [[ "$c" == [[:ascii:]] ]]; then
+      total=$(( total + 1 ))
+      continue
+    fi
+    printf -v cp '%d' "'$c"
+    w=1
+    if   [ "$cp" -ge 4352 ]   && [ "$cp" -le 4447 ]; then w=2    # 1100-115F
+    elif [ "$cp" -ge 11904 ]  && [ "$cp" -le 12350 ]; then w=2   # 2E80-303E
+    elif [ "$cp" -ge 12353 ]  && [ "$cp" -le 13311 ]; then w=2   # 3041-33FF
+    elif [ "$cp" -ge 13312 ]  && [ "$cp" -le 19903 ]; then w=2   # 3400-4DBF
+    elif [ "$cp" -ge 19968 ]  && [ "$cp" -le 40959 ]; then w=2   # 4E00-9FFF
+    elif [ "$cp" -ge 40960 ]  && [ "$cp" -le 42191 ]; then w=2   # A000-A4CF
+    elif [ "$cp" -ge 44032 ]  && [ "$cp" -le 55203 ]; then w=2   # AC00-D7A3
+    elif [ "$cp" -ge 63744 ]  && [ "$cp" -le 64255 ]; then w=2   # F900-FAFF
+    elif [ "$cp" -ge 65072 ]  && [ "$cp" -le 65103 ]; then w=2   # FE30-FE4F
+    elif [ "$cp" -ge 65280 ]  && [ "$cp" -le 65376 ]; then w=2   # FF00-FF60
+    elif [ "$cp" -ge 65504 ]  && [ "$cp" -le 65510 ]; then w=2   # FFE0-FFE6
+    elif [ "$cp" -ge 127744 ] && [ "$cp" -le 129791 ]; then w=2  # 1F300-1FAFF
+    elif [ "$cp" -ge 131072 ]; then w=2                          # >= 20000
+    fi
+    total=$(( total + w ))
+  done
+  printf '%s' "$total"
 }
 
 mapfile -t all_tasks < <(printf '%s' "$input" | jq -c '.tasks[]?' 2>/dev/null | tr -d '\r')
@@ -364,11 +416,16 @@ for task in "${all_tasks[@]}"; do
   col3_c+=("$share_seg");     col3_p+=("$share_plain")
   col4_c+=("$elapsed_seg");   col4_p+=("$elapsed_plain")
 
-  [ "${#seg1_plain}" -gt "${col_max[0]}" ]       && col_max[0]=${#seg1_plain}
-  [ "${#spend_plain}" -gt "${col_max[1]}" ]      && col_max[1]=${#spend_plain}
-  [ "${#sparkburn_plain}" -gt "${col_max[2]}" ]  && col_max[2]=${#sparkburn_plain}
-  [ "${#share_plain}" -gt "${col_max[3]}" ]      && col_max[3]=${#share_plain}
-  [ "${#elapsed_plain}" -gt "${col_max[4]}" ]    && col_max[4]=${#elapsed_plain}
+  dw0=$(disp_width "$seg1_plain")
+  dw1=$(disp_width "$spend_plain")
+  dw2=$(disp_width "$sparkburn_plain")
+  dw3=$(disp_width "$share_plain")
+  dw4=$(disp_width "$elapsed_plain")
+  [ "$dw0" -gt "${col_max[0]}" ] && col_max[0]=$dw0
+  [ "$dw1" -gt "${col_max[1]}" ] && col_max[1]=$dw1
+  [ "$dw2" -gt "${col_max[2]}" ] && col_max[2]=$dw2
+  [ "$dw3" -gt "${col_max[3]}" ] && col_max[3]=$dw3
+  [ "$dw4" -gt "${col_max[4]}" ] && col_max[4]=$dw4
 done
 
 # ---------- PASS 2: build the uniform description budget, pad, emit ----------
@@ -390,10 +447,23 @@ for ((r=0; r<row_total; r++)); do
   description="${descriptions[$r]}"
   desc_seg=""
   if [ -n "$description" ] && [ "$desc_budget" -ge 8 ]; then
-    desc_len=${#description}
-    if [ "$desc_len" -gt "$desc_budget" ]; then
-      cut=$(( desc_budget - 1 ))
-      desc_text="${description:0:$cut}…"
+    desc_disp_len=$(disp_width "$description")
+    if [ "$desc_disp_len" -gt "$desc_budget" ]; then
+      # Cut by accumulated DISPLAY width, not character count: walk
+      # characters, keep adding while the running total stays within
+      # budget-1 cells (leaving exactly 1 cell for the "…" appended after).
+      target=$(( desc_budget - 1 ))
+      desc_chars=${#description}
+      acc=0
+      cut_pos=0
+      for ((di=0; di<desc_chars; di++)); do
+        dc="${description:di:1}"
+        dw=$(disp_width "$dc")
+        [ "$(( acc + dw ))" -gt "$target" ] && break
+        acc=$(( acc + dw ))
+        cut_pos=$(( di + 1 ))
+      done
+      desc_text="${description:0:$cut_pos}…"
     else
       desc_text="$description"
     fi
@@ -429,7 +499,7 @@ for ((r=0; r<row_total; r++)); do
       if [ "$i" -eq "$last_idx" ]; then
         row="${row}${cell_c}"
       else
-        plen=${#cell_p}
+        plen=$(disp_width "$cell_p")
         w="${col_max[$i]}"
         pad=$(( w - plen ))
         padding=""

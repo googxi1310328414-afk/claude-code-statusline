@@ -19,9 +19,12 @@ export LC_ALL=C.UTF-8
 # no line 2 at all. The " | " separators are COLUMN-ALIGNED across all
 # three lines: every segment tracks a parallel plain-text twin (no ANSI,
 # no OSC 8 - hyperlinks and colors are zero-width and never factor into
-# alignment) purely for width measurement; see the render_line()/
-# col_widths block near the bottom for the actual padding logic, and its
-# comment for the CJK-width caveat.
+# alignment) purely for width measurement, measured in true terminal
+# DISPLAY cells via disp_width() (not raw character count) so East Asian
+# wide/fullwidth text (e.g. in session_name, or any repo/branch/worktree
+# name) aligns correctly too; see disp_width()'s own comment for the
+# wide-character ranges used and the render_line()/col_widths block near
+# the bottom for the actual padding logic.
 #
 # LINE 1 (identity/location), joined with " | ":
 #   1  clock time HH:MM:SS (not from stdin; only advances on refresh)  - bright white
@@ -230,6 +233,53 @@ fmt_k_or_m() {
   else
     printf '%sk' "$k"
   fi
+}
+
+# True terminal DISPLAY width of a plain (no ANSI/OSC 8) string, in cells,
+# for column-alignment math - ${#s} alone is a character count, which
+# under-counts East Asian wide/fullwidth characters (2 cells each). Fast
+# path: pure-ASCII strings return ${#s} directly (cheap, covers the common
+# case). Otherwise walks characters (relies on LC_ALL=C.UTF-8 above so
+# ${s:i:1}/${#s} are character-, not byte-, based), looks up each
+# non-ASCII character's Unicode codepoint via printf's "'c" numeric-value
+# extension, and adds 2 for the standard wide/fullwidth ranges, else 1.
+# The glyphs this script uses on its own (▸ ● ✓ ✗ · → ⎇ Σ » █ ░ ▁-█ …) are
+# all deliberately counted as 1 cell here, matching how Windows Terminal's
+# default (non-East-Asian-ambiguous-wide) profile renders them - a
+# terminal configured for East-Asian ambiguous-wide would need those
+# bumped to 2 to match its own rendering.
+disp_width() {
+  local s="$1"
+  if [[ "$s" != *[![:ascii:]]* ]]; then
+    printf '%s' "${#s}"
+    return
+  fi
+  local len=${#s} i c cp w total=0
+  for ((i=0; i<len; i++)); do
+    c="${s:i:1}"
+    if [[ "$c" == [[:ascii:]] ]]; then
+      total=$(( total + 1 ))
+      continue
+    fi
+    printf -v cp '%d' "'$c"
+    w=1
+    if   [ "$cp" -ge 4352 ]   && [ "$cp" -le 4447 ]; then w=2    # 1100-115F
+    elif [ "$cp" -ge 11904 ]  && [ "$cp" -le 12350 ]; then w=2   # 2E80-303E
+    elif [ "$cp" -ge 12353 ]  && [ "$cp" -le 13311 ]; then w=2   # 3041-33FF
+    elif [ "$cp" -ge 13312 ]  && [ "$cp" -le 19903 ]; then w=2   # 3400-4DBF
+    elif [ "$cp" -ge 19968 ]  && [ "$cp" -le 40959 ]; then w=2   # 4E00-9FFF
+    elif [ "$cp" -ge 40960 ]  && [ "$cp" -le 42191 ]; then w=2   # A000-A4CF
+    elif [ "$cp" -ge 44032 ]  && [ "$cp" -le 55203 ]; then w=2   # AC00-D7A3
+    elif [ "$cp" -ge 63744 ]  && [ "$cp" -le 64255 ]; then w=2   # F900-FAFF
+    elif [ "$cp" -ge 65072 ]  && [ "$cp" -le 65103 ]; then w=2   # FE30-FE4F
+    elif [ "$cp" -ge 65280 ]  && [ "$cp" -le 65376 ]; then w=2   # FF00-FF60
+    elif [ "$cp" -ge 65504 ]  && [ "$cp" -le 65510 ]; then w=2   # FFE0-FFE6
+    elif [ "$cp" -ge 127744 ] && [ "$cp" -le 129791 ]; then w=2  # 1F300-1FAFF
+    elif [ "$cp" -ge 131072 ]; then w=2                          # >= 20000
+    fi
+    total=$(( total + w ))
+  done
+  printf '%s' "$total"
 }
 
 # 1. clock (not from stdin) - bright white
@@ -817,15 +867,15 @@ col_widths=()
 for ((ci=0; ci<max_cols; ci++)); do
   w=0
   if [ "$ci" -lt "${#parts1_plain[@]}" ]; then
-    l=${#parts1_plain[$ci]}
+    l=$(disp_width "${parts1_plain[$ci]}")
     [ "$l" -gt "$w" ] && w=$l
   fi
   if [ "$ci" -lt "${#parts2_plain[@]}" ]; then
-    l=${#parts2_plain[$ci]}
+    l=$(disp_width "${parts2_plain[$ci]}")
     [ "$l" -gt "$w" ] && w=$l
   fi
   if [ "$ci" -lt "${#parts3_plain[@]}" ]; then
-    l=${#parts3_plain[$ci]}
+    l=$(disp_width "${parts3_plain[$ci]}")
     [ "$l" -gt "$w" ] && w=$l
   fi
   col_widths+=("$w")
@@ -842,7 +892,7 @@ render_line() {
   for ((ci=0; ci<n; ci++)); do
     cell="${cparts[$ci]}"
     if [ "$ci" -lt "$((n-1))" ]; then
-      plen=${#pparts[$ci]}
+      plen=$(disp_width "${pparts[$ci]}")
       w="${col_widths[$ci]}"
       pad=$(( w - plen ))
       padding=""
