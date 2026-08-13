@@ -298,26 +298,32 @@ disp_width() {
 #   1 id  2 identity  3 type  4 model  5 effort  6 status  7 startTime
 #   8 tokenCount  9 description
 #
-# NOT read as literal TSV, on purpose: @tsv (jq, below) is used only to
-# borrow its per-field backslash/tab/CR/LF ESCAPING (so a literal newline
-# or embedded tab typed into a task's description/name can never split a
-# row or misalign a column); every real separator tab @tsv inserts
-# BETWEEN fields (never inside one - an embedded one is the 2-char escape
-# by then) is then rewritten, in BASH after capture (a plain parameter-
-# expansion replace, matches a raw tab BYTE only), to the ASCII Unit
-# Separator 0x1F, ACROSS THE WHOLE captured blob in one shot (cheaper than
-# per-line, and correct either way since the replace only ever touches
-# raw tab bytes, never the newlines mapfile splits on). This rewrite is
-# required, not cosmetic: space/tab/newline are BASH "IFS-whitespace"
-# characters, so `IFS=$'\t' read -r a b c <<<...` silently COLLAPSES any
-# run of consecutive tabs - i.e. every empty field, and most tasks have
-# several (no type/model/effort is common) - into a single delimiter,
-# shifting every field after the first empty one into the wrong variable
-# (this hit production: status landing in the type slot, startTime in the
-# model slot, etc). 0x1F is not IFS-whitespace, so empty fields between
-# two 0x1F bytes are preserved exactly; every `read` below uses
-# IFS=$'\x1f' to match.
+# NOT read as literal TSV, on purpose: every text field is first run
+# through `def clean` IN JQ - tab/LF/CR fold to a single space (so a
+# newline typed into a description can never split a row) and every
+# OTHER C0 control char is stripped outright. The strip is load-bearing
+# twice over (adversarial review, 2026-08-14): a raw 0x1F inside a field
+# (JSON \u001f is legal, @tsv passes it through) used to split that row
+# at the wrong places - startTime landed in the tokenCount slot and got
+# WRITTEN INTO the trend file - and any other raw C0 walked straight
+# into the emitted JSON string, which the spec forbids, so the host
+# dropped the whole row. After clean, the ONLY escape @tsv can still
+# produce is backslash -> "\\" (its tab/LF/CR escapes have nothing left
+# to fire on), and PASS 1 decodes that with ONE order-safe expansion per
+# text field - a multi-escape decode has no safe order ("\" then "t"
+# adjacent in cleartext is indistinguishable from an escaped tab), which
+# is exactly why the escapes are neutralized jq-side instead. Every real
+# separator tab @tsv inserts BETWEEN fields is then rewritten, in BASH
+# after capture (parameter-expansion replace of the raw tab BYTE, whole
+# blob in one shot), to the ASCII Unit Separator 0x1F. That rewrite is
+# required, not cosmetic: space/tab/newline are BASH "IFS-whitespace",
+# so `IFS=$'\t' read` silently COLLAPSES runs of consecutive tabs -
+# i.e. every empty field, and most tasks have several - shifting every
+# later field into the wrong variable (this hit production). 0x1F is not
+# IFS-whitespace, so empty fields survive exactly; every `read` below
+# uses IFS=$'\x1f' to match.
 jq_all_out=$(jq -r '
+  def clean: tostring | gsub("[\t\n\r]"; " ") | gsub("[\u0001-\u001f]"; "");
   (.columns // "") as $columns
   | (.tasks // []) as $tasks_raw
   | ($tasks_raw | if type == "array" then . else [] end) as $tasks
@@ -325,21 +331,21 @@ jq_all_out=$(jq -r '
   | ([$tasks[]? | .model // empty | select(length>0)] | group_by(.) | max_by(length) | .[0] // "") as $majority_model
   | ([$tasks[]? | .tokenCount // 0 | select(type=="number")] | add // 0 | tostring) as $total_tokens
   | ([$tasks[]? | .tokenCount // empty | select(type=="number" and . > 0)] | length | tostring) as $tokened_count
-  | $columns, $majority_model, $total_tokens, $tokened_count,
+  | $columns, ($majority_model | clean), $total_tokens, $tokened_count,
     (
       range(0; $tcount) as $i
       | ($tasks[$i]) as $task
       | (
           [
-            ($task.id // ""),
-            (if ($task.name != null and $task.name != "") then $task.name elif ($task.label != null and $task.label != "") then $task.label elif ($task.type != null and $task.type != "") then $task.type else "" end),
-            ($task.type // ""),
-            ($task.model // ""),
-            ($task.effort // "" | tostring),
-            ($task.status // ""),
+            ($task.id // "" | clean),
+            ((if ($task.name != null and $task.name != "") then $task.name elif ($task.label != null and $task.label != "") then $task.label elif ($task.type != null and $task.type != "") then $task.type else "" end) | clean),
+            ($task.type // "" | clean),
+            ($task.model // "" | clean),
+            ($task.effort // "" | clean),
+            ($task.status // "" | clean),
             ($task.startTime // "" | tostring),
             ($task.tokenCount // "" | tostring),
-            ($task.description // "")
+            ($task.description // "" | clean)
           ] | @tsv
         ),
         (
@@ -408,6 +414,11 @@ if [ -r "$subagent_trend_file" ]; then
     [[ "$t_epoch" =~ ^[0-9]+$ ]] || continue
     [ -n "$t_csv" ] || continue
     [[ "$t_csv" == *[!0-9,]* ]] && continue
+    # CLOCK-ROLLBACK GUARD: a row stamped in the future (wall clock
+    # stepped back since it was written) would block the >=10s sampling
+    # throttle below until the clock re-passes it - purge it instead;
+    # sampling restarts cleanly on this very render.
+    [ "$t_epoch" -gt $(( samp_now + 60 )) ] && { trend_dirty=1; continue; }
     [ $(( samp_now - t_epoch )) -gt 1800 ] && { trend_dirty=1; continue; }
     trend_csv_by_id[$t_id]=$t_csv
     trend_epoch_by_id[$t_id]=$t_epoch
@@ -428,6 +439,11 @@ col_max=(0 0 0 0 0 0)
 jl_count=${#JL[@]}
 task_count_total=$(( (jl_count - 4) / 2 ))
 [ "$task_count_total" -lt 0 ] && task_count_total=0
+# @tsv decode constants (see the jq call's header comment): after jq-side
+# `clean`, backslash is the ONLY escape @tsv can still emit, so decoding
+# is one expansion per text field - order-safe by construction.
+BSL1='\'
+BSL2='\\'
 for ((ti=0; ti<task_count_total; ti++)); do
   row_idx=$(( 4 + 2*ti ))
   # Field order matches the CANONICAL COLUMN ORDER comment above exactly.
@@ -435,6 +451,15 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # literal tab here would silently corrupt any row with an empty field.
   IFS=$'\x1f' read -r id identity_plain task_type model effort status start_time token_count description <<< "${JL[$row_idx]}"
   [ -z "$id" ] && continue
+  # @tsv DECODE (adversarial review fix, 2026-08-14): undo the doubled
+  # backslashes @tsv wrote (its only remaining escape after jq-side
+  # clean) on the user-text fields - Windows paths in descriptions/names
+  # rendered as C:\\Users\\... and were width-budgeted at the inflated
+  # length. Enum-shaped fields (status/effort/model id) can't carry
+  # backslashes and skip the expansion.
+  identity_plain=${identity_plain//"$BSL2"/"$BSL1"}
+  task_type=${task_type//"$BSL2"/"$BSL1"}
+  description=${description//"$BSL2"/"$BSL1"}
 
   # column 1: identity segment: "▸ " + identity (bright magenta) + "(type)"
   # (gray) + "·"+short-model (cyan, always when present) + "·"+effort

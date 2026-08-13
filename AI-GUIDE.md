@@ -66,8 +66,8 @@
 
 **第 2 行 · 上下文引擎**
 8. 上下文电池：灰`ctx ` 标签起段。**主路径**（total_input_tokens 与 context_window_size 均为正数）：`occupied = total_input_tokens + total_output_tokens(数值时)`，`used=occupied*100/window` 夹 0–100，`remaining=100-used` 统一驱动一切——五格电池（实格数 `(remaining+10)/20` 夹 0–5，实格`█`、空格`░`灰）、档色（≥50绿/20–49黄/<20亮红且加亮红`!`前缀）、百分比数字；token 文本 `占用/窗口`，各数字独立格式化：<1000k 用 `(n+500)/1000` 取 k；≥1000k 用 M（`m10=(n+50000)/100000`，小数为零省略：`1M`、`1.5M`），白`294k`+灰`/1M`。**回退路径**（token 字段不可用但 remaining_percentage 非 null）：按百分比驱动电池，无 token 文本，显示值 `printf '%.0f'`，阈值判断用整数截断（floor）。
-9. 走势+速率（一段，两半各自可选，空格连接）：走势=历史文件同会话行 token 列的相邻差值（负值夹 0，取最近 ≤9 行→≤8 个差值，≥2 个才显示），min..max 归一到 `▁▂▃▄▅▆▇█`（全等→全`▄`），青色；速率=最新 token 值减 5 分钟窗口内最旧值 / 时距（需时距 ≥60s 且差值非负），≥1000/min 显示一位小数 k（整数算法 `delta*60/(span*100)` 得十倍值再拆），否则 `N/m`；档色 <5000灰/5000–14999黄/≥15000亮红。
-10. 缓存命中：`.context_window.current_usage` 的 r=cache_read、w=cache_creation、i=input，denom=i+w+r>0 才显示：灰`cache ` + `N%`（r*100/denom）档色 ≥80绿/50–79黄/<50亮红。
+9. 走势+速率（一段，两半各自可选，空格连接）：走势=历史文件同会话行 token 列的相邻差值（负值夹 0，取最近 ≤9 行→≤8 个差值，≥2 个才显示），min..max 归一到 **6 级** `▁▂▃▄▅▆`（**封顶 ▆，刻意不用 ▇/█**——满高格会与相邻行叠字粘连；全等→全`▃`），青色；速率=最新 token 值减 5 分钟窗口内最旧值 / 时距（需时距 ≥60s 且差值非负），≥1000/min 显示一位小数 k（整数算法 `delta*60/(span*100)` 得十倍值再拆），否则 `N/m`；档色 <5000灰/5000–14999黄/≥15000亮红。
+10. 缓存命中：`.context_window.current_usage` 的 r=cache_read、w=cache_creation、i=input，denom=i+w+r>0 才显示：灰`cache ` + **一位小数** `N.M%`（整数算法 `r*1000/denom` 得十倍值再拆，如 `92.3%`）档色按整数部分 ≥80绿/50–79黄/<50亮红。
 
 **第 3 行 · 开销与限额**
 11. 花费：`$` 不着色（终端默认色）+ 金额 `printf '%.2f'` 档色（整数部分 <1灰/1–4黄/≥5亮红）+ 空格 + `$X.X/h` 速率（历史文件 60 分钟窗口，纯 bash 分转换：整数部分*100+前两位小数，需时距 ≥120s 且差值非负，`cents*3600/span` 得每小时分数，按整美元档色同金额）。速率半独立可缺。
@@ -81,11 +81,11 @@
 
 ## 2. 硬性要求（两个脚本通用）
 
-0. **进程预算（Windows 生死线）**：MSYS2 上每次 fork ≈2–5ms，命令替换 `$(纯bash函数)` 也 fork——热路径出现几百次就是数秒卡顿。铁律：(a) 所有纯 bash 辅助函数用 **REPLY 返回模式**（`fn args; out=$REPLY`），调用点零命令替换；(b) 一切日期格式化用 `printf -v var '%(fmt)T' epoch`；(c) 文件读取用 `mapfile -t arr < file` / `read -r var < file`（无管道）；(d) TSV 拆列用 `IFS=$'\x1f' read -r -a`——**分隔符必须用 0x1F**，tab 属 IFS 空白类会折叠连续空字段导致整行串位；(e) 每次渲染的外部进程预算：jq×1 + git×1（+按需 tail/date×1），后台任务必须完全脱离（重定向全关 + `&` + disown）。
+0. **进程预算（Windows 生死线）**：MSYS2 上每次 fork ≈2–5ms，命令替换 `$(纯bash函数)` 也 fork——热路径出现几百次就是数秒卡顿。铁律：(a) 所有纯 bash 辅助函数用 **REPLY 返回模式**（`fn args; out=$REPLY`），调用点零命令替换；(b) 一切日期格式化用 `printf -v var '%(fmt)T' epoch`；(c) 文件读取用 `mapfile -t arr < file` / `read -r var < file`（无管道）；(d) TSV 拆列用 `IFS=$'\x1f' read -r -a`——**分隔符必须用 0x1F**，tab 属 IFS 空白类会折叠连续空字段导致整行串位；(e) 每次渲染的外部进程预算：jq×1 + git×1（+宽模式且有 transcript 时 tail+awk×1 管道、date≤1；低频路径——历史全量重写 ~30min 一次——允许 find×1 清孤儿 tmp），后台任务必须完全脱离（重定向全关 + `&` + disown）。
 0b. **历史文件双层**：细粒度 `~/.claude/statusline-history.tsv`（0x1F 4 列 `epoch␟session_id␟tokens␟cost`；读取端先 `${line//$'\t'/$'\x1f'}` 兼容旧 TAB；**整行形状校验**，恰好 4 列+逐列数值正则，否则整行丢弃——严禁部分字段泄入求和；按 **3 小时**窗+1 万行帽裁剪重写）只服务走势/速率/$每小时。today/week 走日聚合 `statusline-daily.tsv`（0x1F 6 列 `day␟sid␟closed␟peak␟prev␟last_epoch`：单调段状态机增量前推 + **last_epoch 水位线**——重放不双计、并发丢写由细粒度行自愈、首跑自动从存量行播种同一代码路径；week=含今日的近 7 个自然日，文件留 9 日）。两文件写入**追加优先**：平时新行走单次 O_APPEND 追加（并发天然安全）；仅当最老行超出读窗 30 分钟（细粒度）、行帽触顶或读到脏行/过期行时才全量裁剪重写（`$$` 临时名+原子 mv）——稳态下细粒度文件约每 30 分钟才重写一次，而非旧的每次追加都重写。
 0c. **抗资源枯竭·永不白屏三件套**（Windows 大进程树下 fork 枯竭真实存在——bash 报 `fork: retry: Resource temporarily unavailable`、子进程 0xC0000142——届时 jq spawn 会失败）：(a) **stderr 黑匣子**：`export LC_ALL` 后立即 `exec 2>>~/.claude/statusline-err.log`（超 500 行先自轮转再重定向），任何 stderr 泄给宿主都会整栏白屏，黑匣子既保白屏防线又留尸检证据；(b) **哨兵形状校验**：单次 jq 输出 N 个字段后**必须再追加一个字面量哨兵字段 `("__END__")`**——裸行数检查不可靠，因为 `$(...)` 命令替换会剥掉**全部**尾随换行，末字段（如 transcript_path）为空时 jq 输出以连续换行结尾、被整体剥除，健康载荷凭空少行而误判（真机踩过：无 transcript_path 的载荷 100% 误触发假降级）；哨兵永不为空、必幸存剥除，检查 `[ "${#F[@]}" -lt N+1 ] || [ "${F[N]}" != "__END__" ]` 才可靠；(c) **降级行**：形状校验失败时输出一行 `HH:MM:SS | statusline: degraded (fork)`（`printf '%(%H:%M:%S)T' -1`，零进程）并 `exit 0`——绝不空输出、绝不非零退出。
 
-0d. **语句预算**：MSYS 下 bash 每条语句 ~20-40μs（解释器本身的价格，与语句内容几乎无关）——热路径"每行 × 每帧"的循环体语句数就是毫秒账。**禁止任何随历史/日志增长的每帧重扫**：跨帧记忆一律用规模有界的紧凑状态文件承载（日聚合按天×会话、趋势态按活跃任务，皆此模式）。
+0d. **语句预算**：MSYS 下 bash 每条语句 ~20-40μs（解释器本身的价格，与语句内容几乎无关）——热路径"每行 × 每帧"的循环体语句数就是毫秒账。**禁止任何随历史/日志增长的每帧重扫**：跨帧记忆一律用规模有界的紧凑状态文件承载（日聚合按天×会话、趋势态按活跃任务，皆此模式）。同一状态文件**每帧只许走一遍**（第一轮对抗审查实锤：历史文件曾被两个近同构循环各扫一遍，1260 行 3 会话稳态白付 ~0.3-0.7s/帧——现为单循环同时喂走势数组/裁剪集/日聚合折叠/节流纪元）。**`mapfile <<< 大块` 按字节计价 ~3.5μs/B**（512KiB≈1.8s，换临时文件同样慢——拆行本身就是 O(bytes)，"逐行扫描只按行数计价"的成本模型是错的）：大块文本一律在管道里先经 awk/grep 预滤成小结果再拆行（transcript 尾窗模式），或先有界切片（`${blob:0:2048}`）再用参数展开逐行走（git porcelain 头部模式）。
 1. 无浮点：比较一律"截断小数→整数比"（非负数等价 floor）；显示另行 printf。
 2. printf/算术前必须 `[ -n ]` + `[[ =~ ^[0-9]+$ ]]` 守卫。
 3. 先判段非空再包颜色，禁止"只有颜色码的空段"进入拼装。
@@ -111,7 +111,7 @@
 
 ## 4. 子代理面板行（subagentStatusLine）
 
-**常驻 daemon 架构（必须）**：宿主重画面板时先出默认行、钩子返回才替换——钩子延迟即"闪回默认"窗口。因此 subagentStatusLine 命令指向轻钩子 `statusline-panel-hook.sh`（纯内建：分块读 stdin → 按**载荷首任务 id** 派生缓存键 → 原子 spool 交接 `spool.<key>.new` → mapfile 秒回 `cache.<key>` 上一帧 → `kill -0` 探测 daemon、死则游离拉起），渲染由 `statusline-panel-daemon.sh` 异步跑真渲染脚本完成（单实例 noclobber 抢占+活性接管；0.3s fifo `read -t` 零派生轮询；无活 2 分钟自灭；`--once` 供测试）。并发会话任务集不相交→缓存键天然隔离；一切竞争丢失都由下一拍自愈。状态目录 `$STATUSLINE_PANEL_DIR`（默认 `~/.claude/statusline-panel.d/`），renderer/daemon 路径可用 `STATUSLINE_PANEL_RENDERER`/`STATUSLINE_PANEL_DAEMON` 覆盖（测试用）。
+**常驻 daemon 架构（必须）**：宿主重画面板时先出默认行、钩子返回才替换——钩子延迟即"闪回默认"窗口。因此 subagentStatusLine 命令指向轻钩子 `statusline-panel-hook.sh`（纯内建：分块读 stdin → 按**载荷首任务 id** 派生缓存键 → 原子 spool 交接 `spool.<key>.new` → mapfile 秒回 `cache.<key>` 上一帧 → `kill -0` 探测 daemon、死则游离拉起），渲染由 `statusline-panel-daemon.sh` 异步跑真渲染脚本完成（单实例 noclobber 抢占；**陈旧接管=删除+独占重建、绝不裸 `>` 覆写**（截断窗会让并发读者误判无主）；**退出删除 pid 文件前必须校验内容==$$**（否则先退的一方会删掉存活实例的注册、级联拉起第三实例）；0.3s fifo `read -t` 零派生轮询；无活 2 分钟自灭；`--once` 供测试）。**渲染子进程必须带硬超时**（后台启动+fifo 节拍计数等待，默认 15s，`STATUSLINE_PANEL_RENDER_TIMEOUT` 覆盖；超时杀子进程跳帧，缓存继续供上一好帧）——同步无超时等待曾是全会话面板永久冻结的单点（子进程挂死→daemon 阻塞→`kill -0` 探活恒真→永不重启，默认安装无恢复路径）；每次渲染的 cache tmp 名带自增序号（MSYS/NTFS 上被杀子进程的 tmp 名会短暂处于 delete-pending、不可复用）。并发会话任务集不相交→缓存键天然隔离；一切竞争丢失都由下一拍自愈。状态目录 `$STATUSLINE_PANEL_DIR`（默认 `~/.claude/statusline-panel.d/`），renderer/daemon 路径可用 `STATUSLINE_PANEL_RENDERER`/`STATUSLINE_PANEL_DAEMON` 覆盖（测试用）。
 
 ### 4.1 契约（与主状态栏不同！）
 
@@ -129,10 +129,10 @@
 
 ## 5. 验证（必须实际执行）
 
-**首选**：仓库根目录 `bash test.sh --assert` —— 43 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、双层花费存储、追加优先裁剪触发、面板钩子 spool/缓存秒回/daemon 渲染、安装器本地模式/合并/幂等、列对齐、TSV 列序、空列裁剪、性能 <3s 门槛），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
+**首选**：仓库根目录 `bash test.sh --assert` —— 59 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、双层花费存储、追加优先裁剪触发、面板钩子 spool/缓存秒回/daemon 渲染、安装器本地模式/合并/幂等、**NBSP 分隔符列对齐（含断言活性自证——分隔符样式再变会红而不是断言静默失效）**、TSV 列序、空列裁剪、性能 <3s 门槛，及**对抗审查回归组**：@tsv 反斜杠单次反解码、C0 清洗不串位不坏 JSON、session_name 内嵌换行不降级、ctx 回退负值夹取/垃圾整段消失、主目录兄弟目录边界、daemon 挂死子进程超时截杀、时钟回拨不冻结采样、~500KiB transcript <2.5s 性能门），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
 
 主状态栏（`fixtures/` 三份 + 状态文件人工历史）：
-- **full.json**：三行齐全；电池 `ctx ███░░ 66% 70k/200k`（占用 69671=68471+1200→70k，非 68k！）；`cache 92%` 绿；`» my-session`。
+- **full.json**：三行齐全；电池 `ctx ███░░ 66% 70k/200k`（占用 69671=68471+1200→70k，非 68k！）；`cache 92.3%` 绿（一位小数）；`» my-session`。
 - 把 window 改 1000000：token 文本变 `70k/1M`。
 - **low-context.json**：`!█░░░░ 12% 176k/200k` 亮红；`$1.07` 黄；`5h` 青标签+`82%`亮红+白重置；`7d 45%` 绿无重置。
 - **minimal.json**：第 2 行消失（新会话无历史时），无悬空分隔符。
@@ -140,7 +140,7 @@
 - 干净/脏 git 仓库两态：绿 `main` / 绿 `main`+黄`*`。
 
 子代理行（`fixtures/subagent-tasks.json`，4 任务应输出 3 行有效 JSON）：
-- t1：`▸ code-reviewer(general)·max ●`（紫/灰/亮红/绿）、`68k tok`、走势`▄█▁▁`+速率、`Σ`份额、秒级用时`@HH:MM:SS`、描述截断。
+- t1：`▸ code-reviewer(general)·max ●`（紫/灰/亮红/绿）、`68k tok`、走势`▄▆▁▁`+速率（6 级封顶 ▆）、`Σ`份额、秒级用时`@HH:MM:SS`、描述截断。
 - t2：`12k tok`；`✓` **绿**；分钟级速率 `131/m`。
 - t3：label 兜底 + `·haiku-4-5` 青（模型恒显）+ `·50000` 黄 + `✗` 亮红 + `185k tok`；对象形态 tokenSamples 走势正常。
 - 无 id 任务不产生输出行。

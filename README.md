@@ -17,7 +17,7 @@ $0.42 $4.8/h                        | today $55.97      | week $89.20           
 
 | 行 | 主题 | 段 |
 |---|---|---|
-| 1 | 身份与位置 | 秒级时钟 · 模型短 id 名（同面板规则，保 `[1m]`，无 id 回退 display_name）`·`思考档位（热度色）`·`think · 目录缩写（`~`/折叠，末级亮蓝）· `⎇`worktree · 仓库（**OSC 8 超链接**）· 分支+脏`*` · `⚑`stash 数（≥5 亮红，0 隐藏）· PR（**超链接** + 评审状态 + CI 徽记）· `⚡bypass` 权限警示（settings 配置近似）|
+| 1 | 身份与位置 | 秒级时钟 · 模型短 id 名（同面板规则，保 `[1m]`，无 id 回退 display_name）`·`思考档位（热度色）`·`think · 目录缩写（`~`/折叠，末级亮蓝）· `⎇`worktree · 仓库（**OSC 8 超链接**）· 分支+脏`*` · `⚑`stash 数（≥5 亮红，0 隐藏）· PR（**超链接** + 评审状态 + CI 徽记）|
 | 2 | 上下文引擎 | `ctx` 五格电池（**占用=输入+最新输出**，`│`=80% 压缩线惯例标记，k/M 单位）· 消耗走势`▁▂▃▄▅▆`+速率（同段同色）· `cache 命中率一位小数 r/w量 新鲜度(hot→倒计时→cold)` · `↻`压缩次数`↓`回收量 |
 | 3 | 花费 | `$`金额+`$X.X/h`速率 · `today` 今日跨会话总花费 · `week` 近 7 天总花费 · `+增/-删`行数 |
 | 4 | 限额与会话 | `5h`/`7d` 用量%`·t`时间游标`→`重置时刻 · `wk` 按模型周配额（当前模型常显，他模型 ≥50% 才现身）· `extra` 付费溢出 · `»`会话名 |
@@ -40,7 +40,7 @@ $0.42 $4.8/h                        | today $55.97      | week $89.20           
 - **每次渲染进程数 ≈ 2**（jq×1 + git×1；可选 tail/date×1）：所有辅助函数走 REPLY 无 fork 调用、`printf -v` 替代一切 `$(date)`、纯 bash 解析历史文件——从最初 35+ 进程/3 秒优化到 **<1 秒**，支撑秒级 `refreshInterval` 常驻刷新（取消规则要求渲染远快于间隔——见"自动刷新机制"）
 - **状态文件双层**：细粒度 `statusline-history.tsv`（0x1F，TAB 旧格式自动兼容，**3 小时**窗）只养走势/速率/$每小时；today/week 走 `statusline-daily.tsv` 日聚合（单调段状态机 + 水位线增量：重放不双计、并发丢写自愈、首跑自动播种）——每帧不再重走几万行历史；写入**追加优先**（最老行超窗 30 分钟/行帽/脏行才全量重写，稳态磁盘 churn −95%）；`/clear` 重置按单调段分别计峰，不少算
 - **防御体系**：全部字段 `// empty`+数值正则守卫、历史行整行形状校验、Windows jq 的 CRLF 剥离、`LC_ALL=C.UTF-8` 字符计宽、NBSP 对齐垫充（防 VSCode 终端吞空格）、行首 `\e[0m` 防宿主样式渗染、非零退出=白屏的红线
-- **外部数据全部缓存+后台脱离刷新**：PR CI 状态（gh，60s）、周配额/溢出（OAuth `/api/oauth/usage`，180s+429 退避——**非官方端点**，随时可能失效，失效即整段静默消失）
+- **外部数据全部缓存+后台脱离刷新**：PR CI 状态（gh，60s，**按 repo+PR 分键**的缓存文件——多会话停在不同 PR 不再互相驱逐；gh 无结果也写**负缓存**，未登录/断网时按 TTL 重试而非每帧重派生）、周配额/溢出（OAuth `/api/oauth/usage`，180s+429 退避——**非官方端点**，随时可能失效，失效即整段静默消失）
 
 ## 依赖与安装
 
@@ -63,7 +63,7 @@ curl -fsSL https://raw.githubusercontent.com/googxi1310328414-afk/claude-code-st
 ```bash
 bash test.sh            # 渲染演示（终端看真色彩）
 bash test.sh --codes    # ANSI 码可视化
-bash test.sh --assert   # 43 项断言（CI 用，含性能门槛）
+bash test.sh --assert   # 59 项断言（CI 用，含性能门槛与对抗审查回归组）
 ```
 
 GitHub Actions 在每次 push 自动跑断言套件。
@@ -79,7 +79,7 @@ GitHub Actions 在每次 push 自动跑断言套件。
 5. **忙碌回合**：主栏**画面**冻结在回合开始帧，但**调用照常**（状态文件持续新鲜，回合结束瞬间回正）；子代理面板不受此限、全程实时。
 6. **采样与刷新的配比**：主栏 10s 刷新 × 30s 采样节流 = 每三帧记一次历史（走势每格≈30s，整图窗口 ~4.5 分钟）；面板宿主 ~5s 节拍 × 10s 采样 = 每两帧一样（每格≈10s）。刷新间隔管"画面多新"，采样节流管"走势每格多长"——两个旋钮独立调。
 7. **自愈层（可选，Windows）**：`statusline-watchdog.ps1` 由计划任务每 2 分钟清理挂死 >30s 的渲染 bash（fork 枯竭下的兜底）；**必须经 `statusline-watchdog.vbs`（wscript）拉起**——计划任务直接跑 powershell 会在 `-WindowStyle Hidden` 生效前闪一下控制台窗口。两文件复制到 `~/.claude/`（vbs 内路径按机器改）后：`schtasks /Create /SC MINUTE /MO 2 /TN claude-statusline-watchdog /TR "wscript.exe C:\Users\<你>\.claude\statusline-watchdog.vbs"`。
-8. **面板常驻 daemon**：subagentStatusLine 命令指向 `statusline-panel-hook.sh`——钩子只做"倒载荷 + 秒回上一帧缓存"（纯内建，稳态零派生，延迟≈bash 启动的毫秒级），真正的渲染由 `statusline-panel-daemon.sh` 异步完成（内容滞后一拍 ~5s，对累计 token/用时无感知）。宿主重画面板是"先默认行、钩子返回才替换"，钩子延迟=默认行闪烁窗口——daemon 化把它从整段渲染耗时（~300ms）压到毫秒级。缓存键=载荷首任务 id（并发会话任务集不相交，天然各用各的缓存）；daemon 单实例（noclobber 抢占+活性探测）、无活 2 分钟自灭、死了由下一拍钩子拉起、挂死的渲染子进程由第 7 条看门狗兜底——全链路自愈，无需手工管理。状态目录 `~/.claude/statusline-panel.d/`。
+8. **面板常驻 daemon**：subagentStatusLine 命令指向 `statusline-panel-hook.sh`——钩子只做"倒载荷 + 秒回上一帧缓存"（纯内建，稳态零派生，延迟≈bash 启动的毫秒级），真正的渲染由 `statusline-panel-daemon.sh` 异步完成（内容滞后一拍 ~5s，对累计 token/用时无感知）。宿主重画面板是"先默认行、钩子返回才替换"，钩子延迟=默认行闪烁窗口——daemon 化把它从整段渲染耗时（~300ms）压到毫秒级。缓存键=载荷首任务 id（并发会话任务集不相交，天然各用各的缓存）；daemon 单实例（noclobber 抢占；陈旧 pid 接管走"删除+独占重建"而非裸覆写，退出删除先验证 pid 归属——并发接管不再互踩）、无活 2 分钟自灭、死了由下一拍钩子拉起；**挂死的渲染子进程由 daemon 自身硬超时截杀跳帧**（默认 15s，`STATUSLINE_PANEL_RENDER_TIMEOUT` 可调，约为正常渲染的 50 倍——此前无超时，子进程一挂 daemon 即永久卡死、探活却始终"存活"，全部会话面板冻结在旧帧且默认安装无任何恢复路径；第 7 条看门狗仍是外层保险）——全链路自愈，无需手工管理。状态目录 `~/.claude/statusline-panel.d/`。
 
 ## 已知边界
 
@@ -87,6 +87,6 @@ GitHub Actions 在每次 push 自动跑断言套件。
 - **"刷新了但数字没动"是上游数据节奏**：宿主载荷里的 token/cost 只在每次 API 响应边界前进（实测同值连续 2-4 帧、平台期 ~20-40s，长工具调用/长生成期间更久），渲染忠实镜像宿主账目——非脚本滞后，脚本侧无解。
 - **忙碌回合中主状态栏绘制完全挂起**（实测：脚本仍按节奏被调用、数据保持新鲜，但画面冻结在回合开始帧；resize/交互均无法强制重画；回合结束瞬间回正）。同屏子代理面板不受此限、全程实时。根治需官方支持，可 `/feedback` 提"busy 期间按 refreshInterval 重绘 statusLine"。
 - workflow/ultracode 编队渲染在 `/workflows` 专属 UI，**不经过** subagentStatusLine（实测）；面板行只承载常规子代理。
-- 压缩计数/缓存倒计时读 transcript 尾部窗口（默认 512KiB，`STATUSLINE_TRANSCRIPT_TAIL_BYTES` 可调；重会话单条 JSONL 实测已达 114KiB——单条超窗会让两段静默消失，故留 ~4× 余量），超出窗口的旧边界不计；缓存倒计时的 TTL 是假设值（`STATUSLINE_CACHE_TTL_SECONDS`，默认 3600）。
+- 压缩计数/缓存倒计时读 transcript 尾部窗口（默认 512KiB，`STATUSLINE_TRANSCRIPT_TAIL_BYTES` 可调；重会话单条 JSONL 实测已达 114KiB——单条超窗会让两段静默消失，故留 ~4× 余量），超出窗口的旧边界不计；窗口扫描由 `tail | awk` 一次管道预滤（+1 fork，毫秒级）——bash 侧只拆有效行，**帧耗随命中数而非窗口字节数走**（旧实现 `mapfile` 整窗拆行实测 ~3.5μs/字节、满窗每帧 ~1.8s，已修）；窄终端（<100 列）该块整体跳过（紧凑行本就没有这两段）。缓存倒计时的 TTL 是假设值（`STATUSLINE_CACHE_TTL_SECONDS`，默认 3600）。
 - 电池上的 `│` 压缩线是 80% 社区惯例，非官方阈值。
 - `date -d`（GNU）与 `printf '%(...)T'`（bash ≥4.2）；macOS 需改 `date -r`。

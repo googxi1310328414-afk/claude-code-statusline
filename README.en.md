@@ -8,7 +8,7 @@ An information-dense, colorized status line for Claude Code (Windows / Git Bash)
 
 ```
 08:17:08               | Fable 5·max·think | ~\claude-code-statusline  | main*
-ctx ████░ 71% 294k/1M  | ▂▃▂▄ 2.9k/m       | cache 99%
+ctx ████░ 71% 294k/1M  | ▂▃▂▄ 2.9k/m       | cache 99.3%
 $74.94 $79.8/h         | +2005/-585        | 5h 32%→09:10 7d 12%→08-15 | » session-name
 ```
 
@@ -36,9 +36,10 @@ curl -fsSL https://raw.githubusercontent.com/googxi1310328414-afk/claude-code-st
 
 It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES settings.json (existing keys preserved, original backed up) and smoke-tests the render; append ` -s -- --with-watchdog` to also register the Windows watchdog task. Manual steps:
 
-1. Copy both `.sh` files into `~/.claude/`.
-2. Merge the two keys from `settings-snippet.json` into `~/.claude/settings.json`.
-3. Done — the status line re-renders on the next refresh.
+1. Copy all FOUR `.sh` files into `~/.claude/`: `statusline-command.sh` (main renderer), `subagent-statusline.sh` (panel renderer), `statusline-panel-hook.sh` (the instant-return panel hook) and `statusline-panel-daemon.sh` (the resident panel renderer the hook spawns).
+2. Create the panel state directory `~/.claude/statusline-panel.d/`.
+3. Merge the two keys from `settings-snippet.json` into `~/.claude/settings.json` (statusLine points at the main script, subagentStatusLine at the panel HOOK — not at the panel renderer directly).
+4. Done — the status line re-renders on the next refresh.
 
 **Recommended**: feed [`AI-GUIDE.md`](AI-GUIDE.md) (Chinese; the complete build spec with data contracts, thresholds, robustness rules and a verification checklist) to Claude Code and let it rebuild and adapt everything for your machine.
 
@@ -47,6 +48,7 @@ It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES s
 ```bash
 bash test.sh          # render all fixtures (see real colors in your terminal)
 bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
+bash test.sh --assert # 59 assertions (CI mode; perf gates + adversarial-review regression group)
 ```
 
 ## Notable engineering notes
@@ -55,6 +57,9 @@ bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
 - Windows `jq` emits CRLF: every line-wise read must pass through `tr -d '\r'` (MSYS bash strips trailing CRs in `$(...)` substitutions, `mapfile` does not).
 - Scripts export `LC_ALL=C.UTF-8` — column alignment depends on character-based (not byte-based) string measurement, plus a `disp_width()` that counts East-Asian wide characters as 2 terminal cells.
 - Two-tier spend store: fine-grained history is kept for only 3h (it only feeds sparkline/rate/$-per-hour); today/week read a tiny per-day rollup file maintained incrementally with a watermark (replay-safe, self-healing under concurrent sessions) — renders never re-walk days of rows.
+- The panel daemon kills a hung render child at a hard deadline (default 15 s, `STATUSLINE_PANEL_RENDER_TIMEOUT`) and skips the frame — a wedged child can no longer freeze every session's panel behind an "alive" pid probe.
+- The transcript tail window (512 KiB) is pre-filtered by one `tail | awk` pipe: bash splits only the few matched lines, so the frame cost follows match count, not window bytes (`mapfile <<<` measures ~3.5 µs/byte on MSYS — splitting IS O(bytes)).
+- The PR CI badge cache is one file PER (repo, PR) with negative caching — concurrent sessions on different PRs stopped evicting each other every frame.
 - Workflow/ultracode fleets do **not** flow through `subagentStatusLine` (measured empirically); they render in the dedicated `/workflows` UI, which has no customization hook.
 
 MIT licensed.

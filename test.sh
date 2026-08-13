@@ -71,15 +71,36 @@ if [ "$1" = "--assert" ]; then
   printf '%s' "$plain" | grep -q '·t' && ok "pace cursor" || bad "pace cursor missing"
   printf '%s' "$plain" | grep -q '» my-session' && ok "session name marker" || bad "session marker missing"
   printf '%s' "$plain" | grep -q 'fable-5·max·think' && ok "main model panel-synced short id" || bad "main model name not synced"
-  printf '%s' "$plain" | grep -q '| |' && bad "stray empty cell '| |'" || ok "no stray empty cells"
-  # first-column separator aligns across all 4 lines
-  col=$(printf '%s\n' "$plain" | head -1 | grep -bo ' | ' | head -1 | cut -d: -f1)
+  # SEPARATORS ARE NBSP|NBSP (U+00A0 padding, not ASCII spaces): the old
+  # ASCII ' | ' / '| |' patterns matched NOTHING in real output, so the
+  # alignment and empty-cell asserts had passed unconditionally since
+  # they were written (dead assertions - adversarial review 2026-08-14,
+  # proven by breaking the padding and still getting ALL PASS). NBSP is
+  # bound ONCE here and a liveness assert proves the pattern still
+  # occurs at all, so any future separator restyle fails LOUDLY instead
+  # of going silently dead again.
+  NBSP=$(printf '\302\240')
+  SEPPAT="${NBSP}|${NBSP}"
+  sep_count=$(printf '%s' "$plain" | grep -o "$SEPPAT" | wc -l)
+  [ "$sep_count" -ge 4 ] && ok "NBSP separator liveness (pattern matches real output)" || bad "NBSP separator pattern matches nothing - asserts dead again"
+  printf '%s' "$plain" | grep -qE "\|(${NBSP})+\|" && bad "stray empty cell (sep-pad-sep)" || ok "no stray empty cells"
+  # first-column separator aligns across all 4 lines - compared in
+  # CHARACTERS (bash ${#} under the UTF-8 locale), NOT bytes: the cells
+  # contain multibyte glyphs (█ ░ │ ⚑ ...), so byte offsets legitimately
+  # differ across perfectly aligned lines
+  col=""
   aligned=1
   while IFS= read -r ln; do
-    c=$(printf '%s' "$ln" | grep -bo ' | ' | head -1 | cut -d: -f1)
-    [ -n "$c" ] && [ "$c" != "$col" ] && aligned=0
+    case "$ln" in
+      *"$SEPPAT"*)
+        pre=${ln%%"$SEPPAT"*}
+        if [ -z "$col" ]; then col=${#pre}
+        elif [ "${#pre}" != "$col" ]; then aligned=0; fi
+        ;;
+    esac
   done <<< "$plain"
-  [ "$aligned" -eq 1 ] && ok "first separator aligned (byte-wise)" || bad "first separator misaligned"
+  [ -n "$col" ] || aligned=0
+  [ "$aligned" -eq 1 ] && ok "first separator aligned (char-wise)" || bad "first separator misaligned"
   awk -v a="$t0" -v b="$t1" 'BEGIN{exit (b-a < 3.0) ? 0 : 1}' && ok "render < 3s" || bad "render too slow"
   printf '%s' "$plain" | grep -q '·t60%' && ok "pace cursor value (t60%)" || bad "pace value wrong"
 
@@ -151,7 +172,7 @@ if [ "$1" = "--assert" ]; then
   [ "$all_json" -eq 1 ] && ok "subagent rows valid JSON" || bad "subagent invalid JSON"
   printf '%s' "$sub" | jq -r .content 2>/dev/null | strip | grep -q '5k tok' && ok "subagent field order (TSV fix)" || bad "subagent fields scrambled"
   solo=$(jq -n --argjson now "$now" '{columns:120,tasks:[{id:"t1",label:"solo",status:"running",tokenCount:5000,startTime:(($now-120)*1000),description:"x"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
-  printf '%s' "$solo" | grep -q '| |' && bad "solo row empty cell" || ok "solo row clean"
+  printf '%s' "$solo" | grep -qE "\|(${NBSP})+\|" && bad "solo row empty cell" || ok "solo row clean"
   printf '%s' "$solo" | grep -q 'Σ' && bad "solo row shows share" || ok "solo hides share"
   # model is a STANDALONE cell (not glued to the identity), always shown
   # when present, with the "[1m]" capacity tag KEPT verbatim
@@ -168,6 +189,68 @@ if [ "$1" = "--assert" ]; then
   printf "ms\x1f%s\x1f1000,3000,4000\n" "$((now-10))" > "$STATUSLINE_SUBAGENT_TREND_FILE"
   spark=$(subagent_payload "$now" | bash ./subagent-statusline.sh | jq -r 'select(.id=="ms") | .content' | strip)
   printf '%s' "$spark" | grep -qE '[▁▂▃▄▅▆]' && ok "subagent sparkline from own samples" || bad "own-sample sparkline missing"
+
+  # ---- adversarial-review round-1 regression asserts (2026-08-14) ----
+  BSL=$(printf '\134')
+  # R1: @tsv backslash decode - a Windows path in a description renders
+  # with SINGLE backslashes (was doubled), and the row stays valid JSON
+  bsrow=$(jq -n --arg d "edit C:${BSL}Users${BSL}me${BSL}app.js" '{columns:200,tasks:[{id:"bs1",label:"L",status:"running",tokenCount:5000,description:$d}]}' | bash ./subagent-statusline.sh)
+  printf '%s' "$bsrow" | jq -e . >/dev/null 2>&1 && ok "backslash row valid JSON" || bad "backslash row invalid JSON"
+  bs_content=$(printf '%s' "$bsrow" | jq -r .content | strip)
+  case "$bs_content" in
+    *"C:${BSL}${BSL}Users"*) bad "backslash still doubled" ;;
+    *"C:${BSL}Users${BSL}me"*) ok "@tsv backslash decoded once" ;;
+    *) bad "backslash path missing entirely" ;;
+  esac
+  # R2: a raw C0 (0x1F) inside a field neither shifts columns nor breaks
+  # the emitted JSON (jq-side clean strips it before @tsv)
+  c0row=$(jq -n '{columns:150,tasks:[{id:"c0",label:("A"+"\u001f"+"B"),status:"running",startTime:1755100000000,tokenCount:5000,description:"real"}]}' | bash ./subagent-statusline.sh)
+  printf '%s' "$c0row" | jq -e . >/dev/null 2>&1 && ok "C0 row valid JSON" || bad "C0 row invalid JSON"
+  printf '%s' "$c0row" | grep -q '1755100000k tok' && bad "C0 shifted startTime into token slot" || ok "C0 does not shift fields"
+  # R3: an embedded newline in session_name must NOT degrade the whole
+  # bar (jq-side clean folds it; the F[] sentinel stays at F[30])
+  nlout=$(jq -n '{session_id:"nl1",model:{display_name:"M"},workspace:{current_dir:"/x"},session_name:("a"+"\n"+"b")}' | bash ./statusline-command.sh | strip)
+  printf '%s' "$nlout" | grep -q 'degraded' && bad "newline session_name degraded bar" || ok "newline session_name survives"
+  printf '%s' "$nlout" | grep -q '» a b' && ok "newline folded to space" || bad "newline fold missing"
+  # R4: ctx fallback guards - negative remaining clamps to the red !0%
+  # alarm; a garbage string drops the segment (no printf noise, no green)
+  negout=$(jq -n '{session_id:"neg1",model:{display_name:"M"},workspace:{current_dir:"/x"},context_window:{remaining_percentage:-7.4}}' | bash ./statusline-command.sh | strip)
+  printf '%s' "$negout" | grep -q 'ctx !' && printf '%s' "$negout" | grep -q ' 0%' && ok "negative remaining clamps to !0%" || bad "negative remaining unguarded"
+  garbout=$(jq -n '{session_id:"garb1",model:{display_name:"M"},workspace:{current_dir:"/x"},context_window:{remaining_percentage:"12abc"}}' | bash ./statusline-command.sh | strip)
+  printf '%s' "$garbout" | grep -q 'ctx' && bad "garbage remaining rendered ctx" || ok "garbage remaining drops segment"
+  # R5: home-prefix boundary - a SIBLING profile directory must not be
+  # abbreviated as "~..."
+  sibout=$(jq -n --arg d "C:${BSL}Users${BSL}Administrator.DOMAIN${BSL}proj" '{session_id:"sib1",model:{display_name:"M"},workspace:{current_dir:$d}}' | USERPROFILE="C:${BSL}Users${BSL}Administrator" bash ./statusline-command.sh | strip)
+  printf '%s' "$sibout" | grep -q '~.DOMAIN' && bad "sibling profile abbreviated as home" || ok "home boundary respected"
+  # R6: daemon hung-child deadline - a wedged renderer is killed at the
+  # timeout, the frame is skipped, --once returns promptly (this was the
+  # permanent all-session panel freeze)
+  printf '#!/bin/bash\nsleep 300\n' > "$tmpd/hangrender.sh"
+  printf '{"columns":120,"tasks":[{"id":"tmo1","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.tmo1.new"
+  tmo_t0=$SECONDS
+  STATUSLINE_PANEL_RENDERER="$tmpd/hangrender.sh" STATUSLINE_PANEL_RENDER_TIMEOUT=1 bash ./statusline-panel-daemon.sh --once
+  tmo_el=$(( SECONDS - tmo_t0 ))
+  [ "$tmo_el" -lt 6 ] && ok "daemon kills hung render at deadline" || bad "daemon blocked on hung render (${tmo_el}s)"
+  [ -f "$STATUSLINE_PANEL_DIR/cache.tmo1" ] && bad "hung render left a cache" || ok "hung render frame skipped"
+  # R7: clock rollback - a future-epoch history row must not freeze the
+  # 30s sampling throttle (this render still appends a fresh row)
+  printf "%s\x1fabc\x1f70000\x1f0.50\n" "$((now+7200))" > "$STATUSLINE_HISTORY_FILE"
+  bash ./statusline-command.sh < fixtures/full.json >/dev/null
+  [ "$(grep -c . "$STATUSLINE_HISTORY_FILE")" -ge 2 ] && ok "future-epoch row does not freeze sampling" || bad "clock rollback froze sampling"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R8: transcript tail cost is O(matches) via the awk pre-filter, not
+  # O(bytes) via mapfile: a ~500KiB filler transcript renders fast and
+  # still finds the newest cache-active line
+  filler=$(printf 'x%.0s' {1..400})
+  {
+    for ((fi=0; fi<1200; fi++)); do printf '{"type":"user","message":{"content":"%s"},"uuid":"u%s"}\n' "$filler" "$fi"; done
+    printf '{"type":"assistant","message":{"usage":{"cache_read_input_tokens":50000}},"timestamp":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  } > "$tmpd/big.jsonl"
+  t8a=$EPOCHREALTIME
+  bigout=$(jq --arg tp "$tmpd/big.jsonl" '.transcript_path=$tp' fixtures/full.json | bash ./statusline-command.sh | strip)
+  t8b=$EPOCHREALTIME
+  printf '%s' "$bigout" | grep -q ' hot' && ok "big-transcript cache line found via awk" || bad "big-transcript cache line missed"
+  awk -v a="$t8a" -v b="$t8b" 'BEGIN{exit (b-a < 2.5) ? 0 : 1}' && ok "big-transcript render < 2.5s (O(bytes) split gone)" || bad "big-transcript render too slow"
 
   # panel daemon architecture: the hook must spool the payload, stay
   # silent on a cold cache, serve the cached frame instantly, and the
