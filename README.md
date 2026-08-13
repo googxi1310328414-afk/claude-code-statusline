@@ -84,6 +84,7 @@ GitHub Actions 在每次 push 自动跑断言套件。
 ## 已知边界
 
 - 渲染实测 0.4–1.3 秒（隔离基准 0.4–0.6s，真实载荷 ~1.2s）；刷新机理与取消规则见上一章。
+- **"刷新了但数字没动"是上游数据节奏**：宿主载荷里的 token/cost 只在每次 API 响应边界前进（实测同值连续 2-4 帧、平台期 ~20-40s，长工具调用/长生成期间更久），渲染忠实镜像宿主账目——非脚本滞后，脚本侧无解。
 - **忙碌回合中主状态栏绘制完全挂起**（实测：脚本仍按节奏被调用、数据保持新鲜，但画面冻结在回合开始帧；resize/交互均无法强制重画；回合结束瞬间回正）。同屏子代理面板不受此限、全程实时。根治需官方支持，可 `/feedback` 提"busy 期间按 refreshInterval 重绘 statusLine"。
 - workflow/ultracode 编队渲染在 `/workflows` 专属 UI，**不经过** subagentStatusLine（实测）；面板行只承载常规子代理。
 - 压缩计数/缓存倒计时读 transcript 尾部窗口（默认 512KiB，`STATUSLINE_TRANSCRIPT_TAIL_BYTES` 可调；重会话单条 JSONL 实测已达 114KiB——单条超窗会让两段静默消失，故留 ~4× 余量），超出窗口的旧边界不计；缓存倒计时的 TTL 是假设值（`STATUSLINE_CACHE_TTL_SECONDS`，默认 3600）。
