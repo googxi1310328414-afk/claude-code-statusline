@@ -10,6 +10,7 @@ cd "$(dirname "$0")" || exit 1
 export STATUSLINE_HISTORY_FILE="$(mktemp -u)/test-hist.tsv" 2>/dev/null || export STATUSLINE_HISTORY_FILE="/tmp/statusline-test-hist.$$"
 mkdir -p "$(dirname "$STATUSLINE_HISTORY_FILE")"
 export STATUSLINE_SUBAGENT_SAMPLES_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-subsamp.tsv"
+export STATUSLINE_DAILY_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-daily.tsv"
 trap 'rm -rf "$(dirname "$STATUSLINE_HISTORY_FILE")"' EXIT
 
 strip() { perl -pe 's/\e\[[0-9;]*m//g; s/\e\]8;;[^\e]*\e\\//g'; }
@@ -96,6 +97,18 @@ if [ "$1" = "--assert" ]; then
   bare=$(bash ./statusline-command.sh < fixtures/full.json | strip)
   printf '%s' "$bare" | grep -q 'degraded' && bad "empty-tail payload false degraded" || ok "empty-tail payload not degraded"
   [ "$(printf '%s\n' "$bare" | wc -l)" -eq 4 ] && ok "empty-tail payload full 4-line render" || bad "empty-tail payload line count != 4"
+
+  # two-tier spend store: the renders above must have seeded the daily
+  # rollup (watermark path) from the same-day fixture history rows
+  grep -q "^$(date +%Y%m%d)" "$STATUSLINE_DAILY_FILE" 2>/dev/null && ok "daily rollup seeded" || bad "daily rollup missing"
+  # week must survive on the rollup alone (no fine rows): yesterday-only
+  # rollup row, closed 500 + peak 250 cents = $7.50
+  yday=$(date -d yesterday +%Y%m%d 2>/dev/null || date -v-1d +%Y%m%d)
+  printf "%s\x1fzzz\x1f500\x1f250\x1f250\x1f%s\n" "$yday" "$((now-86400))" > "$STATUSLINE_DAILY_FILE"
+  : > "$STATUSLINE_HISTORY_FILE"
+  wkonly=$(bash ./statusline-command.sh < fixtures/minimal.json | strip)
+  printf '%s' "$wkonly" | grep -q 'week \$7.50' && ok "week from rollup alone" || bad "rollup-only week wrong"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
 
   # stash segment: count rides the same single git call (--porcelain=v2
   # --branch --show-stash); also guards the v1->v2 branch-parse rewrite

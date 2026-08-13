@@ -239,13 +239,17 @@ exec 2>>"$statusline_err_log"
 #      whole segment is hidden when the amount rounds to 0.00 AND no rate
 #      is displayable.
 #   (TODAY/WEEK TOTAL, right after cost: gray "today"/"week" + white
-#   "$X.XX" each - a pure-bash scan of the history file's already-loaded
-#   rows, summing the peak of every per-session spending "run" (a /clear
-#   resets a session's cost column, so a simple max would undercount) -
-#   zero spawns, no transcript scanning; see the inline comment above
-#   their code for the full monotonic-run algorithm and caveats. TODAY
-#   only shows when it exceeds the current session's own cost by >=1
-#   cent; WEEK has no such comparison.)
+#   "$X.XX" each - fed by a TWO-TIER store: the fine-grained history
+#   file (trimmed to 3h; it only needs to serve sparkline/rate/$-per-
+#   hour) plus a tiny per-day rollup file (statusline-daily.tsv) that
+#   carries each (day, session)'s monotonic-run spend state forward
+#   incrementally (a /clear resets a session's cost column, so a simple
+#   max would undercount) - zero spawns, no transcript scanning, and no
+#   re-walk of days of rows every render; see the inline comment above
+#   their code for the algorithm, the watermark/concurrency story and
+#   caveats. TODAY only shows when it exceeds the current session's own
+#   cost by >=1 cent; WEEK (last 7 local calendar days incl today) has
+#   no such comparison.)
 #   12 lines changed +added/-removed - "+" green / "/" uncolored / "-" red.
 #      ZERO-HIDE: hidden when added and removed are both 0.
 #
@@ -636,47 +640,88 @@ if [ -n "$session_id" ]; then
   fi
 fi
 
-# TODAY/WEEK TOTAL + HISTORY TRIM: ONE pure-bash pass over hist_all_lines
-# (which already reflects this render's just-appended row above, if any)
-# computes all three at once - zero extra spawns, and no second pass just
-# for trimming. "Today" = same local-time YYYYMMDD string as now (printf
-# '%(%Y%m%d)T', string-compared per row; no UTC-midnight math needed);
-# "week" = epoch >= now-604800. TRIM is now TIME-based, not count-based:
-# a row is kept when its epoch is within the last 8 days (7-day week
-# window + 1 day margin), with a 50000-line safety cap (oldest surviving
-# rows dropped beyond it) applied after the scan in case some pathological
-# number of sessions keeps the file huge even within 8 days.
-# MONOTONIC RUNS (today and week both): a session's cost column is
-# normally a running total, but /clear resets it mid-session, so simply
-# taking the max cost seen for a session_id would UNDERCOUNT a session
-# that cleared and kept spending. Instead, within each scope
-# independently, rows for a given session_id are walked in file order
-# (chronological); a cost LOWER than that session's previous row closes
-# out the current run (its peak is added to the session's scope total)
-# and starts a new run at the lower value; whatever run is still open per
-# session is closed out once more after the loop. This sums the peak of
-# every run instead of a single global max. TODAY is shown only when its
-# sum exceeds THIS session's own cost by >= 1 cent (avoids redundancy
-# with the cost segment right before it); WEEK has no such comparison -
-# it's expected to differ from a same-day session's own cost, and when it
-# happens to equal today's total (single day of data so far) both still
-# show. Caveat (both): only counts sessions that actually rendered the
-# statusline within the scope's window, and a session whose rows straddle
-# a window edge has its outside-the-window spend excluded from that scope
-# - today and week are independent sums, not complementary halves.
-declare -A today_prev_cents today_run_max_cents today_total_by_sid
-declare -A week_prev_cents week_run_max_cents week_total_by_sid
+# TODAY/WEEK TOTAL + HISTORY TRIM + DAILY ROLLUP: ONE pure-bash pass over
+# hist_all_lines (which already reflects this render's just-appended row
+# above, if any) feeds all of it - zero extra spawns.
+#
+# TWO-TIER STORE (perf): the fine rows only need to serve the sparkline
+# (last ~3min), token rate (5min window) and $/h (60min window), so the
+# fine file is trimmed to 3 HOURS (was 8 days). The spend scopes that DID
+# need days of data (today/week) read a tiny per-day rollup file instead
+# of re-walking days of fine rows every render: at the old retention a
+# long-lived multi-session file approached the 50k-row cap, and this
+# loop's per-row herestring split alone would have added hundreds of ms
+# to EVERY render. Steady state now: fine file ~1k rows, rollup dozens.
+#
+# ROLLUP FILE (statusline-daily.tsv, override: $STATUSLINE_DAILY_FILE):
+# one row per (local day, session):
+#   day<0x1F>sid<0x1F>closed_cents<0x1F>peak_cents<0x1F>prev_cents<0x1F>last_epoch
+# = the MONOTONIC-RUN state machine for that day+session, carried across
+# renders: a session's cost column is a running total that /clear resets
+# mid-session, so a plain max would undercount - a value LOWER than prev
+# closes the open run (its peak folds into closed_cents) and starts a new
+# run at the lower value; display total = closed + peak. Same algorithm
+# the old in-loop scan used, now incremental instead of recomputed.
+#
+# last_epoch is the WATERMARK that makes this replay-safe and concurrency-
+# self-healing: each render folds ONLY fine rows newer than the sid's
+# watermark into the state, so re-walking old rows can never double-close
+# a run; when two sessions rewrite the shared rollup at the same tick
+# (per-PID tmp + atomic mv, last-writer-wins), the loser's folds are
+# simply re-done from the still-present fine rows on the next render.
+# SEEDING IS THE SAME CODE PATH, not a special case: missing rollup file
+# = empty state + zero watermarks = the first render folds every fine row
+# it has (up to 8 days' worth on the first post-upgrade run) and writes
+# the seeded rollup.
+#
+# SEMANTICS: today = sum over sessions of closed+peak for today's local
+# YYYYMMDD; week = the same summed over the last 7 LOCAL CALENDAR DAYS
+# including today (day granularity replaces the old rolling 604800s
+# window - an edge day is now wholly in or wholly out). A session's first
+# observation of a day seeds that day's run at the full cumulative value
+# (same straddle behavior as the old per-day scan). TODAY only shows when
+# its sum exceeds THIS session's own cost by >= 1 cent (avoids redundancy
+# with the cost segment right before it); WEEK has no such comparison.
+# Caveat (unchanged): only sessions that actually rendered within a scope
+# are counted - today and week are independent sums, not halves.
+daily_file="${STATUSLINE_DAILY_FILE:-$HOME/.claude/statusline-daily.tsv}"
+declare -A du_closed du_peak du_prev du_epoch
+declare -A du_watermark
 printf -v today_str '%(%Y%m%d)T' -1
-hist_time_cutoff=$(( now_epoch - 691200 ))
-week_cutoff_epoch=$(( now_epoch - 604800 ))
+if [ -f "$daily_file" ]; then
+  mapfile -t daily_raw_lines < "$daily_file" 2>/dev/null
+  for dline in "${daily_raw_lines[@]}"; do
+    dline=${dline//$'\r'/}
+    IFS=$'\x1f' read -r d_day d_sid d_closed d_peak d_prev d_epoch d_extra <<< "$dline"
+    # whole-row shape check, 6 exact columns, every numeric field guarded
+    # - malformed/foreign rows dropped whole, same discipline as the fine
+    # file's reader below
+    [[ "$d_day" =~ ^[0-9]{8}$ ]] || continue
+    [ -n "$d_sid" ] || continue
+    [[ "$d_closed" =~ ^[0-9]+$ ]] || continue
+    [[ "$d_peak" =~ ^[0-9]+$ ]] || continue
+    [[ "$d_prev" =~ ^[0-9]+$ ]] || continue
+    [[ "$d_epoch" =~ ^[0-9]+$ ]] || continue
+    [ -n "$d_extra" ] && continue
+    dkey="${d_day}"$'\x1f'"${d_sid}"
+    du_closed[$dkey]=$d_closed
+    du_peak[$dkey]=$d_peak
+    du_prev[$dkey]=$d_prev
+    du_epoch[$dkey]=$d_epoch
+    [ "$d_epoch" -gt "${du_watermark[$d_sid]:-0}" ] && du_watermark[$d_sid]=$d_epoch
+  done
+fi
+
+hist_time_cutoff=$(( now_epoch - 10800 ))
 hist_trimmed=()
+daily_dirty=0
 for hline in "${hist_all_lines[@]}"; do
   hline=${hline//$'\r'/}
   hline=${hline//$'\t'/$'\x1f'}
   IFS=$'\x1f' read -r -a hfields <<< "$hline"
   # WHOLE-ROW shape check (see the history-file comment above) - a line
   # that doesn't split into exactly 4 fields is dropped here entirely,
-  # both from this scope's sums AND from the trimmed rewrite below, since
+  # both from the rollup folds AND from the trimmed rewrite below, since
   # its epoch can't be trusted enough to even decide whether it's within
   # the trim window.
   [ "${#hfields[@]}" -eq 4 ] || continue
@@ -686,61 +731,67 @@ for hline in "${hist_all_lines[@]}"; do
   [ "$h_epoch" -ge "$hist_time_cutoff" ] && hist_trimmed+=("$hline")
 
   [ -z "$h_sid" ] && continue
+  # watermark: rows already folded into the rollup state are skipped
+  # BEFORE any further parsing - in steady state each render folds only
+  # the handful of rows that appeared since its previous render
+  [ "$h_epoch" -le "${du_watermark[$h_sid]:-0}" ] && continue
   # Validity is decided by cost_to_cents alone (the one shared cost
   # parser used everywhere in this script now - see its own comment) -
   # no separate regex pre-check, so there is no second gate that could
-  # ever disagree with it. Handles arbitrary decimal length (truncates,
-  # never rejects) identically for pre-this-fix long-decimal rows and
-  # freshly-written 2-decimal ones.
+  # ever disagree with it. A row whose cost doesn't parse is skipped
+  # WITHOUT advancing the watermark - it contributes nothing anywhere.
   cost_to_cents "$h_cost" || continue
   h_cents="$REPLY"
 
-  if [ "$h_epoch" -ge "$week_cutoff_epoch" ]; then
-    w_prev=${week_prev_cents["$h_sid"]:-}
-    if [ -z "$w_prev" ]; then
-      week_run_max_cents["$h_sid"]=$h_cents
-    elif [ "$h_cents" -lt "$w_prev" ]; then
-      week_total_by_sid["$h_sid"]=$(( ${week_total_by_sid["$h_sid"]:-0} + ${week_run_max_cents["$h_sid"]:-0} ))
-      week_run_max_cents["$h_sid"]=$h_cents
-    else
-      [ "$h_cents" -gt "${week_run_max_cents["$h_sid"]:-0}" ] && week_run_max_cents["$h_sid"]=$h_cents
-    fi
-    week_prev_cents["$h_sid"]=$h_cents
+  printf -v row_day '%(%Y%m%d)T' "$h_epoch"
+  dkey="${row_day}"$'\x1f'"${h_sid}"
+  d_prev=${du_prev[$dkey]:-}
+  if [ -z "$d_prev" ]; then
+    du_closed[$dkey]=${du_closed[$dkey]:-0}
+    du_peak[$dkey]=$h_cents
+  elif [ "$h_cents" -lt "$d_prev" ]; then
+    du_closed[$dkey]=$(( ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} ))
+    du_peak[$dkey]=$h_cents
+  else
+    [ "$h_cents" -gt "${du_peak[$dkey]:-0}" ] && du_peak[$dkey]=$h_cents
   fi
+  du_prev[$dkey]=$h_cents
+  du_epoch[$dkey]=$h_epoch
+  du_watermark[$h_sid]=$h_epoch
+  daily_dirty=1
+done
 
-  printf -v row_str '%(%Y%m%d)T' "$h_epoch"
-  if [ "$row_str" = "$today_str" ]; then
-    t_prev=${today_prev_cents["$h_sid"]:-}
-    if [ -z "$t_prev" ]; then
-      today_run_max_cents["$h_sid"]=$h_cents
-    elif [ "$h_cents" -lt "$t_prev" ]; then
-      today_total_by_sid["$h_sid"]=$(( ${today_total_by_sid["$h_sid"]:-0} + ${today_run_max_cents["$h_sid"]:-0} ))
-      today_run_max_cents["$h_sid"]=$h_cents
-    else
-      [ "$h_cents" -gt "${today_run_max_cents["$h_sid"]:-0}" ] && today_run_max_cents["$h_sid"]=$h_cents
-    fi
-    today_prev_cents["$h_sid"]=$h_cents
-  fi
-done
-for sid_key in "${!today_run_max_cents[@]}"; do
-  today_total_by_sid["$sid_key"]=$(( ${today_total_by_sid["$sid_key"]:-0} + today_run_max_cents[$sid_key] ))
-done
-for sid_key in "${!week_run_max_cents[@]}"; do
-  week_total_by_sid["$sid_key"]=$(( ${week_total_by_sid["$sid_key"]:-0} + week_run_max_cents[$sid_key] ))
-done
 today_total_cents=0
-for sid_key in "${!today_total_by_sid[@]}"; do
-  today_total_cents=$(( today_total_cents + today_total_by_sid[$sid_key] ))
-done
 week_total_cents=0
-for sid_key in "${!week_total_by_sid[@]}"; do
-  week_total_cents=$(( week_total_cents + week_total_by_sid[$sid_key] ))
+printf -v week_first_str '%(%Y%m%d)T' "$(( now_epoch - 518400 ))"
+for dkey in "${!du_peak[@]}"; do
+  d_day="${dkey%%$'\x1f'*}"
+  d_total=$(( ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} ))
+  [ "$d_day" = "$today_str" ] && today_total_cents=$(( today_total_cents + d_total ))
+  [ "$d_day" -ge "$week_first_str" ] && week_total_cents=$(( week_total_cents + d_total ))
 done
+
+# Rollup rewrite - only on renders that actually folded something new.
+# Retention: 9 local days (7-day week window + margin); the row count is
+# naturally tiny (days x sessions), no cap needed.
+if [ "$daily_dirty" -eq 1 ]; then
+  printf -v daily_keep_str '%(%Y%m%d)T' "$(( now_epoch - 777600 ))"
+  daily_out_lines=()
+  for dkey in "${!du_peak[@]}"; do
+    d_day="${dkey%%$'\x1f'*}"
+    d_sid="${dkey#*$'\x1f'}"
+    [ "$d_day" -ge "$daily_keep_str" ] || continue
+    daily_out_lines+=("${d_day}"$'\x1f'"${d_sid}"$'\x1f'"${du_closed[$dkey]:-0}"$'\x1f'"${du_peak[$dkey]:-0}"$'\x1f'"${du_prev[$dkey]:-0}"$'\x1f'"${du_epoch[$dkey]:-0}")
+  done
+  if [ "${#daily_out_lines[@]}" -gt 0 ]; then
+    printf '%s\n' "${daily_out_lines[@]}" > "${daily_file}.tmp.$$" 2>/dev/null && mv -f "${daily_file}.tmp.$$" "$daily_file" 2>/dev/null
+  fi
+fi
 
 if [ -n "$session_id" ] && [ "$should_append" -eq 1 ]; then
   hist_trimmed_count=${#hist_trimmed[@]}
-  if [ "$hist_trimmed_count" -gt 50000 ]; then
-    hist_trimmed=("${hist_trimmed[@]: -50000}")
+  if [ "$hist_trimmed_count" -gt 10000 ]; then
+    hist_trimmed=("${hist_trimmed[@]: -10000}")
   fi
   # Per-PID tmp name: two concurrent sessions trimming at the same tick
   # collided on a shared fixed ".tmp" (Windows: "Device or resource busy",

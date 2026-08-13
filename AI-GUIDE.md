@@ -77,19 +77,19 @@
 
 ### 1.3 状态文件（走势/速率/花费速率的数据源）
 
-`~/.claude/statusline-history.tsv`，TSV 行：`epoch<TAB>session_id<TAB>tokens<TAB>cost`（tokens 记**占用**=输入+输出，主路径不可用时记 input-only；缺值存空串）。每次调用：同会话最后一行不存在或 ≥20 秒旧才追加（采样步长，与 refreshInterval 配比：走势每格≈20 秒变化量）；追加后到**带 `$$` 的临时文件**再 `mv` 截断（固定 tmp 名会让多会话并发裁剪互撞丢行，已实锤）。所有读取按会话过滤、要求恰好 4 列 + 逐列数值校验，损坏/并发行静默跳过；全部文件操作 `2>/dev/null` 包裹，文件不可写绝不能影响其余段。
+`~/.claude/statusline-history.tsv`，TSV 行：`epoch<TAB>session_id<TAB>tokens<TAB>cost`（tokens 记**占用**=输入+输出，主路径不可用时记 input-only；缺值存空串）。每次调用：同会话最后一行不存在或 ≥20 秒旧才追加（采样步长，与 refreshInterval 配比：走势每格≈20 秒变化量）；追加后到**带 `$$` 的临时文件**再 `mv` 截断（固定 tmp 名会让多会话并发裁剪互撞丢行，已实锤）。所有读取按会话过滤、要求恰好 4 列 + 逐列数值校验，损坏/并发行静默跳过；全部文件操作 `2>/dev/null` 包裹，文件不可写绝不能影响其余段。细粒度行仅保 3 小时，today/week 由日聚合文件驱动（见硬性要求 0b）。
 
 ## 2. 硬性要求（两个脚本通用）
 
 0. **进程预算（Windows 生死线）**：MSYS2 上每次 fork ≈2–5ms，命令替换 `$(纯bash函数)` 也 fork——热路径出现几百次就是数秒卡顿。铁律：(a) 所有纯 bash 辅助函数用 **REPLY 返回模式**（`fn args; out=$REPLY`），调用点零命令替换；(b) 一切日期格式化用 `printf -v var '%(fmt)T' epoch`；(c) 文件读取用 `mapfile -t arr < file` / `read -r var < file`（无管道）；(d) TSV 拆列用 `IFS=$'\x1f' read -r -a`——**分隔符必须用 0x1F**，tab 属 IFS 空白类会折叠连续空字段导致整行串位；(e) 每次渲染的外部进程预算：jq×1 + git×1（+按需 tail/date×1），后台任务必须完全脱离（重定向全关 + `&` + disown）。
-0b. **历史文件格式**：`~/.claude/statusline-history.tsv`，0x1F 分隔 `epoch␟session_id␟tokens␟cost`；读取端先做 `${line//$'\t'/$'\x1f'}` 兼容旧 TAB 行；**整行形状校验**（必须恰好 4 列且逐列过数值正则，否则整行丢弃——严禁部分字段泄入求和）；按 8 天时间窗+5 万行上限裁剪重写（顺带自迁移到规范格式）。
+0b. **历史文件双层**：细粒度 `~/.claude/statusline-history.tsv`（0x1F 4 列 `epoch␟session_id␟tokens␟cost`；读取端先 `${line//$'\t'/$'\x1f'}` 兼容旧 TAB；**整行形状校验**，恰好 4 列+逐列数值正则，否则整行丢弃——严禁部分字段泄入求和；按 **3 小时**窗+1 万行帽裁剪重写）只服务走势/速率/$每小时。today/week 走日聚合 `statusline-daily.tsv`（0x1F 6 列 `day␟sid␟closed␟peak␟prev␟last_epoch`：单调段状态机增量前推 + **last_epoch 水位线**——重放不双计、并发丢写由细粒度行自愈、首跑自动从存量行播种同一代码路径；week=含今日的近 7 个自然日，文件留 9 日）。两文件重写一律 `$$` 临时名+原子 mv。
 0c. **抗资源枯竭·永不白屏三件套**（Windows 大进程树下 fork 枯竭真实存在——bash 报 `fork: retry: Resource temporarily unavailable`、子进程 0xC0000142——届时 jq spawn 会失败）：(a) **stderr 黑匣子**：`export LC_ALL` 后立即 `exec 2>>~/.claude/statusline-err.log`（超 500 行先自轮转再重定向），任何 stderr 泄给宿主都会整栏白屏，黑匣子既保白屏防线又留尸检证据；(b) **哨兵形状校验**：单次 jq 输出 N 个字段后**必须再追加一个字面量哨兵字段 `("__END__")`**——裸行数检查不可靠，因为 `$(...)` 命令替换会剥掉**全部**尾随换行，末字段（如 transcript_path）为空时 jq 输出以连续换行结尾、被整体剥除，健康载荷凭空少行而误判（真机踩过：无 transcript_path 的载荷 100% 误触发假降级）；哨兵永不为空、必幸存剥除，检查 `[ "${#F[@]}" -lt N+1 ] || [ "${F[N]}" != "__END__" ]` 才可靠；(c) **降级行**：形状校验失败时输出一行 `HH:MM:SS | statusline: degraded (fork)`（`printf '%(%H:%M:%S)T' -1`，零进程）并 `exit 0`——绝不空输出、绝不非零退出。
 
 1. 无浮点：比较一律"截断小数→整数比"（非负数等价 floor）；显示另行 printf。
 2. printf/算术前必须 `[ -n ]` + `[[ =~ ^[0-9]+$ ]]` 守卫。
 3. 先判段非空再包颜色，禁止"只有颜色码的空段"进入拼装。
 4. git 全部 `--no-optional-locks` + stderr 静默；目录非法时整段静默消失。
-5. stdin 只读一次进变量，jq 取值用 `printf '%s' "$input" | jq -r`（不用 echo）。
+5. stdin 只读一次进变量，jq 用 herestring 喂入 `jq -r '…' <<< "$input"`（免 printf 管道的子壳 fork；不用 echo）。
 6. **逐行读 jq/awk 输出必须 `| tr -d '\r'`**（见前置检查 4）。
 7. 两脚本 shebang 后第一句 `export LC_ALL=C.UTF-8`——所有 `${#}` 长度、`${var:0:N}` 切片、正则类按**字符**而非字节算，对齐才成立。
 8. **列对齐**：每段维护无转义纯文本孪生串（颜色与 OSC 8 序列不计宽）。主状态栏三行按列索引取最大宽度补空格成网格（每行最后一格不垫）；子代理面板两遍法——第一遍算出所有行 5 个定位列的内容与宽度并取列最大值，第二遍统一垫宽后输出（缺中间列的行垫空格占位，尾部缺列丢弃；描述列共用统一预算 = columns − 各列最大宽及分隔符 − 15）。CJK 字符占两格的近似误差如实文档化。
@@ -125,7 +125,7 @@
 
 ## 5. 验证（必须实际执行）
 
-**首选**：仓库根目录 `bash test.sh --assert` —— 30 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、列对齐、TSV 列序、空列裁剪、性能 <3s 门槛），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
+**首选**：仓库根目录 `bash test.sh --assert` —— 32 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、双层花费存储、列对齐、TSV 列序、空列裁剪、性能 <3s 门槛），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
 
 主状态栏（`fixtures/` 三份 + 状态文件人工历史）：
 - **full.json**：三行齐全；电池 `ctx ███░░ 66% 70k/200k`（占用 69671=68471+1200→70k，非 68k！）；`cache 92%` 绿；`» my-session`。

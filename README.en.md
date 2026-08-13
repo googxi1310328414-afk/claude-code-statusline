@@ -46,6 +46,7 @@ bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
 - Auto-refresh = event-driven repaints (~300 ms debounce) + a `refreshInterval` timer (defaults here: main 10s / subagent panel 3s) that re-runs the whole script with fresh stdin JSON even when idle. A new trigger CANCELS the in-flight render, so the interval must comfortably exceed worst-case render time (0.4–1.3 s measured) — undershooting it blanks the bar entirely. settings.json changes hot-reload by CONTENT (touching mtime does nothing), which is also the no-restart recovery path if the render loop ever wedges.
 - Windows `jq` emits CRLF: every line-wise read must pass through `tr -d '\r'` (MSYS bash strips trailing CRs in `$(...)` substitutions, `mapfile` does not).
 - Scripts export `LC_ALL=C.UTF-8` — column alignment depends on character-based (not byte-based) string measurement, plus a `disp_width()` that counts East-Asian wide characters as 2 terminal cells.
+- Two-tier spend store: fine-grained history is kept for only 3h (it only feeds sparkline/rate/$-per-hour); today/week read a tiny per-day rollup file maintained incrementally with a watermark (replay-safe, self-healing under concurrent sessions) — renders never re-walk days of rows.
 - Workflow/ultracode fleets do **not** flow through `subagentStatusLine` (measured empirically); they render in the dedicated `/workflows` UI, which has no customization hook.
 
 MIT licensed.
