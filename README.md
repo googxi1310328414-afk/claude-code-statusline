@@ -47,7 +47,7 @@ $0.42 $4.8/h                        | today $55.97      | week $89.20           
 Claude Code ≥ 2.1.221（子代理 effort 字段）、Git Bash（bash ≥ 4.3，UTF-8）、`jq`、`git`（stash 段需 ≥2.35，更旧仅少这一段）；`gh` 可选（CI 徽记）。
 
 1. 四个 `.sh`（两个渲染脚本 + `statusline-panel-hook.sh`/`statusline-panel-daemon.sh`）复制到 `~/.claude/`（主目录自动检测，无需改路径），并创建目录 `~/.claude/statusline-panel.d/`。
-2. `~/.claude/settings.json` 合并 `settings-snippet.json`（statusLine 与 subagentStatusLine 两块，含各自的 `refreshInterval`）。
+2. `~/.claude/settings.json` 合并 `settings-snippet.json`（statusLine 含 `refreshInterval: 10`；subagentStatusLine 指向面板钩子，**勿配** refreshInterval——宿主不认，见"自动刷新机制"）。
 3. 保存即生效。**推荐**：把 [`AI-GUIDE.md`](AI-GUIDE.md) 全文发给 Claude Code 让它替你装并按机器适配。
 
 ## 测试

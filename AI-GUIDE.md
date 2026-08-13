@@ -98,12 +98,12 @@
 
 ## 3. 安装
 
-两脚本写入 `~/.claude/`；`~/.claude/settings.json` **合并**（勿覆盖其他键）：
+四脚本（两渲染 + 面板钩子/daemon）写入 `~/.claude/` 并建目录 `~/.claude/statusline-panel.d/`；`~/.claude/settings.json` **合并**（勿覆盖其他键）：
 
 ```json
 {
   "statusLine":         { "type": "command", "command": "exec bash ~/.claude/statusline-command.sh", "refreshInterval": 10 },
-  "subagentStatusLine": { "type": "command", "command": "exec bash ~/.claude/subagent-statusline.sh" }
+  "subagentStatusLine": { "type": "command", "command": "exec bash ~/.claude/statusline-panel-hook.sh" }
 }
 ```
 
