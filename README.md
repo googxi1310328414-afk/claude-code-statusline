@@ -2,7 +2,7 @@
 
 [![test](https://github.com/googxi1310328414-afk/claude-code-statusline/actions/workflows/test.yml/badge.svg)](https://github.com/googxi1310328414-afk/claude-code-statusline/actions/workflows/test.yml)
 
-Claude Code 的信息密集型彩色状态栏（Windows / Git Bash，POSIX 兼容）：主会话四行主题网格 + 子代理面板表格行，`refreshInterval` 常驻自动刷新（主 5s；面板为宿主固定 ~5s 节拍，机理见专章），数据缺失的段自动隐藏、整行为空时该行消失，关键指标随状态动态变色。MIT 协议；[English](README.en.md)。
+Claude Code 的信息密集型彩色状态栏（Windows / Git Bash，POSIX 兼容）：主会话四行主题网格 + 子代理面板表格行，`refreshInterval` 常驻自动刷新（主 10s；面板为宿主固定 ~5s 节拍，机理见专章），数据缺失的段自动隐藏、整行为空时该行消失，关键指标随状态动态变色。MIT 协议；[English](README.en.md)。
 
 ![效果预览](assets/preview.svg)
 
@@ -55,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/googxi1310328414-afk/claude-code-st
 自动完成：语法门 + 四脚本原子安装、`statusline-panel.d/` 目录、settings.json **合并**（保留既有键，原文件自动备份，语义无变化不动文件）、冒烟渲染验证；追加 ` -s -- --with-watchdog` 顺带注册看门狗计划任务。手动安装：
 
 1. 四个 `.sh`（两个渲染脚本 + `statusline-panel-hook.sh`/`statusline-panel-daemon.sh`）复制到 `~/.claude/`（主目录自动检测，无需改路径），并创建目录 `~/.claude/statusline-panel.d/`。
-2. `~/.claude/settings.json` 合并 `settings-snippet.json`（statusLine 含 `refreshInterval: 5`；subagentStatusLine 指向面板钩子，**勿配** refreshInterval——宿主不认，见"自动刷新机制"）。
+2. `~/.claude/settings.json` 合并 `settings-snippet.json`（statusLine 含 `refreshInterval: 10`；subagentStatusLine 指向面板钩子，**勿配** refreshInterval——宿主不认，见"自动刷新机制"）。
 3. 保存即生效。**推荐**：把 [`AI-GUIDE.md`](AI-GUIDE.md) 全文发给 Claude Code 让它替你装并按机器适配。
 
 ## 测试
@@ -74,10 +74,10 @@ GitHub Actions 在每次 push 自动跑断言套件。
 
 1. **事件驱动打底**：宿主在新助手消息、`/compact`、权限切换等时刻重跑脚本（约 300ms 防抖）。只有这层时，空闲期状态栏静止不动。
 2. **`refreshInterval: N`（秒）常驻定时器**：settings.json 配上后，空闲时宿主也每 N 秒把最新 stdin JSON 喂给脚本**整个重跑一遍**、用输出重画。每帧都是全新进程、无常驻驻留——跨帧记忆（走势/速率/today/week/子代理采样）全部依赖 `~/.claude` 下的状态文件续命，这是"无状态脚本 + 有状态文件"的刻意设计。命令写成 `exec bash ~/.claude/…`（见 settings-snippet）可省掉宿主 `-c` 包装壳那一层进程。
-3. **取消规则（生死线）**：新触发到来时宿主会 **taskkill 杀掉仍在跑的上一帧**。因此 **N 必须显著大于最坏渲染耗时**——一旦机器负载把渲染拖过 N 秒，就进入"帧帧被杀→输出永远到不了终点→整栏空白"的取消风暴（2026-08-13 双会话 fork 枯竭实锤：渲染被拖过 2s 间隔，黑匣子与进程启动追踪均有存证）。本仓库默认主栏 **5s**（数据粒度与安全余量的平衡点：语句级优化后渲染实测 ~0.3-0.5s，约 10 倍余量）；子代理面板的节拍**由宿主固定**（2.1.229 实测精确 ~5s 一拍，`refreshInterval` 键对 subagentStatusLine 无效，勿配）。
+3. **取消规则（生死线）**：新触发到来时宿主会 **taskkill 杀掉仍在跑的上一帧**。因此 **N 必须显著大于最坏渲染耗时**——一旦机器负载把渲染拖过 N 秒，就进入"帧帧被杀→输出永远到不了终点→整栏空白"的取消风暴（2026-08-13 双会话 fork 枯竭实锤：渲染被拖过 2s 间隔，黑匣子与进程启动追踪均有存证）。本仓库默认主栏 **10s**（**负载优先**：渲染实测 ~0.3-0.5s，但多会话+代理编队的风暴期会拖长，10s 为取消规则留足余量并压低常驻进程流量；代价是数据滞后≤10s，属明确接受的取舍）；子代理面板的节拍**由宿主固定**（2.1.229 实测精确 ~5s 一拍，`refreshInterval` 键对 subagentStatusLine 无效，勿配）。
 4. **配置热重载**：宿主对 settings.json 做**内容**监听——改任意值保存，渲染循环 1 秒内重建（仅 touch mtime **无效**）。渲染循环因挂死彻底卡住时，这也是唯一免重启的复活手段。
 5. **忙碌回合**：主栏**画面**冻结在回合开始帧，但**调用照常**（状态文件持续新鲜，回合结束瞬间回正）；子代理面板不受此限、全程实时。
-6. **采样与刷新的配比**：主栏 5s 刷新 × 20s 采样节流 = 约每四帧记一次历史（走势每格≈20s）；面板宿主 ~5s 节拍 × 10s 采样 = 每两帧一样（每格≈10s）。刷新间隔管"画面多新"，采样节流管"走势每格多长"——两个旋钮独立调。
+6. **采样与刷新的配比**：主栏 10s 刷新 × 20s 采样节流 = 每两帧记一次历史（走势每格≈20s）；面板宿主 ~5s 节拍 × 10s 采样 = 每两帧一样（每格≈10s）。刷新间隔管"画面多新"，采样节流管"走势每格多长"——两个旋钮独立调。
 7. **自愈层（可选，Windows）**：`statusline-watchdog.ps1` 由计划任务每 2 分钟清理挂死 >30s 的渲染 bash（fork 枯竭下的兜底）；**必须经 `statusline-watchdog.vbs`（wscript）拉起**——计划任务直接跑 powershell 会在 `-WindowStyle Hidden` 生效前闪一下控制台窗口。两文件复制到 `~/.claude/`（vbs 内路径按机器改）后：`schtasks /Create /SC MINUTE /MO 2 /TN claude-statusline-watchdog /TR "wscript.exe C:\Users\<你>\.claude\statusline-watchdog.vbs"`。
 8. **面板常驻 daemon**：subagentStatusLine 命令指向 `statusline-panel-hook.sh`——钩子只做"倒载荷 + 秒回上一帧缓存"（纯内建，稳态零派生，延迟≈bash 启动的毫秒级），真正的渲染由 `statusline-panel-daemon.sh` 异步完成（内容滞后一拍 ~5s，对累计 token/用时无感知）。宿主重画面板是"先默认行、钩子返回才替换"，钩子延迟=默认行闪烁窗口——daemon 化把它从整段渲染耗时（~300ms）压到毫秒级。缓存键=载荷首任务 id（并发会话任务集不相交，天然各用各的缓存）；daemon 单实例（noclobber 抢占+活性探测）、无活 2 分钟自灭、死了由下一拍钩子拉起、挂死的渲染子进程由第 7 条看门狗兜底——全链路自愈，无需手工管理。状态目录 `~/.claude/statusline-panel.d/`。
 

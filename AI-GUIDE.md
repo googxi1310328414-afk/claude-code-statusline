@@ -52,7 +52,7 @@
 
 > **权威规格说明**：下面的分段表描述核心形态；每段的最终权威细节（含后续增量：today/week 跨会话统计、`wk` 按模型周配额、`extra` 溢出、压缩计数 `↻`、缓存倒计时、80% 压缩线 `│`、`·t` 节奏游标及其变色覆盖）以参考实现 `statusline-command.sh` **头部注释**为准——实现时先通读那份头注。
 
-四行分组：**1 身份与位置**（时钟|模型|目录|worktree|仓库|分支|⚑stash|PR+CI）；**2 上下文引擎**（ctx 电池|走势+速率|cache 三件套|↻压缩）；**3 花费**（$+$/h|today|week|行数）；**4 限额与会话**（5h/7d 节奏游标|wk 模型配额|extra|»会话名）。每行独立拼装，段间分隔符为灰色 ` | `（前后 reset），行尾补一次 reset；**一行内无任何段时该行不打印**（第 1 行有时钟兜底恒在）。settings.json 的 statusLine 键配 `"refreshInterval": 5`（渲染经语句级优化实测 ~0.3-0.5s，约 10 倍余量；间隔必须显著大于最坏渲染耗时——新触发会取消在途渲染，见前置检查 5）；**subagentStatusLine 配 refreshInterval 无效**（2.1.229 实测：配 3 仍精确 5.000s 一拍——面板节拍由宿主固定 ~5s 驱动，勿写该键）。
+四行分组：**1 身份与位置**（时钟|模型|目录|worktree|仓库|分支|⚑stash|PR+CI）；**2 上下文引擎**（ctx 电池|走势+速率|cache 三件套|↻压缩）；**3 花费**（$+$/h|today|week|行数）；**4 限额与会话**（5h/7d 节奏游标|wk 模型配额|extra|»会话名）。每行独立拼装，段间分隔符为灰色 ` | `（前后 reset），行尾补一次 reset；**一行内无任何段时该行不打印**（第 1 行有时钟兜底恒在）。settings.json 的 statusLine 键配 `"refreshInterval": 10`（**负载优先**：渲染实测 ~0.3-0.5s，但多会话+代理编队的风暴期会拖长——10s 为取消规则留足余量并压低常驻进程流量；数据滞后≤10s 属接受的取舍）；**subagentStatusLine 配 refreshInterval 无效**（2.1.229 实测：配 3 仍精确 5.000s 一拍——面板节拍由宿主固定 ~5s 驱动，勿写该键）。
 
 **第 1 行 · 身份与位置**
 1. 时钟：`date +%H:%M:%S`，亮白。
@@ -102,7 +102,7 @@
 
 ```json
 {
-  "statusLine":         { "type": "command", "command": "exec bash ~/.claude/statusline-command.sh", "refreshInterval": 5 },
+  "statusLine":         { "type": "command", "command": "exec bash ~/.claude/statusline-command.sh", "refreshInterval": 10 },
   "subagentStatusLine": { "type": "command", "command": "exec bash ~/.claude/statusline-panel-hook.sh" }
 }
 ```

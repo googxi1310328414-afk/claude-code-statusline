@@ -624,10 +624,10 @@ if [ -n "$session_id" ]; then
   done
 
   # Sampling throttle: at most one history row per session every 20s,
-  # REGARDLESS of refresh cadence (at the default 5s interval that's one
-  # row per ~4 renders). Each sparkline bar therefore spans ~20s of token
-  # change, and the rate segment's >=60s span gate arms after ~4 samples
-  # (~1 min).
+  # REGARDLESS of refresh cadence (at the default 10s interval that's
+  # one row every other render). Each sparkline bar therefore spans ~20s
+  # of token change, and the rate segment's >=60s span gate arms after
+  # ~4 samples (~1 min).
   should_append=1
   if [ -n "$last_hist_epoch" ]; then
     hist_age=$(( now_epoch - last_hist_epoch ))
