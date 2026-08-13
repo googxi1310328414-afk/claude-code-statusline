@@ -251,6 +251,12 @@ if [ "$1" = "--assert" ]; then
   t8b=$EPOCHREALTIME
   printf '%s' "$bigout" | grep -q ' hot' && ok "big-transcript cache line found via awk" || bad "big-transcript cache line missed"
   awk -v a="$t8a" -v b="$t8b" 'BEGIN{exit (b-a < 2.5) ? 0 : 1}' && ok "big-transcript render < 2.5s (O(bytes) split gone)" || bad "big-transcript render too slow"
+  # R9: the watchdog VBS must stay pure ASCII - wscript parses .vbs as
+  # the system ANSI codepage (GBK on zh-CN), where a line-final UTF-8
+  # multibyte char whose last byte is a DBCS lead SWALLOWS the following
+  # newline and comments out real code (fired in production: the Set
+  # line got eaten, every 2-min task run popped an error dialog)
+  LC_ALL=C grep -qP '[\x80-\xff]' statusline-watchdog.vbs && bad "watchdog vbs contains non-ASCII bytes" || ok "watchdog vbs pure ASCII"
 
   # panel daemon architecture: the hook must spool the payload, stay
   # silent on a cold cache, serve the cached frame instantly, and the
