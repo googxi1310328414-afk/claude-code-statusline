@@ -87,6 +87,15 @@ if [ "$1" = "--assert" ]; then
   coldout=$(jq --arg tp "$tmpd/tr3.jsonl" '.transcript_path=$tp' fixtures/full.json | bash ./statusline-command.sh | strip)
   printf '%s' "$coldout" | grep -q 'cold' && ok "cache cold state" || bad "cold state missing"
 
+  # REGRESSION (sentinel fix): fixtures/full.json has NO transcript_path, so
+  # jq's raw output ends in a run of newlines that $() strips entirely -
+  # pre-sentinel builds miscounted the fields and false-tripped the
+  # "degraded (fork)" line on this perfectly healthy payload. (The narrow
+  # assertions above masked it: degraded output is also exactly 1 line.)
+  bare=$(bash ./statusline-command.sh < fixtures/full.json | strip)
+  printf '%s' "$bare" | grep -q 'degraded' && bad "empty-tail payload false degraded" || ok "empty-tail payload not degraded"
+  [ "$(printf '%s\n' "$bare" | wc -l)" -eq 4 ] && ok "empty-tail payload full 4-line render" || bad "empty-tail payload line count != 4"
+
   sub=$(subagent_payload "$now" | bash ./subagent-statusline.sh)
   [ "$(printf '%s\n' "$sub" | wc -l)" -eq 3 ] && ok "subagent 3 rows" || bad "subagent row count"
   all_json=1

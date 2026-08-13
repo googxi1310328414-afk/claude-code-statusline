@@ -368,7 +368,8 @@ jq_main_out=$(jq -r '
   (.rate_limits.seven_day.used_percentage // ""),
   (.rate_limits.seven_day.resets_at // ""),
   (.session_name // ""),
-  (.transcript_path // "")
+  (.transcript_path // ""),
+  ("__END__")
 ' <<< "$input" 2>/dev/null)
 jq_main_out=${jq_main_out//$'\r'/}
 mapfile -t F <<< "$jq_main_out"
@@ -380,17 +381,39 @@ mapfile -t F <<< "$jq_main_out"
 # case $(jq ...) captures nothing, but a herestring `mapfile` on a truly
 # empty string still yields ONE element (an empty string - <<< "" feeds
 # just a trailing newline to stdin), never a zero-length array, so
-# emptiness alone isn't a reliable signal; check the SHAPE instead: a
-# healthy jq run always emits exactly 29 lines (every field above is
-# `// ""`, never `// empty`, specifically so field COUNT stays fixed
-# regardless of which fields the payload actually has), so fewer than
-# that means the spawn didn't really run. Backed up by checking the
-# first mandatory field (session_id, always present per the documented
-# stdin contract) for good measure. Every other internal failure path in
-# this script already degrades to omitting a segment, never to dying -
-# this is the one point where a totally absent jq result would otherwise
-# fall through to a blank statusline instead of at least one line.
-if [ "${#F[@]}" -lt 29 ] || [ -z "${F[0]}" ]; then
+# emptiness alone isn't a reliable signal on its own.
+#
+# A naive "count the lines" check (even though every field above is
+# `// ""`, never `// empty`, specifically to keep the field count fixed)
+# is ALSO not reliable by itself, for a subtler reason: bash's $(...)
+# command substitution strips ALL trailing newlines from what it
+# captures - not just one. If the payload's trailing field(s) (e.g.
+# transcript_path, last in the list) are empty, jq's raw output ends in
+# multiple consecutive newlines (one ending the last non-empty field's
+# line, then one per empty line after it), and $() strips them ALL,
+# silently deleting those trailing empty fields before mapfile ever sees
+# them - a perfectly healthy jq run then LOOKS short by exactly the
+# number of empty trailing fields, which would have produced a false
+# "degraded" trigger on totally ordinary payloads (this was caught for
+# real: a fixture/payload with no transcript_path tripped it, even
+# though jq had run fine).
+#
+# FIX: a literal, never-empty SENTINEL ("__END__") is appended as one
+# more field after transcript_path. Because it can never itself be
+# empty, it always survives $()'s trailing-newline stripping regardless
+# of how many REAL fields before it were blank - so its presence at
+# F[29] is a reliable "jq's output stream reached the end intact" signal
+# that the raw line count alone can't give. Degraded when EITHER fewer
+# than 30 elements exist (the sentinel and/or other trailing fields were
+# stripped entirely - spawn produced too little output) OR F[29] isn't
+# literally "__END__" (shouldn't be reachable if the count check passed,
+# but costs nothing to also check directly rather than trust the count
+# alone). F[0..28] indices are unchanged everywhere else in this script.
+# Every other internal failure path in this script already degrades to
+# omitting a segment, never to dying - this is the one point where a
+# totally absent/truncated jq result would otherwise fall through to a
+# blank statusline instead of at least one line.
+if [ "${#F[@]}" -lt 30 ] || [ "${F[29]}" != "__END__" ]; then
   printf '\e[0m\e[97m%(%H:%M:%S)T\e[0m\e[90m | statusline: degraded (fork)\e[0m\n' -1
   exit 0
 fi
