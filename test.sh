@@ -6,6 +6,11 @@
 export LC_ALL=C.UTF-8
 cd "$(dirname "$0")" || exit 1
 
+# 全程使用隔离历史文件——绝不触碰真实 ~/.claude/statusline-history.tsv
+export STATUSLINE_HISTORY_FILE="$(mktemp -u)/test-hist.tsv" 2>/dev/null || export STATUSLINE_HISTORY_FILE="/tmp/statusline-test-hist.$$"
+mkdir -p "$(dirname "$STATUSLINE_HISTORY_FILE")"
+trap 'rm -rf "$(dirname "$STATUSLINE_HISTORY_FILE")"' EXIT
+
 strip() { perl -pe 's/\e\[[0-9;]*m//g; s/\e\]8;;[^\e]*\e\\//g'; }
 filter() { if [ "$1" = "--codes" ]; then sed 's/\x1b/\\e/g'; else cat; fi; }
 
@@ -38,12 +43,9 @@ if [ "$1" = "--assert" ]; then
   fails=0
   ok()  { echo "PASS  $1"; }
   bad() { echo "FAIL  $1"; fails=$((fails+1)); }
-  mkdir -p ~/.claude
-  hist=~/.claude/statusline-history.tsv
-  [ -f "$hist" ] && cp "$hist" "$hist.assertbak"
   tmpd=$(mktemp -d)
   now=$(date +%s)
-  make_history "$now" "$hist"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
   make_transcript "$tmpd/tr.jsonl"
 
   t0=$EPOCHREALTIME
@@ -95,7 +97,6 @@ if [ "$1" = "--assert" ]; then
   printf '%s' "$solo" | grep -q '| |' && bad "solo row empty cell" || ok "solo row clean"
   printf '%s' "$solo" | grep -q 'Σ' && bad "solo row shows share" || ok "solo hides share"
 
-  [ -f "$hist.assertbak" ] && mv -f "$hist.assertbak" "$hist" || rm -f "$hist"
   rm -rf "$tmpd"
   echo "----"
   [ "$fails" -eq 0 ] && echo "ALL PASS" || echo "$fails FAILURE(S)"

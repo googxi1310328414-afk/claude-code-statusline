@@ -446,6 +446,16 @@ cost_to_cents() {
 # TODAY/WEEK TOTAL's cross-session scan) is a pure-bash loop over that
 # one in-memory array - no awk/grep/cut/tail anywhere below.
 #
+# $STATUSLINE_HISTORY_FILE (env var, optional): overrides the history
+# file path below; default is ~/.claude/statusline-history.tsv. ALL
+# history reads/writes/trims (this whole block, plus the append and the
+# trim/rewrite further down) go through the one `history_file` variable,
+# so setting this env var redirects every one of them together - meant
+# for tests/diagnostics to point at an isolated temp path so a real
+# session's shared history file is never read, appended to, or
+# rewritten by a test run (also sidesteps needing to back up/swap/
+# restore the real file around a test, and the race that implies).
+#
 # CANONICAL ROW FORMAT (writer, below): 4 fields joined by the ASCII Unit
 # Separator (0x1F), "epoch<0x1F>session_id<0x1F>tokens<0x1F>cost" -
 # written directly via printf's \x1f escape, not tab. BACK-COMPAT
@@ -468,7 +478,7 @@ cost_to_cents() {
 # the 4-field shape check. The derived rate/sparkline segments stay
 # silently absent while history is too thin for their window - that's
 # correct, not an error.
-history_file="$HOME/.claude/statusline-history.tsv"
+history_file="${STATUSLINE_HISTORY_FILE:-$HOME/.claude/statusline-history.tsv}"
 hist_all_lines=()
 [ -f "$history_file" ] && mapfile -t hist_all_lines < "$history_file"
 
