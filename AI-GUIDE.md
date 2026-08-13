@@ -82,6 +82,7 @@
 
 0. **进程预算（Windows 生死线）**：MSYS2 上每次 fork ≈2–5ms，命令替换 `$(纯bash函数)` 也 fork——热路径出现几百次就是数秒卡顿。铁律：(a) 所有纯 bash 辅助函数用 **REPLY 返回模式**（`fn args; out=$REPLY`），调用点零命令替换；(b) 一切日期格式化用 `printf -v var '%(fmt)T' epoch`；(c) 文件读取用 `mapfile -t arr < file` / `read -r var < file`（无管道）；(d) TSV 拆列用 `IFS=$'\x1f' read -r -a`——**分隔符必须用 0x1F**，tab 属 IFS 空白类会折叠连续空字段导致整行串位；(e) 每次渲染的外部进程预算：jq×1 + git×1（+按需 tail/date×1），后台任务必须完全脱离（重定向全关 + `&` + disown）。
 0b. **历史文件格式**：`~/.claude/statusline-history.tsv`，0x1F 分隔 `epoch␟session_id␟tokens␟cost`；读取端先做 `${line//$'\t'/$'\x1f'}` 兼容旧 TAB 行；**整行形状校验**（必须恰好 4 列且逐列过数值正则，否则整行丢弃——严禁部分字段泄入求和）；按 8 天时间窗+5 万行上限裁剪重写（顺带自迁移到规范格式）。
+0c. **抗资源枯竭·永不白屏三件套**（Windows 大进程树下 fork 枯竭真实存在——bash 报 `fork: retry: Resource temporarily unavailable`、子进程 0xC0000142——届时 jq spawn 会失败）：(a) **stderr 黑匣子**：`export LC_ALL` 后立即 `exec 2>>~/.claude/statusline-err.log`（超 500 行先自轮转再重定向），任何 stderr 泄给宿主都会整栏白屏，黑匣子既保白屏防线又留尸检证据；(b) **哨兵形状校验**：单次 jq 输出 N 个字段后**必须再追加一个字面量哨兵字段 `("__END__")`**——裸行数检查不可靠，因为 `$(...)` 命令替换会剥掉**全部**尾随换行，末字段（如 transcript_path）为空时 jq 输出以连续换行结尾、被整体剥除，健康载荷凭空少行而误判（真机踩过：无 transcript_path 的载荷 100% 误触发假降级）；哨兵永不为空、必幸存剥除，检查 `[ "${#F[@]}" -lt N+1 ] || [ "${F[N]}" != "__END__" ]` 才可靠；(c) **降级行**：形状校验失败时输出一行 `HH:MM:SS | statusline: degraded (fork)`（`printf '%(%H:%M:%S)T' -1`，零进程）并 `exit 0`——绝不空输出、绝不非零退出。
 
 1. 无浮点：比较一律"截断小数→整数比"（非负数等价 floor）；显示另行 printf。
 2. printf/算术前必须 `[ -n ]` + `[[ =~ ^[0-9]+$ ]]` 守卫。
@@ -99,7 +100,7 @@
 
 ```json
 {
-  "statusLine":         { "type": "command", "command": "bash ~/.claude/statusline-command.sh" },
+  "statusLine":         { "type": "command", "command": "bash ~/.claude/statusline-command.sh", "refreshInterval": 2 },
   "subagentStatusLine": { "type": "command", "command": "bash ~/.claude/subagent-statusline.sh" }
 }
 ```
