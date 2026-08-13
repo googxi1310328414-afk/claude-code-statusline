@@ -1,0 +1,15 @@
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  assert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run assertion suite
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          bash test.sh --assert

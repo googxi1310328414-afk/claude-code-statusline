@@ -6,25 +6,84 @@
 # set before any string measurement happens (i.e. before every other line
 # in this script).
 export LC_ALL=C.UTF-8
-# Claude Code status line (detailed layout, ANSI colors, THREE printed
-# lines, column-aligned)
-# Reads the JSON payload once from stdin and prints up to three lines to
-# stdout (Claude Code renders each printed line as its own status-line row;
-# ANSI colors and OSC 8 hyperlinks work on every line). Each line is
-# assembled independently - same colors/per-segment omission rules
-# regardless of line - with its own trailing RESET. Line 1 always has at
-# least the clock, so it always prints; lines 2 and 3 are skipped ENTIRELY
-# (no blank line) when every one of their segments is absent - e.g. a
-# fresh minimal session can render as just line 1 + a short line 3, with
-# no line 2 at all. The " | " separators are COLUMN-ALIGNED across all
-# three lines: every segment tracks a parallel plain-text twin (no ANSI,
-# no OSC 8 - hyperlinks and colors are zero-width and never factor into
-# alignment) purely for width measurement, measured in true terminal
-# DISPLAY cells via disp_width() (not raw character count) so East Asian
-# wide/fullwidth text (e.g. in session_name, or any repo/branch/worktree
-# name) aligns correctly too; see disp_width()'s own comment for the
-# wide-character ranges used and the render_line()/col_widths block near
-# the bottom for the actual padding logic.
+# Claude Code status line (detailed layout, ANSI colors, FOUR printed
+# lines, column-aligned, narrow-terminal adaptive)
+#
+# PERFORMANCE: after the jq-missing guard, every stdin field this script
+# needs is read via ONE jq invocation into the F[] array (see the mapfile
+# block below), not one jq call per field. The git branch+dirty check is
+# ONE `git status --porcelain=v1 --branch` call instead of two separate
+# git invocations. TODAY/WEEK TOTAL is a pure-bash scan over the same
+# in-memory history rows already loaded for the token-rate/sparkline
+# segment - no background job or transcript scan of its own. Almost every
+# `date` call has been replaced by bash's own `printf '%(fmt)T' epoch`
+# builtin (4.2+, zero process spawns; -1 means "now").
+#
+# NO-FORK HELPER RETURNS: every pure-bash helper function in this script
+# (cost_to_cents, fmt_k_or_m, fmt_small_or_k, disp_width, wk_label_for,
+# render_line) writes its result to the global REPLY variable instead of
+# printf-to-stdout, and every call site does `fn args; x="$REPLY"` -
+# NEVER `x=$(fn args)`. This matters because bash's command substitution
+# `$(...)` forks a subshell on MSYS2/Windows (~2.5ms each) even when the
+# command inside is a pure-bash function with no external program in it;
+# with disp_width() and cost_to_cents() each called per history row / per
+# cell / per character in various loops, this was measured as the single
+# largest source of forks in this script (thousands/render on a long
+# history file) before this conversion. `printf -v var 'fmt' args` (never
+# `var=$(printf ...)`) is used the same way for every other formatted
+# value, including plain %.0f/%.2f/%*s forms, not just %()T dates. File
+# reads that only need one line use `read -r var < file`, not
+# `var=$(< file)`, for the same reason.
+#
+# EXPECTED REMAINING SPAWN INVENTORY per render, after this pass:
+#   - jq: exactly 1 (the consolidated F[] extraction)
+#   - git: exactly 1 (status --porcelain=v1 --branch)
+#   - tail: 0 or 1 (N3/N4's shared transcript-tail read; only when
+#     transcript_path is set, the file exists, and `tail` is on PATH)
+#   - date: 0 or 1 (N4's ISO-8601 parse; only when the tail scan above
+#     actually found a candidate cache-activity line to parse)
+#   - detached background jobs (never block this render, may spawn gh/
+#     curl/jq/grep internally on their OWN next-render cadence): the PR
+#     CI refresh and N2's OAuth usage refresh
+# Everything else - every helper call, every %()T/%.Nf/%*s format, every
+# single-line file read, every history/tail-row loop - is a bash builtin
+# or parameter expansion with zero forks.
+#
+# NARROW-TERMINAL ADAPTIVE: reads $COLUMNS (set by Claude Code v2.1.153+;
+# falls back to 120 if unset/non-numeric). Under 100 columns, the whole
+# 4-line aligned grid is replaced by ONE compact line: clock | model name
+# only | dir's last path component only | branch(+*) | ctx bar+pct only |
+# $cost only | 5h pct only - same colors/omission rules, no alignment
+# pass. 100+ columns: the 4-line grid described below, unchanged.
+#
+# TRUNCATION/OSC-8 SAFETY: this script itself never truncates a segment
+# mid-string (the directory abbreviation collapses whole path COMPONENTS,
+# never cuts inside one). The only character-level truncation anywhere in
+# this statusline pair is the SUBAGENT script's task-description cut, and
+# that field never carries an OSC 8 hyperlink - keep it that way: if a
+# future segment needs both truncation and a hyperlink, the cut must
+# happen only on text outside the OSC_OPEN..OSC_CLOSE span, never inside
+# it (an OSC 8 sequence split mid-escape can leave the terminal's
+# hyperlink state stuck open for everything printed after it).
+#
+# Reads the JSON payload once from stdin and (at 100+ columns) prints up
+# to FOUR lines to stdout (Claude Code renders each printed line as its
+# own status-line row; ANSI colors and OSC 8 hyperlinks work on every
+# line). Each line is assembled independently - same colors/per-segment
+# omission rules regardless of line - with its own trailing RESET. Line 1
+# always has at least the clock, so it always prints; lines 2, 3 and 4
+# are skipped ENTIRELY (no blank line) when every one of their segments
+# is absent - e.g. a fresh minimal session can render as just line 1 + a
+# short line 4, with no lines 2 or 3 at all. The " | " separators are
+# COLUMN-ALIGNED across all four lines: every segment tracks a parallel
+# plain-text twin (no ANSI, no OSC 8 - hyperlinks and colors are
+# zero-width and never factor into alignment) purely for width
+# measurement, measured in true terminal DISPLAY cells via disp_width()
+# (not raw character count) so East Asian wide/fullwidth text (e.g. in
+# session_name, or any repo/branch/worktree name) aligns correctly too;
+# see disp_width()'s own comment for the wide-character ranges used and
+# the render_line()/col_widths block near the bottom for the actual
+# padding logic.
 #
 # LINE 1 (identity/location), joined with " | ":
 #   1  clock time HH:MM:SS (not from stdin; only advances on refresh)  - bright white
@@ -42,7 +101,12 @@ export LC_ALL=C.UTF-8
 #   7  PR: "PR#N" magenta, an OSC 8 hyperlink to .pr.url when present
 #      (plain text otherwise); review state (if any) stays outside the
 #      link and keeps its own dynamic color (approved green /
-#      changes_requested bright red / draft gray / other yellow)
+#      changes_requested bright red / draft gray / other yellow); a
+#      cached, non-blocking CI glyph may follow - "✓CI" green (passing),
+#      "✗CI" bright red (failing), "●CI" yellow (pending) - from a single-
+#      row ~/.claude/statusline-ci-cache entry <60s old that matches this
+#      repo+PR; otherwise no glyph this render, and a detached `gh pr
+#      checks` background job refreshes the cache for next time
 #
 # LINE 2 (context engine), joined with " | ":
 #   8  context battery, always led by a gray "ctx" label + space (so it
@@ -62,7 +126,12 @@ export LC_ALL=C.UTF-8
 #      5-cell bar (█ filled / ░ empty; filled = remaining% rounded to
 #      nearest fifth) with filled cells in the same dynamic tier as "N%"
 #      (>=50 green / 20-49 yellow / <20 bright red) and empty cells gray,
-#      "N%" dynamic. Each of the two token numbers is formatted
+#      "N%" dynamic. AUTO-COMPACT MARK (~80% community convention, not an
+#      official threshold): cell index 4 (floor(0.8*5), the last cell)
+#      renders as a fixed bright-white "│" instead of gray "░" whenever
+#      the bar hasn't filled past it yet (filled<=4); omitted once the
+#      bar is completely full (filled=5). Each of the two token numbers
+#      is formatted
 #      independently by fmt_k_or_m(): "<N>k" (white) while under 1000k,
 #      else "<N>M" or "<N>.<N>M" (one decimal, omitted when zero) - e.g.
 #      1000000 -> "1M", 1500000 -> "1.5M" - with "/" gray between them.
@@ -71,26 +140,81 @@ export LC_ALL=C.UTF-8
 #   9  token rate + sparkline, derived from ~/.claude/statusline-history.tsv
 #      (see the history block below); sparkline (cyan) is up to 8
 #      consecutive token deltas over the last up-to-9 samples, normalized
-#      onto ▁▂▃▄▅▆▇█; rate is tokens/min over the last 5 minutes, "N/m" or
-#      ">=1000/min" as "X.Yk/m", tiered <5000 gray / 5000-14999 yellow /
-#      >=15000 bright red; either half, or the whole segment, may be absent
-#   10 cache hit rate "cache <N>%" - gray label; N% dynamic (>=80 green /
-#      50-79 yellow / <50 bright red); only when current_usage has all of
-#      input/cache_creation/cache_read tokens and their sum is > 0
+#      onto ▁▂▃▄▅▆ (capped at 6 levels, not 8 - ▇/█ are deliberately never
+#      used by any sparkline, only by single-line gauges like the ctx
+#      battery, so a full-height cell here can never visually fuse with
+#      the row above/below it); rate is tokens/min over the last 5
+#      minutes, "N/m" or ">=1000/min" as "X.Yk/m", tiered <5000 gray /
+#      5000-14999 yellow / >=15000 bright red; either half, or the whole
+#      segment, may be absent
+#   10 cache hit rate "cache <N.N>%" - gray label; one decimal place, tier
+#      by the integer part (>=80 green / 50-79 yellow / <50 bright red);
+#      only when current_usage has all of input/cache_creation/cache_read
+#      tokens and their sum is > 0; followed by a gray " r<X>·w<Y>" read/
+#      write breakdown (fmt_small_or_k: raw integer under 1000, one-
+#      decimal-k at/above - e.g. "r435.2k" - never M, unlike fmt_k_or_m),
+#      omitted when both read and creation tokens are 0/absent. N4 CACHE
+#      FRESHNESS COUNTDOWN (unofficial - TTL is an assumption, not a
+#      documented API contract) appends directly to this same segment,
+#      space-separated, only when it itself is showing: scans the tail of
+#      .transcript_path (see item 10b below) newest-first for the latest
+#      assistant/non-sidechain line with nonzero cache activity and a
+#      parseable ISO timestamp, then remaining = $STATUSLINE_CACHE_TTL_
+#      SECONDS (default 3600) - 5 - (now - that timestamp); "47m" or
+#      "9m42s" white when remaining/ttl >0.5, yellow >0.2, bright red >0,
+#      gray "cold" otherwise; absent when no candidate line is found. The
+#      ISO timestamp needs one `date -d` spawn (no pure-bash ISO parse) -
+#      fired only when a candidate was actually found, never per-render.
+#   10b compaction counter - gray "↻" + white count of `"subtype":
+#      "compact_boundary"` lines (skipping any marked `"isSidechain":
+#      true`) seen in the same transcript tail-read as N4 above; when the
+#      sum of (preTokens-postTokens) across those boundaries is > 0, a
+#      gray " ↓" + white k-or-M-formatted total follows. Hidden when the
+#      count is 0. Both this and N4 read from ONE shared `tail -c 128KiB`
+#      of .transcript_path - the only two accepted external-process
+#      exceptions in this script (see that shared read's own comment for
+#      why, and its documented "may miss data outside the tail window"
+#      limitation).
 #
 # (The standalone "out" segment, total_output_tokens shown on its own, has
 # been removed entirely - variables, formatting, and its parts2+= entry.)
 #
-# LINE 3 (spend/quota), joined with " | ":
+# LINE 3 (spend), joined with " | ":
 #   11 session cost: "$" uncolored (plain default foreground, like the "/" in
 #      lines changed), amount dynamic (<$1 gray / $1-4 yellow / >=$5 bright
 #      red); optionally followed by a space and a history-derived cost rate
 #      "$X.Y/h" whose "$" is ALSO uncolored (bare, matching the amount's),
 #      with only "X.Y/h" itself in its own dynamic color by whole
-#      dollars/hour: <1 gray / 1-4 yellow / >=5 bright red
-#   12 lines changed +added/-removed                        - "+" green / "/" uncolored / "-" red
+#      dollars/hour: <1 gray / 1-4 yellow / >=5 bright red. ZERO-HIDE: the
+#      whole segment is hidden when the amount rounds to 0.00 AND no rate
+#      is displayable.
+#   (TODAY/WEEK TOTAL, right after cost: gray "today"/"week" + white
+#   "$X.XX" each - a pure-bash scan of the history file's already-loaded
+#   rows, summing the peak of every per-session spending "run" (a /clear
+#   resets a session's cost column, so a simple max would undercount) -
+#   zero spawns, no transcript scanning; see the inline comment above
+#   their code for the full monotonic-run algorithm and caveats. TODAY
+#   only shows when it exceeds the current session's own cost by >=1
+#   cent; WEEK has no such comparison.)
+#   12 lines changed +added/-removed - "+" green / "/" uncolored / "-" red.
+#      ZERO-HIDE: hidden when added and removed are both 0.
+#
+# LINE 4 (quota & session), joined with " | ":
 #   13 rate limits: "5h"/"7d" label fixed cyan, "N%" dynamic per window (<50
-#      green / 50-79 yellow / >=80 bright red), "→reset" white
+#      green / 50-79 yellow / >=80 bright red), "→reset" white. PACE CURSOR:
+#      when resets_at is valid, a gray "·t<N>%" (how far through the window,
+#      0-100%, clamped) follows the usage percent before "→reset"; pace =
+#      usage% - time%, and pace>=15 forces the usage percent to bright red,
+#      0<pace<15 forces at least yellow (never downgrades an already-red
+#      tier), pace<=0 leaves the absolute tier alone.
+#   (N2 WEEKLY/EXTRA USAGE, right after rate limits: gray "wk" + per-model
+#   entries "<CyanLabel><tiered%>" space-joined - the current session's
+#   model always shown (when the cache has it), other models only past a
+#   50% warning threshold, current first then others descending by usage
+#   - followed by gray "extra" + white "$used/$limit" when enabled. Cached
+#   + background-refreshed from an UNOFFICIAL API; whole segment absent
+#   without a fresh-enough cache entry. See the inline comment above its
+#   code for the full cache/refresh/backoff design.)
 #   14 session name - gray, prefixed with a "» " marker (both inside the
 #      same gray span) so the AI-generated name doesn't read as a bare
 #      stray system message
@@ -102,15 +226,26 @@ export LC_ALL=C.UTF-8
 # ANSI-C quoting ($'\e[..m'), so each variable already holds the literal
 # escape byte; every printf only ever needs %s (never %b).
 #
-# Full example (three lines):
+# Full example (four lines):
 #   14:32:07 | Fable 5·max·think | ~\proj\webapp | ⎇ wt-fix→main | acme/webapp | main* | PR#42 approved
-#   ctx ████░ 71% 294k/1M | ▂▅█▃ 5.6k/m | cache 82%
-#   $0.42 $0.6/h | +156/-23 | 5h 37%→09:00 7d 12%→08-15 | » my-session
+#   ctx ████│ 71% 294k/1M | ▂▅▆▃ 5.6k/m | cache 82%
+#   $0.42 $0.6/h | +156/-23
+#   5h 37%·t56%→09:00 7d 12%·t23%→08-15 | wk Fab45% Son67% | » my-session
 # Low-context example (line 2 only, illustrating the "!" warning bar):
 #   ctx !█░░░░ 12% 176k/200k
-# Minimal example (fresh session: line 1 + a bare line 3, no line 2 at all):
+# Minimal example (fresh session: line 1 + a bare line 4, no lines 2/3):
 #   14:32:07 | Fable 5 | ~
 #   » my-session
+# (These examples predate the CI glyph/cache r-w/today-week-total
+# additions and the narrow-terminal compact line; see each segment's own
+# comment above and inline in the code for those. The ctx battery's "│"
+# (N5) IS the current rendering, kept accurate; the rate-limit windows'
+# "·tNN%" pace cursor shown above is also current (the N1 micro-bar was
+# tried and reverted - see item 13's own comment), as is the wk per-model
+# restyle. Padding/separator NBSP (N6) is invisible in plain text so
+# isn't shown either way. Not
+# otherwise kept in perfect sync on every addition, to avoid a wall of
+# mutually-inconsistent numbers.)
 
 # --- color constants (basic 16-color ANSI only) ---
 RESET=$'\e[0m'
@@ -128,6 +263,17 @@ RED_BRIGHT=$'\e[91m'
 MAGENTA_BRIGHT=$'\e[95m'
 WHITE_BRIGHT=$'\e[97m'
 
+# N6: alignment padding (column-width filler spaces) and the grid
+# separator's surrounding spaces use NBSP (U+00A0) instead of a plain
+# space, so VSCode-style terminals that trim trailing/run whitespace on
+# render can't collapse them and break the column alignment. Semantic
+# single spaces INSIDE a segment (e.g. between "5h" and its bar) are
+# deliberately left as plain spaces - only these two structural uses are
+# affected. disp_width() already counts NBSP as 1 cell (its codepoint,
+# 160, falls outside every wide/fullwidth range), so plain-width
+# bookkeeping needs no other change.
+NBSP=$'\xc2\xa0'
+
 # OSC 8 terminal hyperlinks (experimental - terminals without support just
 # render the plain colored text, which is fine). A link is
 # OSC_OPEN + url + OSC_CLOSE + <visible text, with its own color codes
@@ -136,65 +282,103 @@ OSC_OPEN=$'\e]8;;'
 OSC_CLOSE=$'\e\\'
 
 input=$(cat)
-jqr() { printf '%s' "$input" | jq -r "$1"; }
 
-# --- history state file (used by the token-rate/sparkline and cost-rate
-# sub-segments below): ~/.claude/statusline-history.tsv, TSV rows
-# "epoch\tsession_id\ttokens\tcost". Skipped entirely when session_id is
-# absent. A row is appended only if the last row for this session is
-# missing or >=5s old, then the file is trimmed to its last 200 lines via a
-# temp file + mv (tolerates races between parallel sessions - worst case a
-# lost row, never corruption). All history reads tolerate/skip malformed
-# lines. The derived rate/sparkline segments stay silently absent while
-# history is too thin for their window - that's correct, not an error.
-session_id=$(jqr '.session_id // empty')
-history_file="$HOME/.claude/statusline-history.tsv"
-hist_rows=""
-if [ -n "$session_id" ]; then
-  now_epoch=$(date +%s)
-  should_append=1
-  if [ -f "$history_file" ]; then
-    last_hist_line=$(grep -F "$(printf '\t%s\t' "$session_id")" "$history_file" 2>/dev/null | tail -n 1)
-    if [ -n "$last_hist_line" ]; then
-      last_hist_epoch=$(printf '%s' "$last_hist_line" | cut -f1)
-      if [[ "$last_hist_epoch" =~ ^[0-9]+$ ]]; then
-        hist_age=$(( now_epoch - last_hist_epoch ))
-        [ "$hist_age" -lt 5 ] && should_append=0
-      fi
-    fi
-  fi
-  if [ "$should_append" -eq 1 ]; then
-    hist_in=$(jqr '.context_window.total_input_tokens // empty')
-    hist_win=$(jqr '.context_window.context_window_size // empty')
-    hist_out=$(jqr '.context_window.total_output_tokens // empty')
-    if [[ "$hist_in" =~ ^[0-9]+$ ]] && [ "$hist_in" -gt 0 ] && [[ "$hist_win" =~ ^[0-9]+$ ]] && [ "$hist_win" -gt 0 ]; then
-      hist_out_n=0
-      [[ "$hist_out" =~ ^[0-9]+$ ]] && hist_out_n="$hist_out"
-      hist_tokens_now=$(( hist_in + hist_out_n ))
-    else
-      hist_tokens_now="$hist_in"
-    fi
-    hist_cost_now=$(jqr '.cost.total_cost_usd // empty')
-    printf '%s\t%s\t%s\t%s\n' "$now_epoch" "$session_id" "$hist_tokens_now" "$hist_cost_now" >> "$history_file" 2>/dev/null
-    tail -n 200 "$history_file" > "${history_file}.tmp" 2>/dev/null && mv -f "${history_file}.tmp" "$history_file" 2>/dev/null
-  fi
-  hist_rows=$(awk -F'\t' -v sid="$session_id" 'NF==4 && $2==sid {print}' "$history_file" 2>/dev/null)
+# jq guard: if jq is missing, every segment below is unusable - degrade to
+# one line (clock via the bash date builtin, no process spawn) and exit
+# cleanly rather than emitting nothing or erroring.
+command -v jq >/dev/null 2>&1 || { printf '\e[0m\e[97m%(%H:%M:%S)T\e[0m | statusline: jq missing\n' -1; exit 0; }
+
+# PERF: one jq invocation for the whole script instead of one per field.
+# Every field is null-guarded with `// ""` (not `// empty`) so each always
+# emits exactly one line, keeping the fixed field order below intact for
+# positional mapfile assignment. The output is captured into a variable,
+# CR-stripped with a parameter expansion (Windows jq can emit CRLF), then
+# split with a herestring `mapfile` - no `tr`/pipe/subshell spawn anywhere
+# in this step. The tokenSamples-equivalent concept doesn't exist in this
+# script; nothing else needs jq after this block.
+jq_main_out=$(jq -r '
+  (.session_id // ""),
+  (.model.display_name // ""),
+  (.effort.level // ""),
+  (if .thinking.enabled == true then "think" else "" end),
+  (.workspace.current_dir // ""),
+  (.workspace.repo.owner // ""),
+  (.workspace.repo.name // ""),
+  (.workspace.repo.host // "github.com"),
+  (.worktree.name // ""),
+  (.worktree.branch // ""),
+  (.pr.number // ""),
+  (.pr.review_state // ""),
+  (.pr.url // ""),
+  (.context_window.remaining_percentage // ""),
+  (.context_window.total_input_tokens // ""),
+  (.context_window.context_window_size // ""),
+  (.context_window.total_output_tokens // ""),
+  (.context_window.current_usage.cache_read_input_tokens // ""),
+  (.context_window.current_usage.cache_creation_input_tokens // ""),
+  (.context_window.current_usage.input_tokens // ""),
+  (.cost.total_cost_usd // ""),
+  (.cost.total_lines_added // ""),
+  (.cost.total_lines_removed // ""),
+  (.rate_limits.five_hour.used_percentage // ""),
+  (.rate_limits.five_hour.resets_at // ""),
+  (.rate_limits.seven_day.used_percentage // ""),
+  (.rate_limits.seven_day.resets_at // ""),
+  (.session_name // ""),
+  (.transcript_path // "")
+' <<< "$input" 2>/dev/null)
+jq_main_out=${jq_main_out//$'\r'/}
+mapfile -t F <<< "$jq_main_out"
+
+session_id="${F[0]}";    model="${F[1]}";      effort="${F[2]}";     thinking="${F[3]}"
+dir="${F[4]}";           repo_owner="${F[5]}"; repo_name="${F[6]}"; repo_host="${F[7]}"
+wt_name="${F[8]}";       wt_branch="${F[9]}";  pr_number="${F[10]}"; pr_state="${F[11]}"
+pr_url="${F[12]}";       remaining="${F[13]}"; in_tokens="${F[14]}"; win_size="${F[15]}"
+out_tokens_ctx="${F[16]}"; cache_r="${F[17]}"; cache_w="${F[18]}";  cache_i="${F[19]}"
+cost="${F[20]}";         added="${F[21]}";     removed="${F[22]}"
+five="${F[23]}";         five_reset="${F[24]}"; week="${F[25]}";   week_reset="${F[26]}"
+session_name="${F[27]}"; transcript_path="${F[28]}"
+
+# PERF: bash's printf '%(fmt)T' builtin (bash 4.2+) replaces every `date`
+# call in this script - zero process spawns. -1 means "now".
+printf -v now_epoch '%(%s)T' -1
+
+# HOME auto-detect: prefer $USERPROFILE (native Windows backslash form;
+# forward-slash twin derived by replacing every backslash); if unset, fall
+# back to $HOME for both forms (correct as-is on a POSIX box; on a
+# hypothetical Windows box missing USERPROFILE, $HOME's own form - usually
+# already POSIX-style under Git Bash - is used verbatim rather than
+# attempting a POSIX-to-Windows path conversion, since that's an edge case
+# this deployment shouldn't hit in practice).
+if [ -n "$USERPROFILE" ]; then
+  home_bs="$USERPROFILE"
+  home_fs="${USERPROFILE//\\//}"
+elif [ -n "$HOME" ]; then
+  home_bs="$HOME"
+  home_fs="$HOME"
+else
+  home_bs=""
+  home_fs=""
 fi
-
-# Windows jq/awk can emit CRLF; mapfile only strips \n, so a stray \r would
-# survive on every element and fail the numeric regex guards below (the
-# same class of bug found and fixed in the subagent script's sparkline
-# mapfile) - tr -d '\r' defends all four of these the same way.
-mapfile -t tok_epochs < <(printf '%s\n' "$hist_rows" | awk -F'\t' '$3 ~ /^[0-9]+$/ {print $1}' | tr -d '\r')
-mapfile -t tok_values < <(printf '%s\n' "$hist_rows" | awk -F'\t' '$3 ~ /^[0-9]+$/ {print $3}' | tr -d '\r')
-mapfile -t cost_epochs < <(printf '%s\n' "$hist_rows" | awk -F'\t' '$4 ~ /^[0-9]+(\.[0-9]+)?$/ {print $1}' | tr -d '\r')
-mapfile -t cost_values < <(printf '%s\n' "$hist_rows" | awk -F'\t' '$4 ~ /^[0-9]+(\.[0-9]+)?$/ {print $4}' | tr -d '\r')
 
 # Parses a cost string ("12", "12.5", "12.34...") to integer cents in pure
 # bash: no bc/awk. Decimal part is truncated/zero-padded to exactly 2
 # digits; 10#$decpart forces base-10 so a leading zero (e.g. "05") is never
-# misread as octal.
+# misread as octal. (Moved ahead of the history block below since the
+# TODAY TOTAL computation needs it.)
+# NO-FORK RETURN: writes to global REPLY instead of printf+stdout: this is
+# called once per history row inside the today/week loops below (up to a
+# few hundred times on a long-lived history file) - $(cost_to_cents ...)
+# would fork a subshell PER CALL even though the function is pure bash
+# (MSYS2 forks for command substitution regardless of what's inside it,
+# ~2.5ms each - this was the single largest source of forks measured in
+# this script). REPLY is cleared first so a failed call (return 1, e.g.
+# unparseable input) never leaks a PREVIOUS call's value to a caller that
+# forgets to check the return status - always check `$?`/the function's
+# own return value, not just whether REPLY looks numeric, when precision
+# matters (every call site below does check).
 cost_to_cents() {
+  REPLY=""
   local c="$1"
   local intpart decpart
   intpart="${c%%.*}"
@@ -209,8 +393,220 @@ cost_to_cents() {
     decpart="${decpart}0"
   done
   [[ "$decpart" =~ ^[0-9]{2}$ ]] || return 1
-  printf '%s' "$(( intpart * 100 + 10#$decpart ))"
+  REPLY=$(( intpart * 100 + 10#$decpart ))
 }
+
+# --- history state file (used by the token-rate/sparkline and cost-rate
+# sub-segments below, and by TODAY/WEEK TOTAL further down): PERF: the
+# file is read ONCE via builtin redirection (`mapfile -t hist_all_lines <
+# file` - no pipe, no cat/tr spawn; any stray \r is stripped per-line via
+# parameter expansion instead of `tr`), then every extraction (this
+# session's rows for the rate/sparkline arrays, the append+trim, and
+# TODAY/WEEK TOTAL's cross-session scan) is a pure-bash loop over that
+# one in-memory array - no awk/grep/cut/tail anywhere below.
+#
+# CANONICAL ROW FORMAT (writer, below): 4 fields joined by the ASCII Unit
+# Separator (0x1F), "epoch<0x1F>session_id<0x1F>tokens<0x1F>cost" -
+# written directly via printf's \x1f escape, not tab. BACK-COMPAT
+# (reader, both loops below): every line is normalized with
+# `line=${line//$'\t'/$'\x1f'}` BEFORE splitting, so pre-this-deploy rows
+# (which used a literal tab) parse identically to current rows - one
+# 0x1F split handles both formats forever, and the trim/rewrite below
+# rewrites the whole file in the canonical 0x1F form on every render that
+# appends, so a file self-migrates off tabs within one render cycle.
+#
+# WHOLE-ROW VALIDATION: split via `read -r -a` into an array and require
+# EXACTLY 4 fields before touching ANY of them - a malformed/foreign line
+# (wrong delimiter, wrong field count, truncated write) is skipped in its
+# entirety rather than letting a partially-parsed field (e.g. a shifted
+# value that still happens to satisfy a later numeric regex) leak into a
+# sum. Each individual field is then still separately regex-validated
+# before use, but only after the row has already passed the shape check.
+# All history reads tolerate/skip malformed lines this way - a row only
+# counts once its epoch parses as a plain non-negative integer, on top of
+# the 4-field shape check. The derived rate/sparkline segments stay
+# silently absent while history is too thin for their window - that's
+# correct, not an error.
+history_file="$HOME/.claude/statusline-history.tsv"
+hist_all_lines=()
+[ -f "$history_file" ] && mapfile -t hist_all_lines < "$history_file"
+
+tok_epochs=(); tok_values=()
+cost_epochs=(); cost_values=()
+
+if [ -n "$session_id" ]; then
+  last_hist_epoch=""
+  for hline in "${hist_all_lines[@]}"; do
+    hline=${hline//$'\r'/}
+    hline=${hline//$'\t'/$'\x1f'}
+    IFS=$'\x1f' read -r -a hfields <<< "$hline"
+    [ "${#hfields[@]}" -eq 4 ] || continue
+    h_epoch="${hfields[0]}"; h_sid="${hfields[1]}"; h_tok="${hfields[2]}"; h_cost="${hfields[3]}"
+    [[ "$h_epoch" =~ ^[0-9]+$ ]] || continue
+    [ "$h_sid" != "$session_id" ] && continue
+    last_hist_epoch="$h_epoch"
+    if [[ "$h_tok" =~ ^[0-9]+$ ]]; then
+      tok_epochs+=("$h_epoch")
+      tok_values+=("$h_tok")
+    fi
+    if [[ "$h_cost" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      cost_epochs+=("$h_epoch")
+      cost_values+=("$h_cost")
+    fi
+  done
+
+  should_append=1
+  if [ -n "$last_hist_epoch" ]; then
+    hist_age=$(( now_epoch - last_hist_epoch ))
+    [ "$hist_age" -lt 5 ] && should_append=0
+  fi
+
+  if [ "$should_append" -eq 1 ]; then
+    if [[ "$in_tokens" =~ ^[0-9]+$ ]] && [ "$in_tokens" -gt 0 ] && [[ "$win_size" =~ ^[0-9]+$ ]] && [ "$win_size" -gt 0 ]; then
+      hist_out_n=0
+      [[ "$out_tokens_ctx" =~ ^[0-9]+$ ]] && hist_out_n="$out_tokens_ctx"
+      hist_tokens_now=$(( in_tokens + hist_out_n ))
+    else
+      hist_tokens_now="$in_tokens"
+    fi
+    hist_cost_now="$cost"
+    printf -v new_hist_line '%s\x1f%s\x1f%s\x1f%s' "$now_epoch" "$session_id" "$hist_tokens_now" "$hist_cost_now"
+    hist_all_lines+=("$new_hist_line")
+    # reflect the just-appended row in the in-memory rate/sparkline arrays
+    # too (equivalent to the old behavior of re-reading the file post-write)
+    if [[ "$hist_tokens_now" =~ ^[0-9]+$ ]]; then
+      tok_epochs+=("$now_epoch")
+      tok_values+=("$hist_tokens_now")
+    fi
+    if [[ "$hist_cost_now" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      cost_epochs+=("$now_epoch")
+      cost_values+=("$hist_cost_now")
+    fi
+  fi
+fi
+
+# TODAY/WEEK TOTAL + HISTORY TRIM: ONE pure-bash pass over hist_all_lines
+# (which already reflects this render's just-appended row above, if any)
+# computes all three at once - zero extra spawns, and no second pass just
+# for trimming. "Today" = same local-time YYYYMMDD string as now (printf
+# '%(%Y%m%d)T', string-compared per row; no UTC-midnight math needed);
+# "week" = epoch >= now-604800. TRIM is now TIME-based, not count-based:
+# a row is kept when its epoch is within the last 8 days (7-day week
+# window + 1 day margin), with a 50000-line safety cap (oldest surviving
+# rows dropped beyond it) applied after the scan in case some pathological
+# number of sessions keeps the file huge even within 8 days.
+# MONOTONIC RUNS (today and week both): a session's cost column is
+# normally a running total, but /clear resets it mid-session, so simply
+# taking the max cost seen for a session_id would UNDERCOUNT a session
+# that cleared and kept spending. Instead, within each scope
+# independently, rows for a given session_id are walked in file order
+# (chronological); a cost LOWER than that session's previous row closes
+# out the current run (its peak is added to the session's scope total)
+# and starts a new run at the lower value; whatever run is still open per
+# session is closed out once more after the loop. This sums the peak of
+# every run instead of a single global max. TODAY is shown only when its
+# sum exceeds THIS session's own cost by >= 1 cent (avoids redundancy
+# with the cost segment right before it); WEEK has no such comparison -
+# it's expected to differ from a same-day session's own cost, and when it
+# happens to equal today's total (single day of data so far) both still
+# show. Caveat (both): only counts sessions that actually rendered the
+# statusline within the scope's window, and a session whose rows straddle
+# a window edge has its outside-the-window spend excluded from that scope
+# - today and week are independent sums, not complementary halves.
+declare -A today_prev_cents today_run_max_cents today_total_by_sid
+declare -A week_prev_cents week_run_max_cents week_total_by_sid
+printf -v today_str '%(%Y%m%d)T' -1
+hist_time_cutoff=$(( now_epoch - 691200 ))
+week_cutoff_epoch=$(( now_epoch - 604800 ))
+hist_trimmed=()
+for hline in "${hist_all_lines[@]}"; do
+  hline=${hline//$'\r'/}
+  hline=${hline//$'\t'/$'\x1f'}
+  IFS=$'\x1f' read -r -a hfields <<< "$hline"
+  # WHOLE-ROW shape check (see the history-file comment above) - a line
+  # that doesn't split into exactly 4 fields is dropped here entirely,
+  # both from this scope's sums AND from the trimmed rewrite below, since
+  # its epoch can't be trusted enough to even decide whether it's within
+  # the trim window.
+  [ "${#hfields[@]}" -eq 4 ] || continue
+  h_epoch="${hfields[0]}"; h_sid="${hfields[1]}"; h_tok="${hfields[2]}"; h_cost="${hfields[3]}"
+  [[ "$h_epoch" =~ ^[0-9]+$ ]] || continue
+
+  [ "$h_epoch" -ge "$hist_time_cutoff" ] && hist_trimmed+=("$hline")
+
+  [ -z "$h_sid" ] && continue
+  [[ "$h_cost" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+  cost_to_cents "$h_cost" || continue
+  h_cents="$REPLY"
+
+  if [ "$h_epoch" -ge "$week_cutoff_epoch" ]; then
+    w_prev=${week_prev_cents["$h_sid"]:-}
+    if [ -z "$w_prev" ]; then
+      week_run_max_cents["$h_sid"]=$h_cents
+    elif [ "$h_cents" -lt "$w_prev" ]; then
+      week_total_by_sid["$h_sid"]=$(( ${week_total_by_sid["$h_sid"]:-0} + ${week_run_max_cents["$h_sid"]:-0} ))
+      week_run_max_cents["$h_sid"]=$h_cents
+    else
+      [ "$h_cents" -gt "${week_run_max_cents["$h_sid"]:-0}" ] && week_run_max_cents["$h_sid"]=$h_cents
+    fi
+    week_prev_cents["$h_sid"]=$h_cents
+  fi
+
+  printf -v row_str '%(%Y%m%d)T' "$h_epoch"
+  if [ "$row_str" = "$today_str" ]; then
+    t_prev=${today_prev_cents["$h_sid"]:-}
+    if [ -z "$t_prev" ]; then
+      today_run_max_cents["$h_sid"]=$h_cents
+    elif [ "$h_cents" -lt "$t_prev" ]; then
+      today_total_by_sid["$h_sid"]=$(( ${today_total_by_sid["$h_sid"]:-0} + ${today_run_max_cents["$h_sid"]:-0} ))
+      today_run_max_cents["$h_sid"]=$h_cents
+    else
+      [ "$h_cents" -gt "${today_run_max_cents["$h_sid"]:-0}" ] && today_run_max_cents["$h_sid"]=$h_cents
+    fi
+    today_prev_cents["$h_sid"]=$h_cents
+  fi
+done
+for sid_key in "${!today_run_max_cents[@]}"; do
+  today_total_by_sid["$sid_key"]=$(( ${today_total_by_sid["$sid_key"]:-0} + today_run_max_cents[$sid_key] ))
+done
+for sid_key in "${!week_run_max_cents[@]}"; do
+  week_total_by_sid["$sid_key"]=$(( ${week_total_by_sid["$sid_key"]:-0} + week_run_max_cents[$sid_key] ))
+done
+today_total_cents=0
+for sid_key in "${!today_total_by_sid[@]}"; do
+  today_total_cents=$(( today_total_cents + today_total_by_sid[$sid_key] ))
+done
+week_total_cents=0
+for sid_key in "${!week_total_by_sid[@]}"; do
+  week_total_cents=$(( week_total_cents + week_total_by_sid[$sid_key] ))
+done
+
+if [ -n "$session_id" ] && [ "$should_append" -eq 1 ]; then
+  hist_trimmed_count=${#hist_trimmed[@]}
+  if [ "$hist_trimmed_count" -gt 50000 ]; then
+    hist_trimmed=("${hist_trimmed[@]: -50000}")
+  fi
+  printf '%s\n' "${hist_trimmed[@]}" > "${history_file}.tmp" 2>/dev/null && mv -f "${history_file}.tmp" "$history_file" 2>/dev/null
+fi
+
+current_cost_cents=0
+if [ -n "$cost" ] && cost_to_cents "$cost"; then
+  current_cost_cents="$REPLY"
+fi
+today_seg=""
+today_plain=""
+if [ "$today_total_cents" -gt 0 ] && [ "$(( today_total_cents - current_cost_cents ))" -ge 1 ]; then
+  printf -v today_fmt '%d.%02d' "$(( today_total_cents / 100 ))" "$(( today_total_cents % 100 ))"
+  today_seg="${GRAY}today${RESET} ${WHITE}\$${today_fmt}${RESET}"
+  today_plain="today \$${today_fmt}"
+fi
+week_seg=""
+week_plain=""
+if [ "$week_total_cents" -gt 0 ]; then
+  printf -v week_fmt '%d.%02d' "$(( week_total_cents / 100 ))" "$(( week_total_cents % 100 ))"
+  week_seg="${GRAY}week${RESET} ${WHITE}\$${week_fmt}${RESET}"
+  week_plain="week \$${week_fmt}"
+fi
 
 # Formats a raw token count as "<N>k" (as before) unless that would be
 # >=1000k, in which case it switches to "<N>M" / "<N>.<N>M" (one decimal,
@@ -218,7 +614,12 @@ cost_to_cents() {
 # single division (not from the already-rounded k value) to avoid
 # compounding truncation error, matching the rounding style used elsewhere
 # in this script (e.g. the burn-rate segments' rate10).
+# NO-FORK RETURN: writes to global REPLY - see cost_to_cents's comment
+# above for why (every pure-bash helper in this script follows the same
+# pattern; call sites do `fmt_k_or_m "$n"; x="$REPLY"`, never
+# `x=$(fmt_k_or_m "$n")`).
 fmt_k_or_m() {
+  REPLY=""
   local n="$1"
   local k=$(( (n + 500) / 1000 ))
   if [ "$k" -ge 1000 ]; then
@@ -226,12 +627,30 @@ fmt_k_or_m() {
     local whole=$(( m10 / 10 ))
     local frac=$(( m10 % 10 ))
     if [ "$frac" -eq 0 ]; then
-      printf '%sM' "$whole"
+      REPLY="${whole}M"
     else
-      printf '%s.%sM' "$whole" "$frac"
+      REPLY="${whole}.${frac}M"
     fi
   else
-    printf '%sk' "$k"
+    REPLY="${k}k"
+  fi
+}
+
+# For the cache r/w suffix ONLY (ctx battery and token-count formatting
+# elsewhere keep using fmt_k_or_m unchanged): raw integer under 1000
+# (k-rounding a small count like 0 or 312 read as broken - e.g. "w0k"),
+# one-decimal-k (never switching to M - this value is small/bounded
+# enough that M-form isn't useful here) at/above 1000, e.g. "435.2k".
+# Integer math only: v10 = n*10/1000. NO-FORK RETURN via REPLY, same as
+# fmt_k_or_m above.
+fmt_small_or_k() {
+  REPLY=""
+  local n="$1"
+  if [ "$n" -lt 1000 ]; then
+    REPLY="$n"
+  else
+    local v10=$(( n * 10 / 1000 ))
+    REPLY="$(( v10 / 10 )).$(( v10 % 10 ))k"
   fi
 }
 
@@ -248,10 +667,15 @@ fmt_k_or_m() {
 # default (non-East-Asian-ambiguous-wide) profile renders them - a
 # terminal configured for East-Asian ambiguous-wide would need those
 # bumped to 2 to match its own rendering.
+# NO-FORK RETURN via global REPLY (see cost_to_cents's comment above) -
+# this is the single most-called helper in the script (every segment's
+# plain-width measurement, every column-width computation), so
+# $(disp_width ...) forking a subshell per call was a major contributor
+# to the fork count; call sites now do `disp_width "$s"; w="$REPLY"`.
 disp_width() {
   local s="$1"
   if [[ "$s" != *[![:ascii:]]* ]]; then
-    printf '%s' "${#s}"
+    REPLY="${#s}"
     return
   fi
   local len=${#s} i c cp w total=0
@@ -279,11 +703,11 @@ disp_width() {
     fi
     total=$(( total + w ))
   done
-  printf '%s' "$total"
+  REPLY="$total"
 }
 
 # 1. clock (not from stdin) - bright white
-clock=$(date +%H:%M:%S)
+printf -v clock '%(%H:%M:%S)T' -1
 clock_plain="$clock"
 [ -n "$clock" ] && clock="${WHITE_BRIGHT}${clock}${RESET}"
 
@@ -292,9 +716,7 @@ clock_plain="$clock"
 # medium green, high yellow, xhigh bright magenta, max bright red, any other
 # value yellow), think marker magenta. No effort -> no ·effort part; thinking
 # not true -> no ·think part; model alone renders as just the cyan name.
-model=$(jqr '.model.display_name // empty')
-effort=$(jqr '.effort.level // empty')
-thinking=$(jqr 'if .thinking.enabled == true then "think" else empty end')
+# (model/effort/thinking already extracted by the consolidated jq call above)
 model_seg=""
 model_plain=""
 if [ -n "$model" ]; then
@@ -322,10 +744,9 @@ fi
 # untouched below and reused as-is for the git commands). Split into parent
 # (drive/~, any collapsed …, and all backslashes - regular blue) and the
 # final component (bright blue); a single-component path is bright blue only.
-dir=$(jqr '.workspace.current_dir // empty')
+# (dir already extracted by the consolidated jq call above; home_bs/home_fs
+# are set by the HOME auto-detect block above too)
 dir_display="$dir"
-home_bs='C:\Users\Administrator'
-home_fs='C:/Users/Administrator'
 dir_lc="${dir_display,,}"
 if [[ "$dir_lc" == "${home_bs,,}"* ]]; then
   dir_display="~${dir_display:${#home_bs}}"
@@ -359,8 +780,7 @@ if [ -n "$dir_display" ]; then
 fi
 
 # 4. worktree - only in --worktree sessions, from .worktree.name/.branch
-wt_name=$(jqr '.worktree.name // empty')
-wt_branch=$(jqr '.worktree.branch // empty')
+# (wt_name/wt_branch already extracted by the consolidated jq call above)
 wt_seg=""
 wt_plain=""
 if [ -n "$wt_name" ]; then
@@ -376,9 +796,8 @@ fi
 # colored construct is wrapped in an OSC 8 hyperlink to
 # https://<host>/<owner>/<name> (host defaults to github.com), unless the
 # built URL fails the whitespace/ESC paranoia guard.
-repo_owner=$(jqr '.workspace.repo.owner // empty')
-repo_name=$(jqr '.workspace.repo.name // empty')
-repo_host=$(jqr '.workspace.repo.host // "github.com"')
+# (repo_owner/repo_name/repo_host already extracted by the consolidated jq
+# call above)
 repo=""
 repo_plain=""
 if [ -n "$repo_owner" ] && [ -n "$repo_name" ]; then
@@ -391,19 +810,34 @@ if [ -n "$repo_owner" ] && [ -n "$repo_name" ]; then
 fi
 
 # 6. git branch; uses the ORIGINAL $dir, never the abbreviated display text.
-# --no-optional-locks keeps these read-only and fast; the dirty check only
-# runs when we already know we're on a branch, and `head -c1` stops reading
-# as soon as porcelain output proves the tree dirty.
-# Branch name is always green; a dirty "*" is appended as its own yellow token.
-branch=$(git -C "$dir" --no-optional-locks branch --show-current 2>/dev/null)
+# --no-optional-locks keeps this read-only and fast. PERF: ONE git call
+# (`status --porcelain=v1 --branch`) replaces the old branch+status pair;
+# line 1 ("## <branch>[...<upstream>][...]" or "## HEAD (no branch)" or
+# "## No commits yet on <branch>") is parsed for the branch name, matching
+# `git branch --show-current`'s empty-on-detached-HEAD behavior; any
+# further line means the tree is dirty (same signal `head -c1` on
+# `status --porcelain` used to give). Branch name is always green; a dirty
+# "*" is appended as its own yellow token.
+branch=""
 branch_plain=""
-if [ -n "$branch" ]; then
-  dirty=$(git -C "$dir" --no-optional-locks status --porcelain 2>/dev/null | head -c1)
-  branch_plain="$branch"
-  branch="${GREEN}${branch}${RESET}"
-  if [ -n "$dirty" ]; then
-    branch="${branch}${YELLOW}*${RESET}"
-    branch_plain="${branch_plain}*"
+git_status_out=$(git -C "$dir" --no-optional-locks status --porcelain=v1 --branch 2>/dev/null)
+git_status_out=${git_status_out//$'\r'/}
+if [ -n "$git_status_out" ]; then
+  mapfile -t git_status_lines <<< "$git_status_out"
+  git_head_line="${git_status_lines[0]}"
+  git_branch_info="${git_head_line#\#\# }"
+  case "$git_branch_info" in
+    "HEAD (no branch)"*) branch="" ;;
+    "No commits yet on "*) branch="${git_branch_info#No commits yet on }"; branch="${branch%%...*}" ;;
+    *) branch="${git_branch_info%%...*}" ;;
+  esac
+  if [ -n "$branch" ]; then
+    branch_plain="$branch"
+    branch="${GREEN}${branch}${RESET}"
+    if [ "${#git_status_lines[@]}" -gt 1 ]; then
+      branch="${branch}${YELLOW}*${RESET}"
+      branch_plain="${branch_plain}*"
+    fi
   fi
 fi
 
@@ -412,10 +846,9 @@ fi
 # guard (plain colored text otherwise); the review state (when present)
 # stays OUTSIDE the link and keeps its own dynamic color: approved green,
 # changes_requested bright red, draft gray, pending or any other value
-# yellow. No state -> just the (possibly linked) magenta PR#N.
-pr_number=$(jqr '.pr.number // empty')
-pr_state=$(jqr '.pr.review_state // empty')
-pr_url=$(jqr '.pr.url // empty')
+# yellow. No state -> just the (possibly linked) magenta PR#N. A cached CI
+# status glyph (see below) may be appended after the review state.
+# (pr_number/pr_state/pr_url already extracted by the consolidated jq call)
 pr_seg=""
 pr_plain=""
 if [ -n "$pr_number" ]; then
@@ -435,6 +868,55 @@ if [ -n "$pr_number" ]; then
     pr_seg="${pr_seg} ${pr_color}${pr_state}${RESET}"
     pr_plain="${pr_plain} ${pr_state}"
   fi
+
+  # PR CI status: cached + non-blocking. Cache is a SINGLE row (not a
+  # growing table) at ~/.claude/statusline-ci-cache: "epoch\trepo\tpr\tstate".
+  # If it matches this repo+PR and is <60s old, its glyph is appended now;
+  # otherwise render without a glyph and fire a detached, disowned
+  # background `gh` refresh that overwrites the cache for next time - the
+  # render itself never waits on network. Guarded to only fire when `gh`
+  # exists and we have a repo owner/name + PR number.
+  if [ -n "$repo_owner" ] && [ -n "$repo_name" ] && command -v gh >/dev/null 2>&1; then
+    ci_cache_file="$HOME/.claude/statusline-ci-cache"
+    ci_repo_pr="${repo_owner}/${repo_name}"
+    ci_state=""
+    if [ -f "$ci_cache_file" ]; then
+      ci_cache_line=""
+      read -r ci_cache_line < "$ci_cache_file"
+      ci_cache_line=${ci_cache_line//$'\r'/}
+      ci_cache_line=${ci_cache_line//$'\t'/$'\x1f'}
+      IFS=$'\x1f' read -r ci_cache_epoch ci_cache_repo ci_cache_pr ci_cache_state <<< "$ci_cache_line"
+      if [ "$ci_cache_repo" = "$ci_repo_pr" ] && [ "$ci_cache_pr" = "$pr_number" ] && [[ "$ci_cache_epoch" =~ ^[0-9]+$ ]]; then
+        ci_age=$(( now_epoch - ci_cache_epoch ))
+        [ "$ci_age" -lt 60 ] && ci_state="$ci_cache_state"
+      fi
+    fi
+    if [ -n "$ci_state" ]; then
+      ci_glyph_plain=""
+      case "$ci_state" in
+        passing) pr_seg="${pr_seg} ${GREEN}✓CI${RESET}"; ci_glyph_plain="✓CI" ;;
+        failing) pr_seg="${pr_seg} ${RED_BRIGHT}✗CI${RESET}"; ci_glyph_plain="✗CI" ;;
+        pending) pr_seg="${pr_seg} ${YELLOW}●CI${RESET}"; ci_glyph_plain="●CI" ;;
+      esac
+      [ -n "$ci_glyph_plain" ] && pr_plain="${pr_plain} ${ci_glyph_plain}"
+    else
+      (
+        gh_states=$(gh pr checks "$pr_number" --repo "$ci_repo_pr" --json state -q '.[].state' 2>/dev/null)
+        if [ -n "$gh_states" ]; then
+          new_ci_state="passing"
+          # Validated against real `gh pr checks` output. Case-insensitive.
+          if printf '%s' "$gh_states" | grep -Eqi "FAILURE|CANCELLED|TIMED_OUT|ACTION_REQUIRED|ERROR|STARTUP_FAILURE"; then
+            new_ci_state="failing"
+          elif printf '%s' "$gh_states" | grep -Eqi "PENDING|IN_PROGRESS|QUEUED|WAITING|REQUESTED|EXPECTED"; then
+            new_ci_state="pending"
+          fi
+          ci_tmp="${ci_cache_file}.tmp.$$"
+          printf '%s\t%s\t%s\t%s\n' "$(printf '%(%s)T' -1)" "$ci_repo_pr" "$pr_number" "$new_ci_state" > "$ci_tmp" 2>/dev/null && mv -f "$ci_tmp" "$ci_cache_file" 2>/dev/null
+        fi
+      ) >/dev/null 2>&1 &
+      disown
+    fi
+  fi
 fi
 
 # 8. context battery bar: [!]<bar> N% [Xk/Yk]. remaining_int truncates the
@@ -446,12 +928,13 @@ fi
 # the segment's dynamic color (>=50 green, 20-49 yellow, <20 bright red);
 # empty cells (░, U+2591) are gray. "N%" keeps the dynamic color; token
 # counts are unchanged: "Nk" white, "/Nk" (slash included) gray.
-remaining=$(jqr '.context_window.remaining_percentage // empty')
-in_tokens=$(jqr '.context_window.total_input_tokens // empty')
-win_size=$(jqr '.context_window.context_window_size // empty')
-out_tokens_ctx=$(jqr '.context_window.total_output_tokens // empty')
+# (remaining/in_tokens/win_size/out_tokens_ctx already extracted by the
+# consolidated jq call above). ctx_compact_seg is the narrow-terminal
+# variant used on the single adaptive line (bar+pct only, no "ctx" label,
+# no token counts) - see the COLUMNS branch near the bottom.
 ctx_seg=""
 ctx_plain=""
+ctx_compact_seg=""
 if [[ "$in_tokens" =~ ^[0-9]+$ ]] && [ "$in_tokens" -gt 0 ] && [[ "$win_size" =~ ^[0-9]+$ ]] && [ "$win_size" -gt 0 ]; then
   # PRIMARY: actual occupancy (input + this response's output), not the
   # input-only remaining_percentage field.
@@ -473,16 +956,29 @@ if [[ "$in_tokens" =~ ^[0-9]+$ ]] && [ "$in_tokens" -gt 0 ] && [[ "$win_size" =~
   filled=$(( (ctx_remaining + 10) / 20 ))
   [ "$filled" -lt 0 ] && filled=0
   [ "$filled" -gt 5 ] && filled=5
-  bar_filled=""
-  bar_empty=""
+  # N5: auto-compact mark (~80% community convention, not an official
+  # Claude Code threshold) - cell index 4 (floor(0.8*5)) renders as a
+  # fixed bright-white "|" whenever the bar hasn't reached that cell yet
+  # (filled<=4); once the bar is completely full (filled=5) the marker is
+  # omitted, since there's no "before autocompact" cell left to mark.
+  bar_plain=""
+  bar_cells=""
   for ((bi=0; bi<5; bi++)); do
     if [ "$bi" -lt "$filled" ]; then
-      bar_filled="${bar_filled}█"
+      bar_cells="${bar_cells}${ctx_color}█${RESET}"
+      bar_plain="${bar_plain}█"
+    elif [ "$bi" -eq 4 ]; then
+      bar_cells="${bar_cells}${WHITE_BRIGHT}│${RESET}"
+      bar_plain="${bar_plain}│"
     else
-      bar_empty="${bar_empty}░"
+      bar_cells="${bar_cells}${GRAY}░${RESET}"
+      bar_plain="${bar_plain}░"
     fi
   done
-  bar="${ctx_color}${bar_filled}${RESET}${GRAY}${bar_empty}${RESET}"
+  bar="$bar_cells"
+  ctx_compact_seg="$bar"
+  [ -n "$ctx_warn" ] && ctx_compact_seg="${RED_BRIGHT}!${RESET}${ctx_compact_seg}"
+  ctx_compact_seg="${ctx_compact_seg} ${ctx_color}${ctx_remaining}%${RESET}"
   ctx_seg="${GRAY}ctx${RESET} "
   ctx_plain="ctx "
   if [ -n "$ctx_warn" ]; then
@@ -490,9 +986,9 @@ if [[ "$in_tokens" =~ ^[0-9]+$ ]] && [ "$in_tokens" -gt 0 ] && [[ "$win_size" =~
     ctx_plain="${ctx_plain}!"
   fi
   ctx_seg="${ctx_seg}${bar} ${ctx_color}${ctx_remaining}%${RESET}"
-  ctx_plain="${ctx_plain}${bar_filled}${bar_empty} ${ctx_remaining}%"
-  occ_fmt=$(fmt_k_or_m "$occupied")
-  total_fmt=$(fmt_k_or_m "$win_size")
+  ctx_plain="${ctx_plain}${bar_plain} ${ctx_remaining}%"
+  fmt_k_or_m "$occupied"; occ_fmt="$REPLY"
+  fmt_k_or_m "$win_size"; total_fmt="$REPLY"
   ctx_seg="${ctx_seg} ${WHITE}${occ_fmt}${RESET}${GRAY}/${total_fmt}${RESET}"
   ctx_plain="${ctx_plain} ${occ_fmt}/${total_fmt}"
 elif [ -n "$remaining" ]; then
@@ -513,25 +1009,35 @@ elif [ -n "$remaining" ]; then
       ctx_color="$YELLOW"
     fi
   fi
-  bar_filled=""
-  bar_empty=""
+  # N5: auto-compact mark - see the primary path's comment above for the
+  # full rationale; same rule (cell index 4, omitted once filled=5).
+  bar_plain=""
+  bar_cells=""
   for ((bi=0; bi<5; bi++)); do
     if [ "$bi" -lt "$filled" ]; then
-      bar_filled="${bar_filled}█"
+      bar_cells="${bar_cells}${ctx_color}█${RESET}"
+      bar_plain="${bar_plain}█"
+    elif [ "$bi" -eq 4 ]; then
+      bar_cells="${bar_cells}${WHITE_BRIGHT}│${RESET}"
+      bar_plain="${bar_plain}│"
     else
-      bar_empty="${bar_empty}░"
+      bar_cells="${bar_cells}${GRAY}░${RESET}"
+      bar_plain="${bar_plain}░"
     fi
   done
-  bar="${ctx_color}${bar_filled}${RESET}${GRAY}${bar_empty}${RESET}"
+  bar="$bar_cells"
+  printf -v remaining_disp '%.0f' "$remaining"
+  ctx_compact_seg="$bar"
+  [ -n "$ctx_warn" ] && ctx_compact_seg="${RED_BRIGHT}!${RESET}${ctx_compact_seg}"
+  ctx_compact_seg="${ctx_compact_seg} ${ctx_color}${remaining_disp}%${RESET}"
   ctx_seg="${GRAY}ctx${RESET} "
   ctx_plain="ctx "
   if [ -n "$ctx_warn" ]; then
     ctx_seg="${ctx_seg}${RED_BRIGHT}!${RESET}"
     ctx_plain="${ctx_plain}!"
   fi
-  remaining_disp=$(printf '%.0f' "$remaining")
   ctx_seg="${ctx_seg}${bar} ${ctx_color}${remaining_disp}%${RESET}"
-  ctx_plain="${ctx_plain}${bar_filled}${bar_empty} ${remaining_disp}%"
+  ctx_plain="${ctx_plain}${bar_plain} ${remaining_disp}%"
 fi
 
 # 9. token rate + sparkline, from the history file above (needs >=2
@@ -539,8 +1045,10 @@ fi
 # independently-optional halves joined by a space when both are present.
 # Sparkline: consecutive deltas (negative deltas, from a post-/compact
 # reset, clamp to 0) of the tokens column over the last up-to-9 rows (up to
-# 8 deltas), needs >=2 deltas, normalized min..max onto ▁▂▃▄▅▆▇█ (all-equal
-# -> all ▄), cyan. Rate: newest tokens minus the oldest row within the last
+# 8 deltas), needs >=2 deltas, normalized min..max onto 6 glyphs ▁▂▃▄▅▆
+# (all-equal -> all ▃; capped below ▇/█ so a full-height cell can't fuse
+# with an adjacent stacked line), cyan. Rate: newest tokens minus the
+# oldest row within the last
 # 5 minutes, divided by that span; needs span >=60s and a non-negative
 # delta. >=1000/min renders as "X.Yk/m" (rate10 computed as a single more
 # precise division rather than rate*10, to avoid double truncation), else
@@ -570,21 +1078,29 @@ if [ "$tok_count" -ge 2 ]; then
       [ "$dv" -lt "$min_d" ] && min_d=$dv
       [ "$dv" -gt "$max_d" ] && max_d=$dv
     done
-    glyph_chars2=("▁" "▂" "▃" "▄" "▅" "▆" "▇" "█")
+    # Capped at 6 levels (▁-▆, no ▇/█): with multiple rows stacked at zero
+    # line spacing (subagent grid), a full-height █ in one row can visually
+    # fuse with a bottom-aligned ▁ in the row below; stopping at ▆ keeps a
+    # >=1/4-cell gap at every cell top so rows can never connect. The ctx
+    # battery bar and rate-limit micro-bar keep █ - those are single-line
+    # gauges where this fusion can't happen.
+    glyph_chars2=("▁" "▂" "▃" "▄" "▅" "▆")
     if [ "$max_d" -eq "$min_d" ]; then
       for dv in "${deltas[@]}"; do
-        spark2_plain="${spark2_plain}▄"
+        spark2_plain="${spark2_plain}▃"
       done
     else
       d_range=$(( max_d - min_d ))
       for dv in "${deltas[@]}"; do
-        d_idx=$(( (dv - min_d) * 7 / d_range ))
+        d_idx=$(( (dv - min_d) * 5 / d_range ))
         [ "$d_idx" -lt 0 ] && d_idx=0
-        [ "$d_idx" -gt 7 ] && d_idx=7
+        [ "$d_idx" -gt 5 ] && d_idx=5
         spark2_plain="${spark2_plain}${glyph_chars2[$d_idx]}"
       done
     fi
-    spark2_seg="${CYAN}${spark2_plain}${RESET}"
+    # coloring deferred until the rate (below) is known - item 9: the
+    # sparkline shares the rate's tier color when a rate is present, cyan
+    # only when it renders alone
   fi
 fi
 
@@ -627,6 +1143,18 @@ if [ "$tok_count" -ge 2 ]; then
   fi
 fi
 
+# item 9: sparkline glyphs take the rate's tier color when a rate is
+# present, cyan only when the sparkline renders alone (no rate).
+spark2_seg=""
+if [ -n "$spark2_plain" ]; then
+  if [ -n "$rate_seg" ]; then
+    spark2_color="$rate_color"
+  else
+    spark2_color="$CYAN"
+  fi
+  spark2_seg="${spark2_color}${spark2_plain}${RESET}"
+fi
+
 tokrate_seg=""
 tokrate_plain=""
 if [ -n "$spark2_seg" ] && [ -n "$rate_seg" ]; then
@@ -641,25 +1169,183 @@ elif [ -n "$rate_seg" ]; then
 fi
 
 # 10. cache hit rate, from .context_window.current_usage (may be null or
-# absent - guarded by requiring all three numeric fields).
-cache_r=$(jqr '.context_window.current_usage.cache_read_input_tokens // empty')
-cache_w=$(jqr '.context_window.current_usage.cache_creation_input_tokens // empty')
-cache_i=$(jqr '.context_window.current_usage.input_tokens // empty')
+# absent - guarded by requiring all three numeric fields; already
+# extracted by the consolidated jq call above). One decimal place (integer
+# math only: hit10 = r*1000/denom, tier compares hit10/10 i.e. the integer
+# part, displayed as (hit10/10).(hit10%10)). Followed by a gray
+# " r<X>·w<Y>" read/write breakdown (existing k-or-M formatter), omitted
+# when both cache_read and cache_creation are 0/absent.
 cache_seg=""
 cache_plain=""
 if [[ "$cache_r" =~ ^[0-9]+$ ]] && [[ "$cache_w" =~ ^[0-9]+$ ]] && [[ "$cache_i" =~ ^[0-9]+$ ]]; then
   cache_denom=$(( cache_i + cache_w + cache_r ))
   if [ "$cache_denom" -gt 0 ]; then
-    cache_hit=$(( cache_r * 100 / cache_denom ))
-    if [ "$cache_hit" -ge 80 ]; then
+    cache_hit10=$(( cache_r * 1000 / cache_denom ))
+    cache_hit_int=$(( cache_hit10 / 10 ))
+    if [ "$cache_hit_int" -ge 80 ]; then
       cache_color="$GREEN"
-    elif [ "$cache_hit" -ge 50 ]; then
+    elif [ "$cache_hit_int" -ge 50 ]; then
       cache_color="$YELLOW"
     else
       cache_color="$RED_BRIGHT"
     fi
-    cache_seg="${GRAY}cache${RESET} ${cache_color}${cache_hit}%${RESET}"
-    cache_plain="cache ${cache_hit}%"
+    cache_hit_fmt="$(( cache_hit10 / 10 )).$(( cache_hit10 % 10 ))"
+    cache_seg="${GRAY}cache${RESET} ${cache_color}${cache_hit_fmt}%${RESET}"
+    cache_plain="cache ${cache_hit_fmt}%"
+    cache_rw_show=0
+    [ "$cache_r" -gt 0 ] && cache_rw_show=1
+    [ "$cache_w" -gt 0 ] && cache_rw_show=1
+    if [ "$cache_rw_show" -eq 1 ]; then
+      fmt_small_or_k "$cache_r"; cache_r_fmt="$REPLY"
+      fmt_small_or_k "$cache_w"; cache_w_fmt="$REPLY"
+      cache_seg="${cache_seg}${GRAY} r${cache_r_fmt}·w${cache_w_fmt}${RESET}"
+      cache_plain="${cache_plain} r${cache_r_fmt}·w${cache_w_fmt}"
+    fi
+  fi
+fi
+
+# ---------- shared tail-read for N3 (compaction counter) and N4 (cache
+# freshness countdown), both below: ONE `tail -c` spawn - one of only two
+# explicitly-accepted exceptions to this script's zero-external-process
+# policy (see the PERF comment at the top; the other is N4's `date -d`
+# below), because scanning transcript JSONL for these two features needs
+# its own file read that doesn't fit the single upfront jq/git calls.
+# SIMPLIFICATION DISCLOSED: the original request sketched a doubling
+# tail-read (32KiB, then 64/128/256, capped at 4 doublings, stopping once
+# a non-boundary line older than the first found boundary appears) to
+# raise confidence that no compaction boundary was missed just outside
+# the window; that would cost up to 5 `tail` spawns in the worst case,
+# which conflicts with this script's whole performance mandate, and the
+# same request separately concedes "1 tail spawn accepted" - so this
+# implementation takes ONE fixed 128KiB read instead. Both features
+# already accept and document a "may miss data outside the window"
+# limitation, so this is a difference of degree, not of kind. Silently
+# absent (both segments) when transcript_path is empty, unreadable, or
+# `tail` itself is missing.
+tail_lines=()
+if [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && command -v tail >/dev/null 2>&1; then
+  tail_block=$(tail -c 131072 -- "$transcript_path" 2>/dev/null)
+  tail_block=${tail_block//$'\r'/}
+  [ -n "$tail_block" ] && mapfile -t tail_lines <<< "$tail_block"
+fi
+
+# N3: compaction counter. Pure-bash substring scan (grep-free, as
+# specified) of tail_lines for `"subtype":"compact_boundary"` lines,
+# skipping any with `"isSidechain":true`; reclaimed tokens sum
+# preTokens-postTokens out of an embedded "compactMetadata" object when
+# both are present and numeric (found via #*"field": prefix-strip then
+# %%,* / %%}* suffix-strip - the same defensive "extract, then validate
+# with a numeric regex, else silently skip" pattern used everywhere else
+# in this script). LIMITATION (by design, documented): only boundaries
+# that happen to fall inside the tail window above are counted - a long-
+# running session's older compactions can scroll out of a 128KiB tail and
+# simply won't be seen; this is a lower bound, not an exact count.
+compact_count=0
+compact_reclaimed=0
+for tline in "${tail_lines[@]}"; do
+  [[ "$tline" == *'"subtype":"compact_boundary"'* ]] || continue
+  [[ "$tline" == *'"isSidechain":true'* ]] && continue
+  compact_count=$(( compact_count + 1 ))
+  pre_val=""
+  if [[ "$tline" == *'"preTokens":'* ]]; then
+    pre_rest="${tline#*\"preTokens\":}"
+    pre_val="${pre_rest%%,*}"
+    pre_val="${pre_val%%\}*}"
+    pre_val="${pre_val# }"
+  fi
+  post_val=""
+  if [[ "$tline" == *'"postTokens":'* ]]; then
+    post_rest="${tline#*\"postTokens\":}"
+    post_val="${post_rest%%,*}"
+    post_val="${post_val%%\}*}"
+    post_val="${post_val# }"
+  fi
+  if [[ "$pre_val" =~ ^[0-9]+$ ]] && [[ "$post_val" =~ ^[0-9]+$ ]] && [ "$pre_val" -ge "$post_val" ]; then
+    compact_reclaimed=$(( compact_reclaimed + (pre_val - post_val) ))
+  fi
+done
+compact_seg=""
+compact_plain=""
+if [ "$compact_count" -gt 0 ]; then
+  compact_seg="${GRAY}↻${RESET}${WHITE}${compact_count}${RESET}"
+  compact_plain="↻${compact_count}"
+  if [ "$compact_reclaimed" -gt 0 ]; then
+    fmt_k_or_m "$compact_reclaimed"; compact_reclaimed_fmt="$REPLY"
+    compact_seg="${compact_seg}${GRAY} ↓${RESET}${WHITE}${compact_reclaimed_fmt}${RESET}"
+    compact_plain="${compact_plain} ↓${compact_reclaimed_fmt}"
+  fi
+fi
+
+# N4: cache freshness countdown (TTL is an assumption, not a documented
+# API contract). Scans the SAME tail_lines, newest-first, for the most
+# recent assistant (non-sidechain) line that shows cache activity
+# (nonzero cache_read_input_tokens or cache_creation_input_tokens) and
+# has a parseable ISO "timestamp". remaining = ttl - 5 - (now - last);
+# ttl from $STATUSLINE_CACHE_TTL_SECONDS, default 3600. There is no
+# pure-bash ISO-8601 parse, so this is the one other accepted external-
+# process exception in this script: a single `date -d` spawn, fired only
+# when a candidate line was actually found (never on every render, and
+# never at all when the cache segment itself isn't showing). Appended to
+# the cache segment (10) above, space-separated, only when that segment
+# is itself already present - a bare countdown with no "cache N%" next
+# to it would be a floating, context-less fragment.
+if [ -n "$cache_seg" ] && [ "${#tail_lines[@]}" -gt 0 ] && command -v date >/dev/null 2>&1; then
+  cache_ts=""
+  for ((cfi=${#tail_lines[@]}-1; cfi>=0; cfi--)); do
+    tline="${tail_lines[$cfi]}"
+    [[ "$tline" == *'"type":"assistant"'* ]] || continue
+    [[ "$tline" == *'"isSidechain":true'* ]] && continue
+    cache_active=0
+    if [[ "$tline" == *'"cache_read_input_tokens":'* ]]; then
+      crv_rest="${tline#*\"cache_read_input_tokens\":}"
+      crv="${crv_rest%%,*}"; crv="${crv%%\}*}"; crv="${crv# }"
+      [[ "$crv" =~ ^[0-9]+$ ]] && [ "$crv" -gt 0 ] && cache_active=1
+    fi
+    if [ "$cache_active" -eq 0 ] && [[ "$tline" == *'"cache_creation_input_tokens":'* ]]; then
+      ccv_rest="${tline#*\"cache_creation_input_tokens\":}"
+      ccv="${ccv_rest%%,*}"; ccv="${ccv%%\}*}"; ccv="${ccv# }"
+      [[ "$ccv" =~ ^[0-9]+$ ]] && [ "$ccv" -gt 0 ] && cache_active=1
+    fi
+    [ "$cache_active" -eq 0 ] && continue
+    [[ "$tline" == *'"timestamp":"'* ]] || continue
+    ts_rest="${tline#*\"timestamp\":\"}"
+    ts_val="${ts_rest%%\"*}"
+    [ -n "$ts_val" ] && cache_ts="$ts_val" && break
+  done
+  if [ -n "$cache_ts" ]; then
+    cache_ts_epoch=$(date -d "$cache_ts" +%s 2>/dev/null)
+    if [[ "$cache_ts_epoch" =~ ^[0-9]+$ ]]; then
+      cache_ttl="${STATUSLINE_CACHE_TTL_SECONDS:-3600}"
+      [[ "$cache_ttl" =~ ^[0-9]+$ ]] || cache_ttl=3600
+      cache_remaining=$(( cache_ttl - 5 - (now_epoch - cache_ts_epoch) ))
+      if [ "$cache_remaining" -le 0 ]; then
+        cache_fresh_text="cold"
+        cache_fresh_color="$GRAY"
+      else
+        if [ "$cache_remaining" -lt 60 ]; then
+          cache_fresh_text="${cache_remaining}s"
+        else
+          cf_m=$(( cache_remaining / 60 ))
+          cf_s=$(( cache_remaining % 60 ))
+          if [ "$cf_m" -ge 60 ]; then
+            cache_fresh_text="${cf_m}m"
+          else
+            cache_fresh_text="${cf_m}m${cf_s}s"
+          fi
+        fi
+        cache_frac1000=0
+        [ "$cache_ttl" -gt 0 ] && cache_frac1000=$(( cache_remaining * 1000 / cache_ttl ))
+        if [ "$cache_frac1000" -gt 500 ]; then
+          cache_fresh_color="$WHITE"
+        elif [ "$cache_frac1000" -gt 200 ]; then
+          cache_fresh_color="$YELLOW"
+        else
+          cache_fresh_color="$RED_BRIGHT"
+        fi
+      fi
+      cache_seg="${cache_seg} ${cache_fresh_color}${cache_fresh_text}${RESET}"
+      cache_plain="${cache_plain} ${cache_fresh_text}"
+    fi
   fi
 fi
 
@@ -670,9 +1356,11 @@ fi
 # rate "$X.Y/h" from the history file (needs a same-session row with a
 # non-empty cost from >=120s ago within the last hour; cost strings are
 # parsed to integer cents in pure bash - see cost_to_cents above).
-cost=$(jqr '.cost.total_cost_usd // empty')
+# (cost already extracted by the consolidated jq call above). cost_compact
+# is the narrow-terminal variant (amount only, no rate).
 cost_seg=""
 cost_plain=""
+cost_compact_seg=""
 if [ -n "$cost" ]; then
   cost_int="${cost%%.*}"
   cost_color="$GRAY"
@@ -683,9 +1371,10 @@ if [ -n "$cost" ]; then
       cost_color="$YELLOW"
     fi
   fi
-  cost_amount=$(printf '%.2f' "$cost")
+  printf -v cost_amount '%.2f' "$cost"
   cost_seg="\$${cost_color}${cost_amount}${RESET}"
   cost_plain="\$${cost_amount}"
+  cost_compact_seg="$cost_seg"
 
   costrate_seg=""
   costrate_plain=""
@@ -705,8 +1394,10 @@ if [ -n "$cost" ]; then
       old_cost=${cost_values[$cost_oldest_idx]}
       old_cost_epoch=${cost_epochs[$cost_oldest_idx]}
       span_c=$(( newest_cost_epoch - old_cost_epoch ))
-      newest_cents=$(cost_to_cents "$newest_cost" 2>/dev/null)
-      old_cents=$(cost_to_cents "$old_cost" 2>/dev/null)
+      newest_cents=""
+      cost_to_cents "$newest_cost" && newest_cents="$REPLY"
+      old_cents=""
+      cost_to_cents "$old_cost" && old_cents="$REPLY"
       if [[ "$newest_cents" =~ ^[0-9]+$ ]] && [[ "$old_cents" =~ ^[0-9]+$ ]]; then
         delta_cents=$(( newest_cents - old_cents ))
         if [ "$span_c" -ge 120 ] && [ "$delta_cents" -ge 0 ]; then
@@ -730,19 +1421,32 @@ if [ -n "$cost" ]; then
     cost_seg="${cost_seg} ${costrate_seg}"
     cost_plain="${cost_plain} ${costrate_plain}"
   fi
+  # zero-hide: amount rounds to 0.00 AND no rate is displayable -> hide
+  # the whole segment (compact variant included).
+  if [ "$cost_amount" = "0.00" ] && [ -z "$costrate_seg" ]; then
+    cost_seg=""
+    cost_plain=""
+    cost_compact_seg=""
+  fi
 fi
 
 # 12. lines changed (shown once either field is present; missing side defaults
 # to 0) - "+added" green, "/" uncolored, "-removed" red.
-added=$(jqr '.cost.total_lines_added // empty')
-removed=$(jqr '.cost.total_lines_removed // empty')
+# (added/removed already extracted by the consolidated jq call above)
 lines_seg=""
 lines_plain=""
 if [ -n "$added" ] || [ -n "$removed" ]; then
   [ -z "$added" ] && added=0
   [ -z "$removed" ] && removed=0
-  lines_seg="${GREEN}+${added}${RESET}/${RED}-${removed}${RESET}"
-  lines_plain="+${added}/-${removed}"
+  # zero-hide: both zero -> hide the whole segment
+  added_is_zero=0
+  [[ "$added" =~ ^[0-9]+$ ]] && [ "$added" -eq 0 ] && added_is_zero=1
+  removed_is_zero=0
+  [[ "$removed" =~ ^[0-9]+$ ]] && [ "$removed" -eq 0 ] && removed_is_zero=1
+  if [ "$added_is_zero" -eq 0 ] || [ "$removed_is_zero" -eq 0 ]; then
+    lines_seg="${GREEN}+${added}${RESET}/${RED}-${removed}${RESET}"
+    lines_plain="+${added}/-${removed}"
+  fi
 fi
 
 # 13. rate limits (each window independently optional, each with an optional
@@ -751,12 +1455,23 @@ fi
 # by that window's own floor(used_percentage) (<50 green, 50-79 yellow, >=80
 # bright red); "→reset" (arrow included) is white. Windows are still joined
 # by a plain space.
-five=$(jqr '.rate_limits.five_hour.used_percentage // empty')
-five_reset=$(jqr '.rate_limits.five_hour.resets_at // empty')
-week=$(jqr '.rate_limits.seven_day.used_percentage // empty')
-week_reset=$(jqr '.rate_limits.seven_day.resets_at // empty')
+# (five/five_reset/week/week_reset already extracted by the consolidated
+# jq call above). PACE CURSOR: for a window with a valid resets_at,
+# time_pct = how far through the window we are (0..100, clamped);
+# pace = used% - time%. pace>=15 forces bright red; 0<pace<15 forces at
+# least yellow (never downgrades an already-red absolute tier); pace<=0
+# keeps the absolute tier. The pace suffix "·t<N>%" (gray) is appended
+# after the usage percent, before the "→reset" suffix. (A 6-cell micro
+# progress bar was tried here and reverted after visual review - two
+# meanings in one glyph row, and the time cursor landing inside the
+# filled zone when time lags usage read as a rendering glitch rather than
+# a pace signal - back to the textual form.) five_compact/week_compact
+# are the narrow-terminal variants (percent only, pace-aware color, no
+# label/pace-suffix/reset-time) - only five_compact is actually used (the
+# compact line only shows the 5h window).
 rl_seg=""
 rl_plain=""
+five_compact_seg=""
 if [ -n "$five" ]; then
   five_int="${five%%.*}"
   five_color="$GREEN"
@@ -767,11 +1482,35 @@ if [ -n "$five" ]; then
       five_color="$YELLOW"
     fi
   fi
-  five_pct=$(printf '%.0f' "$five")
-  five_part="${CYAN}5h${RESET} ${five_color}${five_pct}%${RESET}"
-  five_part_plain="5h ${five_pct}%"
+  printf -v five_pct '%.0f' "$five"
+  # REVERTED (N1 micro-bar rejected on visual review: two meanings in one
+  # glyph row, and the cursor landing inside the filled zone when time
+  # lags usage read as a rendering glitch, not a pace indicator). Back to
+  # the textual pace cursor "·tNN%" (gray) appended after the usage
+  # percent: "5h 47%·t94%->09:10". Pace tier-override logic (used for the
+  # percent's own color) is unchanged.
+  five_pace_seg=""
+  five_pace_plain=""
   if [[ "$five_reset" =~ ^[0-9]+$ ]]; then
-    five_clock=$(date -d "@$five_reset" +%H:%M)
+    five_time_pct=$(( (18000 - (five_reset - now_epoch)) * 100 / 18000 ))
+    [ "$five_time_pct" -lt 0 ] && five_time_pct=0
+    [ "$five_time_pct" -gt 100 ] && five_time_pct=100
+    five_pace_seg="${GRAY}·t${five_time_pct}%${RESET}"
+    five_pace_plain="·t${five_time_pct}%"
+    if [[ "$five_int" =~ ^[0-9]+$ ]]; then
+      five_pace=$(( five_int - five_time_pct ))
+      if [ "$five_pace" -ge 15 ]; then
+        five_color="$RED_BRIGHT"
+      elif [ "$five_pace" -gt 0 ] && [ "$five_color" != "$RED_BRIGHT" ]; then
+        five_color="$YELLOW"
+      fi
+    fi
+  fi
+  five_part="${CYAN}5h${RESET} ${five_color}${five_pct}%${RESET}${five_pace_seg}"
+  five_part_plain="5h ${five_pct}%${five_pace_plain}"
+  five_compact_seg="${five_color}${five_pct}%${RESET}"
+  if [[ "$five_reset" =~ ^[0-9]+$ ]]; then
+    printf -v five_clock '%(%H:%M)T' "$five_reset"
     five_part="${five_part}${WHITE}→${five_clock}${RESET}"
     five_part_plain="${five_part_plain}→${five_clock}"
   fi
@@ -788,11 +1527,30 @@ if [ -n "$week" ]; then
       week_color="$YELLOW"
     fi
   fi
-  week_pct=$(printf '%.0f' "$week")
-  week_part="${CYAN}7d${RESET} ${week_color}${week_pct}%${RESET}"
-  week_part_plain="7d ${week_pct}%"
+  printf -v week_pct '%.0f' "$week"
+  # REVERTED (N1 micro-bar rejected - see the 5h window's comment above).
+  # Back to the textual pace cursor "·tNN%".
+  week_pace_seg=""
+  week_pace_plain=""
   if [[ "$week_reset" =~ ^[0-9]+$ ]]; then
-    week_clock=$(date -d "@$week_reset" +%m-%d)
+    week_time_pct=$(( (604800 - (week_reset - now_epoch)) * 100 / 604800 ))
+    [ "$week_time_pct" -lt 0 ] && week_time_pct=0
+    [ "$week_time_pct" -gt 100 ] && week_time_pct=100
+    week_pace_seg="${GRAY}·t${week_time_pct}%${RESET}"
+    week_pace_plain="·t${week_time_pct}%"
+    if [[ "$week_int" =~ ^[0-9]+$ ]]; then
+      week_pace=$(( week_int - week_time_pct ))
+      if [ "$week_pace" -ge 15 ]; then
+        week_color="$RED_BRIGHT"
+      elif [ "$week_pace" -gt 0 ] && [ "$week_color" != "$RED_BRIGHT" ]; then
+        week_color="$YELLOW"
+      fi
+    fi
+  fi
+  week_part="${CYAN}7d${RESET} ${week_color}${week_pct}%${RESET}${week_pace_seg}"
+  week_part_plain="7d ${week_pct}%${week_pace_plain}"
+  if [[ "$week_reset" =~ ^[0-9]+$ ]]; then
+    printf -v week_clock '%(%m-%d)T' "$week_reset"
     week_part="${week_part}${WHITE}→${week_clock}${RESET}"
     week_part_plain="${week_part_plain}→${week_clock}"
   fi
@@ -805,10 +1563,270 @@ if [ -n "$week" ]; then
   fi
 fi
 
+# Maps a cached usage-API model key to a 3-char label ("Son"/"Opu"/"Fab"/
+# "Hai" for the known model families, matched as a case-insensitive
+# substring so "claude-sonnet-4-5" etc. all resolve the same way; an
+# unrecognized name takes its OWN first 3 characters, first letter
+# capitalized and the rest lowercased). NO-FORK RETURN via REPLY.
+wk_label_for() {
+  local key_lc="${1,,}"
+  case "$key_lc" in
+    *sonnet*) REPLY="Son" ;;
+    *opus*) REPLY="Opu" ;;
+    *fable*) REPLY="Fab" ;;
+    *haiku*) REPLY="Hai" ;;
+    *)
+      local raw="$1" first3 f rest
+      first3="${raw:0:3}"
+      f="${first3:0:1}"
+      rest="${first3:1}"
+      REPLY="${f^}${rest,,}"
+      ;;
+  esac
+}
+
+# N2: OAuth weekly/extra usage (UNOFFICIAL API - included only by explicit
+# user consent; the exact response shape below is a best-effort guess,
+# not documented, and everything is guarded to degrade to "segment
+# absent" rather than show garbage if that guess is wrong). Cache-and-
+# background-refresh, modeled on the PR CI cache above: a single-row
+# ~/.claude/statusline-usage-cache (epoch, extra_en, extra_used,
+# extra_limit, then a VARIABLE-length tail of alternating model-name/
+# percent pairs - one pair per model the API reported - real tabs from
+# jq's @tsv on the write side, converted to the Unit Separator on this
+# read side for the same empty-field-safety reason documented at the
+# subagent script's task-row extraction; read into an ARRAY here, not
+# fixed named fields, since the model count varies), refreshed by a
+# fully detached/disowned background job so the render never waits on
+# network. "Fresh" (<180s old) skips firing another refresh this render;
+# the cached numbers stay SHOWN for up to 30 minutes even while stale-
+# and-refreshing, so one slow/failed network call can't blank the
+# segment outright. Missing/older-than-30min cache -> segment absent
+# entirely. NOTE: this cache format is a breaking change from an earlier
+# fixed sonnet/opus/fable layout - an old-format cache file left over
+# from before this change parses as harmless nonsense (fails the numeric
+# guards below) rather than garbage output, and self-heals on the next
+# background refresh (<=180s).
+usage_cache_file="$HOME/.claude/statusline-usage-cache"
+usage_backoff_file="$HOME/.claude/statusline-usage-backoff"
+wk_seg=""
+wk_plain=""
+usage_needs_refresh=1
+if [ -f "$usage_cache_file" ]; then
+  usage_line=""
+  read -r usage_line < "$usage_cache_file"
+  usage_line=${usage_line//$'\r'/}
+  usage_line=${usage_line//$'\t'/$'\x1f'}
+  IFS=$'\x1f' read -r -a usage_fields <<< "$usage_line"
+  usage_epoch="${usage_fields[0]}"
+  if [[ "$usage_epoch" =~ ^[0-9]+$ ]]; then
+    usage_age=$(( now_epoch - usage_epoch ))
+    [ "$usage_age" -lt 180 ] && usage_needs_refresh=0
+    if [ "$usage_age" -le 1800 ]; then
+      usage_extra_en="${usage_fields[1]}"
+      usage_extra_used="${usage_fields[2]}"
+      usage_extra_limit="${usage_fields[3]}"
+      usage_field_count=${#usage_fields[@]}
+
+      # Find the current session's model among the cached per-model
+      # entries (fields[4]/[5] = name1/pct1, fields[6]/[7] = name2/pct2,
+      # ...): case-insensitive SUBSTRING match, either direction, since
+      # the session's display name ("Fable 5") and the usage API's own
+      # model key ("fable") are unlikely to match exactly.
+      current_model_idx=-1
+      current_model_pct=""
+      if [ -n "$model" ]; then
+        model_lc="${model,,}"
+        for ((fi=4; fi<usage_field_count; fi+=2)); do
+          m_name="${usage_fields[$fi]}"
+          [ -z "$m_name" ] && continue
+          m_name_lc="${m_name,,}"
+          if [[ "$model_lc" == *"$m_name_lc"* ]] || [[ "$m_name_lc" == *"$model_lc"* ]]; then
+            current_model_idx=$fi
+            current_model_pct="${usage_fields[$((fi+1))]}"
+            break
+          fi
+        done
+      fi
+
+      # OTHER models (not the current one) qualify only at >=50% usage
+      # (an approaching-limit warning); collected then selection-sorted
+      # descending by percent - the candidate count is always tiny (a
+      # handful of models at most), so an O(n^2) pass is negligible and
+      # avoids array-splice bookkeeping for an insertion sort.
+      cand_names=()
+      cand_pcts=()
+      for ((fi=4; fi<usage_field_count; fi+=2)); do
+        [ "$fi" -eq "$current_model_idx" ] && continue
+        m_name="${usage_fields[$fi]}"
+        m_pct="${usage_fields[$((fi+1))]}"
+        [ -z "$m_name" ] && continue
+        [[ "$m_pct" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+        m_pct_int="${m_pct%%.*}"
+        [ "$m_pct_int" -lt 50 ] && continue
+        cand_names+=("$m_name")
+        cand_pcts+=("$m_pct")
+      done
+      cand_count=${#cand_names[@]}
+      cand_used=()
+      for ((ui=0; ui<cand_count; ui++)); do cand_used[ui]=0; done
+
+      wk_names=()
+      wk_pcts=()
+      if [ "$current_model_idx" -ge 0 ] && [[ "$current_model_pct" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        wk_names+=("${usage_fields[$current_model_idx]}")
+        wk_pcts+=("$current_model_pct")
+      fi
+      for ((round=0; round<cand_count; round++)); do
+        best_i=-1
+        best_int=-1
+        for ((ci=0; ci<cand_count; ci++)); do
+          [ "${cand_used[$ci]}" -eq 1 ] && continue
+          p_int="${cand_pcts[$ci]%%.*}"
+          if [ "$p_int" -gt "$best_int" ]; then
+            best_int=$p_int
+            best_i=$ci
+          fi
+        done
+        [ "$best_i" -lt 0 ] && break
+        cand_used[$best_i]=1
+        wk_names+=("${cand_names[$best_i]}")
+        wk_pcts+=("${cand_pcts[$best_i]}")
+      done
+
+      # per-model weekly percentages: cyan 3-char label (same label
+      # language as 5h/7d) + tiered percent (>=80 red / 50-79 yellow /
+      # <50 green, matching the other windows' tiering), space-joined -
+      # current model always first (when the cache has an entry for it),
+      # any others (>=50% only) follow, descending by usage. Whole
+      # segment stays absent (not a bare "wk") when neither exists.
+      wk_model_parts=""
+      wk_model_parts_plain=""
+      wk_count=${#wk_names[@]}
+      for ((wi=0; wi<wk_count; wi++)); do
+        m_name="${wk_names[$wi]}"
+        m_pct="${wk_pcts[$wi]}"
+        wk_label_for "$m_name"; wk_label="$REPLY"
+        m_pct_int="${m_pct%%.*}"
+        if [ "$m_pct_int" -ge 80 ]; then
+          wk_color="$RED_BRIGHT"
+        elif [ "$m_pct_int" -ge 50 ]; then
+          wk_color="$YELLOW"
+        else
+          wk_color="$GREEN"
+        fi
+        printf -v wk_val_disp '%.0f' "$m_pct"
+        wk_one="${CYAN}${wk_label}${RESET}${wk_color}${wk_val_disp}%${RESET}"
+        wk_one_plain="${wk_label}${wk_val_disp}%"
+        if [ -z "$wk_model_parts" ]; then
+          wk_model_parts="$wk_one"
+          wk_model_parts_plain="$wk_one_plain"
+        else
+          wk_model_parts="${wk_model_parts} ${wk_one}"
+          wk_model_parts_plain="${wk_model_parts_plain} ${wk_one_plain}"
+        fi
+      done
+      if [ -n "$wk_model_parts" ]; then
+        wk_seg="${GRAY}wk${RESET} ${wk_model_parts}"
+        wk_plain="wk ${wk_model_parts_plain}"
+      fi
+      # extra usage (cents/100, 2dp): gray "extra " + white "$used/$limit"
+      if [ "$usage_extra_en" = "1" ] && [[ "$usage_extra_used" =~ ^[0-9]+$ ]] && [[ "$usage_extra_limit" =~ ^[0-9]+$ ]]; then
+        printf -v extra_used_fmt '%d.%02d' "$(( usage_extra_used / 100 ))" "$(( usage_extra_used % 100 ))"
+        printf -v extra_limit_fmt '%d.%02d' "$(( usage_extra_limit / 100 ))" "$(( usage_extra_limit % 100 ))"
+        extra_seg="${GRAY}extra${RESET} ${WHITE}\$${extra_used_fmt}/\$${extra_limit_fmt}${RESET}"
+        extra_plain="extra \$${extra_used_fmt}/\$${extra_limit_fmt}"
+        if [ -n "$wk_seg" ]; then
+          wk_seg="${wk_seg} ${extra_seg}"
+          wk_plain="${wk_plain} ${extra_plain}"
+        else
+          wk_seg="$extra_seg"
+          wk_plain="$extra_plain"
+        fi
+      fi
+    fi
+  fi
+fi
+# Detached background refresh - fires when the cache is missing/stale
+# (see above) and we're not in a post-429 backoff window (marker file:
+# a single epoch, "retry no earlier than"). Never blocks the render.
+if [ "$usage_needs_refresh" -eq 1 ] && command -v curl >/dev/null 2>&1; then
+  usage_backoff_until=0
+  if [ -f "$usage_backoff_file" ]; then
+    usage_bo_line=""
+    read -r usage_bo_line < "$usage_backoff_file"
+    usage_bo_line=${usage_bo_line//$'\r'/}
+    [[ "$usage_bo_line" =~ ^[0-9]+$ ]] && usage_backoff_until="$usage_bo_line"
+  fi
+  if [ "$now_epoch" -ge "$usage_backoff_until" ]; then
+    (
+      cred_file="$HOME/.claude/.credentials.json"
+      if [ -f "$cred_file" ] && command -v jq >/dev/null 2>&1; then
+        oauth_token=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred_file" 2>/dev/null)
+        if [ -n "$oauth_token" ]; then
+          usage_hdr_tmp="$HOME/.claude/.statusline-usage-hdr.$$.tmp"
+          usage_body_tmp="$HOME/.claude/.statusline-usage-body.$$.tmp"
+          usage_http_code=$(curl -sS -m 5 -D "$usage_hdr_tmp" -o "$usage_body_tmp" -w '%{http_code}' \
+            -H "Authorization: Bearer $oauth_token" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+          if [ "$usage_http_code" = "429" ]; then
+            usage_retry_secs=300
+            if [ -f "$usage_hdr_tmp" ]; then
+              usage_ra_line=$(grep -i '^Retry-After:' "$usage_hdr_tmp" 2>/dev/null | tail -n1)
+              usage_ra_val="${usage_ra_line#*:}"
+              usage_ra_val="${usage_ra_val//[$'\r\n\t ']/}"
+              [[ "$usage_ra_val" =~ ^[0-9]+$ ]] && usage_retry_secs="$usage_ra_val"
+            fi
+            printf -v usage_bo_now '%(%s)T' -1
+            usage_bo_epoch=$(( usage_bo_now + usage_retry_secs ))
+            printf '%s\n' "$usage_bo_epoch" > "${usage_backoff_file}.tmp.$$" 2>/dev/null && mv -f "${usage_backoff_file}.tmp.$$" "$usage_backoff_file" 2>/dev/null
+          elif [ "$usage_http_code" = "200" ] && [ -f "$usage_body_tmp" ]; then
+            # Best-effort shape: EVERY .limits[]? entry with kind==
+            # "weekly_scoped" is kept (dynamic model list, not just
+            # sonnet/opus/fable - the render side maps whatever name
+            # shows up here to a 3-char label, with the current session's
+            # model always shown and others only past the 50% warning
+            # threshold), keyed by scope.model.display_name (falling back
+            # to scope.model.id); a placeholder entry (percent==0 AND
+            # resets_at==null) is discarded, not treated as a real 0%. If
+            # the API reports no weekly_scoped entries at all, falls back
+            # to the legacy .seven_day_sonnet/.seven_day_opus fields.
+            # Output: extra_en, extra_used, extra_limit, then alternating
+            # model-name/percent pairs (@tsv - real tabs; the render side
+            # converts to the Unit Separator, same as everywhere else).
+            usage_parsed=$(jq -r '
+              def mname: (.scope.model.display_name // .scope.model.id // "unknown");
+              ([.limits[]? | select(.kind=="weekly_scoped")
+                 | select(((.percent // 0) == 0 and (.resets_at // null) == null) | not)
+                 | [mname, ((.percent // 0) | tostring)]]) as $wk
+              | (if ($wk | length) > 0 then $wk else
+                  ([ if .seven_day_sonnet then ["sonnet", ((.seven_day_sonnet.percent // .seven_day_sonnet) | tostring)] else empty end,
+                     if .seven_day_opus then ["opus", ((.seven_day_opus.percent // .seven_day_opus) | tostring)] else empty end ])
+                end) as $models
+              | ([
+                  (if (.extra_usage.is_enabled // false) == true then "1" else "0" end),
+                  ((.extra_usage.used_credits // 0) | floor | tostring),
+                  ((.extra_usage.monthly_limit // 0) | floor | tostring)
+                ] + ($models | flatten)) | @tsv
+            ' "$usage_body_tmp" 2>/dev/null)
+            if [ -n "$usage_parsed" ]; then
+              printf -v usage_write_epoch '%(%s)T' -1
+              printf '%s\t%s\n' "$usage_write_epoch" "$usage_parsed" > "${usage_cache_file}.tmp.$$" 2>/dev/null && mv -f "${usage_cache_file}.tmp.$$" "$usage_cache_file" 2>/dev/null
+            fi
+          fi
+          rm -f "$usage_hdr_tmp" "$usage_body_tmp" 2>/dev/null
+        fi
+      fi
+    ) >/dev/null 2>&1 &
+    disown
+  fi
+fi
+
 # 14. session name - gray, prefixed with a "» " marker (both inside the
 # same gray span) so the AI-generated name doesn't read like a bare stray
 # system message at the end of the line.
-session_name=$(jqr '.session_name // empty')
+# (session_name already extracted by the consolidated jq call above)
 session_name_plain=""
 if [ -n "$session_name" ]; then
   session_name_plain="» ${session_name}"
@@ -831,84 +1849,139 @@ fi
 # this script's non-last-cell segments are expected to contain CJK text
 # in practice (session_name is always the last cell on line 3 anyway, so
 # it is never padded regardless).
-SEP="${RESET}${GRAY} | ${RESET}"
+SEP="${RESET}${GRAY}${NBSP}|${NBSP}${RESET}"
 
-# Line 1: identity/location
-parts1=()
-parts1_plain=()
-[ -n "$clock" ]        && { parts1+=("$clock"); parts1_plain+=("$clock_plain"); }
-[ -n "$model_seg" ]    && { parts1+=("$model_seg"); parts1_plain+=("$model_plain"); }
-[ -n "$dir_display" ]  && { parts1+=("$dir_display"); parts1_plain+=("$dir_plain"); }
-[ -n "$wt_seg" ]       && { parts1+=("$wt_seg"); parts1_plain+=("$wt_plain"); }
-[ -n "$repo" ]         && { parts1+=("$repo"); parts1_plain+=("$repo_plain"); }
-[ -n "$branch" ]       && { parts1+=("$branch"); parts1_plain+=("$branch_plain"); }
-[ -n "$pr_seg" ]       && { parts1+=("$pr_seg"); parts1_plain+=("$pr_plain"); }
+# NARROW-TERMINAL ADAPTIVE: $COLUMNS is set by Claude Code (v2.1.153+) to
+# the actual rendered width; falls back to 120 (matching this script's
+# other columns-default) if unset/non-numeric. Under 100 columns, skip the
+# 3-line aligned grid entirely and emit ONE compact line built from the
+# *_compact_seg variants computed alongside their full segments above
+# (same colors, same omission rules, no alignment/padding pass at all).
+[[ "$COLUMNS" =~ ^[0-9]+$ ]] || COLUMNS=120
 
-# Line 2: context engine
-parts2=()
-parts2_plain=()
-[ -n "$ctx_seg" ]     && { parts2+=("$ctx_seg"); parts2_plain+=("$ctx_plain"); }
-[ -n "$tokrate_seg" ] && { parts2+=("$tokrate_seg"); parts2_plain+=("$tokrate_plain"); }
-[ -n "$cache_seg" ]   && { parts2+=("$cache_seg"); parts2_plain+=("$cache_plain"); }
-
-# Line 3: spend/quota
-parts3=()
-parts3_plain=()
-[ -n "$cost_seg" ]     && { parts3+=("$cost_seg"); parts3_plain+=("$cost_plain"); }
-[ -n "$lines_seg" ]    && { parts3+=("$lines_seg"); parts3_plain+=("$lines_plain"); }
-[ -n "$rl_seg" ]       && { parts3+=("$rl_seg"); parts3_plain+=("$rl_plain"); }
-[ -n "$session_name" ] && { parts3+=("$session_name"); parts3_plain+=("$session_name_plain"); }
-
-max_cols=${#parts1[@]}
-[ "${#parts2[@]}" -gt "$max_cols" ] && max_cols=${#parts2[@]}
-[ "${#parts3[@]}" -gt "$max_cols" ] && max_cols=${#parts3[@]}
-
-col_widths=()
-for ((ci=0; ci<max_cols; ci++)); do
-  w=0
-  if [ "$ci" -lt "${#parts1_plain[@]}" ]; then
-    l=$(disp_width "${parts1_plain[$ci]}")
-    [ "$l" -gt "$w" ] && w=$l
+if [ "$COLUMNS" -lt 100 ]; then
+  dir_last_plain=""
+  if [ "${#dir_final_comps[@]}" -gt 0 ]; then
+    dir_last_plain="${dir_final_comps[$((${#dir_final_comps[@]}-1))]}"
   fi
-  if [ "$ci" -lt "${#parts2_plain[@]}" ]; then
-    l=$(disp_width "${parts2_plain[$ci]}")
-    [ "$l" -gt "$w" ] && w=$l
-  fi
-  if [ "$ci" -lt "${#parts3_plain[@]}" ]; then
-    l=$(disp_width "${parts3_plain[$ci]}")
-    [ "$l" -gt "$w" ] && w=$l
-  fi
-  col_widths+=("$w")
-done
+  compact_parts=()
+  [ -n "$clock" ]          && compact_parts+=("$clock")
+  [ -n "$model" ]          && compact_parts+=("${CYAN_BRIGHT}${model}${RESET}")
+  [ -n "$dir_last_plain" ] && compact_parts+=("${BLUE_BRIGHT}${dir_last_plain}${RESET}")
+  [ -n "$branch" ]         && compact_parts+=("$branch")
+  [ -n "$ctx_compact_seg" ] && compact_parts+=("$ctx_compact_seg")
+  [ -n "$cost_compact_seg" ] && compact_parts+=("$cost_compact_seg")
+  [ -n "$five_compact_seg" ] && compact_parts+=("$five_compact_seg")
 
-# Renders one line: $1/$2 are the NAMES of its colored/plain arrays
-# (nameref, bash 4.3+). Every cell but the last is right-padded with
-# spaces to col_widths[i] before the separator; the last cell is bare.
-render_line() {
-  local -n cparts="$1"
-  local -n pparts="$2"
-  local n=${#cparts[@]}
-  local out="" ci cell plen w pad padding
-  for ((ci=0; ci<n; ci++)); do
-    cell="${cparts[$ci]}"
-    if [ "$ci" -lt "$((n-1))" ]; then
-      plen=$(disp_width "${pparts[$ci]}")
-      w="${col_widths[$ci]}"
-      pad=$(( w - plen ))
-      padding=""
-      [ "$pad" -gt 0 ] && padding=$(printf '%*s' "$pad" '')
-      out="${out}${cell}${padding}${SEP}"
+  compact_line=""
+  for part in "${compact_parts[@]}"; do
+    if [ -z "$compact_line" ]; then
+      compact_line="$part"
     else
-      out="${out}${cell}"
+      compact_line="${compact_line}${SEP}${part}"
     fi
   done
-  printf '%s' "$out"
-}
+  printf '%s\n' "${RESET}${compact_line}${RESET}"
+else
+  # Line 1: identity/location
+  parts1=()
+  parts1_plain=()
+  [ -n "$clock" ]        && { parts1+=("$clock"); parts1_plain+=("$clock_plain"); }
+  [ -n "$model_seg" ]    && { parts1+=("$model_seg"); parts1_plain+=("$model_plain"); }
+  [ -n "$dir_display" ]  && { parts1+=("$dir_display"); parts1_plain+=("$dir_plain"); }
+  [ -n "$wt_seg" ]       && { parts1+=("$wt_seg"); parts1_plain+=("$wt_plain"); }
+  [ -n "$repo" ]         && { parts1+=("$repo"); parts1_plain+=("$repo_plain"); }
+  [ -n "$branch" ]       && { parts1+=("$branch"); parts1_plain+=("$branch_plain"); }
+  [ -n "$pr_seg" ]       && { parts1+=("$pr_seg"); parts1_plain+=("$pr_plain"); }
 
-line1=$(render_line parts1 parts1_plain)
-line2=$(render_line parts2 parts2_plain)
-line3=$(render_line parts3 parts3_plain)
+  # Line 2: context engine
+  parts2=()
+  parts2_plain=()
+  [ -n "$ctx_seg" ]     && { parts2+=("$ctx_seg"); parts2_plain+=("$ctx_plain"); }
+  [ -n "$tokrate_seg" ] && { parts2+=("$tokrate_seg"); parts2_plain+=("$tokrate_plain"); }
+  [ -n "$cache_seg" ]   && { parts2+=("$cache_seg"); parts2_plain+=("$cache_plain"); }
+  [ -n "$compact_seg" ] && { parts2+=("$compact_seg"); parts2_plain+=("$compact_plain"); }
 
-printf '%s\n' "${line1}${RESET}"
-[ -n "$line2" ] && printf '%s\n' "${line2}${RESET}"
-[ -n "$line3" ] && printf '%s\n' "${line3}${RESET}"
+  # Line 3: spend
+  parts3=()
+  parts3_plain=()
+  [ -n "$cost_seg" ]  && { parts3+=("$cost_seg"); parts3_plain+=("$cost_plain"); }
+  [ -n "$today_seg" ] && { parts3+=("$today_seg"); parts3_plain+=("$today_plain"); }
+  [ -n "$week_seg" ]  && { parts3+=("$week_seg"); parts3_plain+=("$week_plain"); }
+  [ -n "$lines_seg" ] && { parts3+=("$lines_seg"); parts3_plain+=("$lines_plain"); }
+
+  # Line 4: quota & session
+  parts4=()
+  parts4_plain=()
+  [ -n "$rl_seg" ]       && { parts4+=("$rl_seg"); parts4_plain+=("$rl_plain"); }
+  [ -n "$wk_seg" ]       && { parts4+=("$wk_seg"); parts4_plain+=("$wk_plain"); }
+  [ -n "$session_name" ] && { parts4+=("$session_name"); parts4_plain+=("$session_name_plain"); }
+
+  max_cols=${#parts1[@]}
+  [ "${#parts2[@]}" -gt "$max_cols" ] && max_cols=${#parts2[@]}
+  [ "${#parts3[@]}" -gt "$max_cols" ] && max_cols=${#parts3[@]}
+  [ "${#parts4[@]}" -gt "$max_cols" ] && max_cols=${#parts4[@]}
+
+  col_widths=()
+  for ((ci=0; ci<max_cols; ci++)); do
+    w=0
+    if [ "$ci" -lt "${#parts1_plain[@]}" ]; then
+      disp_width "${parts1_plain[$ci]}"; l="$REPLY"
+      [ "$l" -gt "$w" ] && w=$l
+    fi
+    if [ "$ci" -lt "${#parts2_plain[@]}" ]; then
+      disp_width "${parts2_plain[$ci]}"; l="$REPLY"
+      [ "$l" -gt "$w" ] && w=$l
+    fi
+    if [ "$ci" -lt "${#parts3_plain[@]}" ]; then
+      disp_width "${parts3_plain[$ci]}"; l="$REPLY"
+      [ "$l" -gt "$w" ] && w=$l
+    fi
+    if [ "$ci" -lt "${#parts4_plain[@]}" ]; then
+      disp_width "${parts4_plain[$ci]}"; l="$REPLY"
+      [ "$l" -gt "$w" ] && w=$l
+    fi
+    col_widths+=("$w")
+  done
+
+  # Renders one line: $1/$2 are the NAMES of its colored/plain arrays
+  # (nameref, bash 4.3+). Every cell but the last is right-padded with
+  # spaces to col_widths[i] before the separator; the last cell is bare.
+  # NO-FORK RETURN via global REPLY, same as every other helper in this
+  # script - called 4x/render (not per-loop), but its OWN inner loop is
+  # per-cell, and disp_width()/the padding printf inside that loop were
+  # both still forking per call before this fix.
+  render_line() {
+    local -n cparts="$1"
+    local -n pparts="$2"
+    local n=${#cparts[@]}
+    local out="" ci cell plen w pad padding
+    for ((ci=0; ci<n; ci++)); do
+      cell="${cparts[$ci]}"
+      if [ "$ci" -lt "$((n-1))" ]; then
+        disp_width "${pparts[$ci]}"; plen="$REPLY"
+        w="${col_widths[$ci]}"
+        pad=$(( w - plen ))
+        padding=""
+        if [ "$pad" -gt 0 ]; then
+          printf -v padding '%*s' "$pad" ''
+          padding=${padding// /$NBSP}
+        fi
+        out="${out}${cell}${padding}${SEP}"
+      else
+        out="${out}${cell}"
+      fi
+    done
+    REPLY="$out"
+  }
+
+  render_line parts1 parts1_plain; line1="$REPLY"
+  render_line parts2 parts2_plain; line2="$REPLY"
+  render_line parts3 parts3_plain; line3="$REPLY"
+  render_line parts4 parts4_plain; line4="$REPLY"
+
+  printf '%s\n' "${RESET}${line1}${RESET}"
+  [ -n "$line2" ] && printf '%s\n' "${RESET}${line2}${RESET}"
+  [ -n "$line3" ] && printf '%s\n' "${RESET}${line3}${RESET}"
+  [ -n "$line4" ] && printf '%s\n' "${RESET}${line4}${RESET}"
+fi

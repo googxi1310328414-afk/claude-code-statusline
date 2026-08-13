@@ -15,26 +15,74 @@ export LC_ALL=C.UTF-8
 # refresh covering ALL rows: {"columns": <number>, "tasks": [{...}, ...]}.
 # For each element of .tasks[] this script emits ONE compact JSON line to
 # stdout: {"id": "<task.id>", "content": "<ANSI row string>"}. Tasks without
-# an id produce no line. An empty/absent tasks array produces no output.
+# an id produce no line. An empty/absent tasks array produces no output. If
+# jq itself is missing, the script exits cleanly (0) with no output at all
+# - there's no id to key a fallback line on in this contract, unlike the
+# main script's single-line fallback.
+#
+# PERFORMANCE: THREE whole-payload jq invocations, not one per field/
+# task: one for the four payload-wide scalars (columns, majority_model,
+# total_tokens, tokened_count), one that emits a row of Unit-Separator-
+# delimited fields per task for every per-task field except tokenSamples
+# (id, identity, type, model, effort, status, startTime, tokenCount,
+# description - split per row via `read`, not a tjq() call per field; NOT
+# literal TSV/tab-delimited - see the extraction site's comment for why),
+# and one raw-JSON-per-task pass (`.tasks[]?` again, same order, indexed
+# in lockstep) kept only because tokenSamples' array-slicing/type-
+# checking doesn't fit a flat delimited row - PLUS one more small jq call
+# PER TASK for that tokenSamples parse specifically (disclosed exception:
+# "three total" is the whole-payload calls; a payload of N tasks is
+# 3+N jq invocations, not 3, because that one sub-parse doesn't fit a
+# flat row - see its own PERF comment further down). `date` is never
+# called - bash's own `printf '%(fmt)T' epoch` builtin (4.2+, zero
+# process spawns) is used everywhere a timestamp is needed.
+#
+# NO-FORK HELPER RETURNS: disp_width() and short_model() write to the
+# global REPLY variable instead of printf-to-stdout, and every call site
+# does `fn args; x="$REPLY"` - NEVER `x=$(fn args)`, because bash's
+# command substitution forks a subshell on MSYS2/Windows (~2.5ms each)
+# even around a pure-bash function with no external program in it.
+# disp_width() in particular is called per task in PASS 1 AND per
+# CHARACTER of a task's description in PASS 2's truncation loop, so
+# $(disp_width ...) was, before this conversion, capable of costing
+# dozens of forks for a single long description in a single row.
+# `printf -v var 'fmt' args` (never `var=$(printf ...)`) is used the same
+# way for every other formatted value, including the padding `%*s` form,
+# not just %()T dates.
+#
+# EXPECTED REMAINING SPAWN INVENTORY per render, after this pass: exactly
+# 3 + N jq invocations (N = task count, for the per-task tokenSamples
+# parse - see above; this is the one still-open item from the prior de-
+# spawn round, not new). Nothing else in this script forks: every helper
+# call, every %()T/%*s format, every per-task/per-character loop is a
+# bash builtin or parameter expansion.
 #
 # Per-task fields consumed: id, name, type, status, description, label,
 # startTime (unix seconds or milliseconds), tokenCount, contextWindowSize,
 # effort, model, tokenSamples (undocumented structure, defensively parsed).
 # cwd is part of the contract but unused here.
 #
-# Column layout: 6 FIXED semantic columns, 1=identity 2=spend 3=sparkline+
+# Column layout: up to 6 semantic columns, 1=identity 2=spend 3=sparkline+
 # rate 4=share 5=elapsed 6=description. Unlike the main script (which
 # omits-and-shifts), this script column-ALIGNS every row's " | "
 # separators against every OTHER row in the same payload: a two-pass
 # design first computes every task's 6 cells (colored + a parallel plain
 # twin, no ANSI/OSC 8, used only for width measurement), tracks the max
 # plain width per column (1-5; description is always last and never
-# padded) across ALL rows, then a second pass pads and emits each row. A
-# task missing a MIDDLE column (e.g. no token share) still renders an
-# EMPTY padded cell there (spaces + separator) so later present columns
-# stay aligned; only TRAILING absent columns (nothing from there to the
-# end of that row) are dropped entirely, and a row's last rendered cell is
-# never padded. Column widths are recomputed fresh every payload/refresh.
+# padded) across ALL rows, then determines which of columns 1-5 are
+# ACTIVE (at least one row's plain width there is >0) - any column no row
+# ever used is dropped from the layout entirely, for every row (no
+# placeholder cell, no separator; otherwise a column empty across the
+# WHOLE payload, e.g. token share with a single task, would still print
+# an empty padded cell and produce a stray "| |") - before a second pass
+# pads and emits each row using only the active columns. A task missing
+# an ACTIVE middle column (e.g. no token share on THIS row, but some
+# other row in the payload has it) still renders an EMPTY padded cell
+# there so later present columns stay aligned; only TRAILING absent
+# columns (nothing from there to the end of that row) are dropped per-
+# row, and a row's last rendered cell is never padded. Column widths and
+# which columns are active are both recomputed fresh every payload/
+# refresh.
 # Width is measured in true terminal DISPLAY cells via disp_width() (see
 # its own comment below), not raw character count, so East Asian wide/
 # fullwidth identity names and descriptions (this script's most likely
@@ -71,17 +119,22 @@ export LC_ALL=C.UTF-8
 #   3  sparkline + burn rate, ONE combined segment (each half
 #      independently optional; both absent -> segment empty for this
 #      row), joined by a single space when both are present. Sparkline
-#      (cyan) from .tokenSamples - defensively parsed (any failure or
-#      fewer than 2 usable numeric samples -> omitted silently, never
-#      crashes the row). Numbers come from raw numeric entries or from an
-#      object entry's .tokens/.tokenCount/.count/.value/.v field; the last
-#      8 are kept; if that subsequence is non-decreasing (a cumulative
-#      counter) it's converted to consecutive deltas first; the result is
-#      normalized min..max onto the 8 glyphs ▁▂▃▄▅▆▇█ (all-equal -> all
-#      ▄). Burn rate - only when tokenCount is numeric and elapsed seconds
+#      from .tokenSamples - defensively parsed (any failure or fewer than
+#      2 usable numeric samples -> omitted silently, never crashes the
+#      row). Numbers come from raw numeric entries or from an object
+#      entry's .tokens/.tokenCount/.count/.value/.v field; the last 8 are
+#      kept; if that subsequence is non-decreasing (a cumulative counter)
+#      it's converted to consecutive deltas first; the result is
+#      normalized min..max onto 6 glyphs ▁▂▃▄▅▆ (all-equal -> all ▃) -
+#      capped at ▆, never ▇/█, so a full-height cell in one row can't
+#      visually fuse with a bottom-aligned ▁ in the row above/below it
+#      when multiple task rows are stacked at zero line spacing. Burn
+#      rate - only when tokenCount is numeric and elapsed seconds
 #      >= 60: tokens/minute, shown as "N/m" or, at or above 1000/min, one
 #      decimal in k as "N.Nk/m"; colored by the integer per-minute rate:
-#      <5000 gray, 5000-14999 yellow, >=15000 bright red
+#      <5000 gray, 5000-14999 yellow, >=15000 bright red. The sparkline
+#      glyphs themselves take that SAME tier color when a rate is present;
+#      cyan only when the sparkline renders alone (no rate).
 #   4  token share "Σ<N>%" of this payload's total tokens - only when at
 #      least 2 tasks have a positive tokenCount and this task's own
 #      tokenCount and the payload total are both positive: "Σ" gray, "N%"
@@ -106,10 +159,18 @@ export LC_ALL=C.UTF-8
 #   ▸ 0.2.79 收尾与发布(local_agent) ● | 221k tok | ▁▂▄ 11.2k/m | Σ84% | 19m41s@07:41:30 | 描述…
 #
 # Colors are the basic 16-color ANSI palette via bash ANSI-C quoting
-# ($'\e[..m'); output is always plain %s - jq's -cn/--arg handles JSON
-# escaping of the embedded ANSI bytes.
+# ($'\e[..m'), and every row's content string starts with a leading
+# reset (defends against host/terminal dim-styling bleeding in). JSON
+# escaping of each row (id + content, including the embedded ANSI bytes)
+# is done inline in pure bash at the emit site (PASS 2, bottom of this
+# file), not via `jq -cn`/--arg - seeing PERF comment there for why.
 
 input=$(cat)
+
+# jq guard: if jq is missing, every row below is unusable - emit nothing
+# useful is impossible in this contract (no id to key a line on), so just
+# exit cleanly rather than erroring or hanging.
+command -v jq >/dev/null 2>&1 || exit 0
 
 RESET=$'\e[0m'
 GRAY=$'\e[90m'
@@ -119,25 +180,45 @@ CYAN=$'\e[36m'
 WHITE=$'\e[37m'
 RED_BRIGHT=$'\e[91m'
 MAGENTA_BRIGHT=$'\e[95m'
-SEP="${RESET}${GRAY} | ${RESET}"
+# N6: alignment padding and the grid separator's surrounding spaces use
+# NBSP (U+00A0), not a plain space, so VSCode-style terminals can't trim
+# them and break column alignment; semantic single spaces inside a
+# segment are left as plain spaces. disp_width() already counts NBSP as
+# 1 cell (codepoint 160, outside every wide/fullwidth range).
+NBSP=$'\xc2\xa0'
+SEP="${RESET}${GRAY}${NBSP}|${NBSP}${RESET}"
 
-columns=$(printf '%s' "$input" | jq -r '.columns // empty')
+# PERF: one jq call for the four payload-wide scalars instead of four; a
+# here-string (<<<) feeds jq without an extra forked stage (unlike a pipe
+# from another command), and the CR-strip is a parameter expansion instead
+# of `tr`, and the split is a here-string mapfile instead of a piped one.
+jq_g_out=$(jq -r '
+  (.columns // ""),
+  ([.tasks[]? | .model // empty | select(length>0)] | group_by(.) | max_by(length) | .[0] // ""),
+  ([.tasks[]? | .tokenCount // 0 | select(type=="number")] | add // 0 | tostring),
+  ([.tasks[]? | .tokenCount // empty | select(type=="number" and . > 0)] | length | tostring)
+' <<< "$input" 2>/dev/null)
+jq_g_out=${jq_g_out//$'\r'/}
+mapfile -t G <<< "$jq_g_out"
+columns="${G[0]}"
+majority_model="${G[1]}"
+total_tokens="${G[2]}"
+tokened_count="${G[3]}"
 [[ "$columns" =~ ^[0-9]+$ ]] || columns=120
-
-majority_model=$(printf '%s' "$input" | jq -r '[.tasks[]? | .model // empty | select(length>0)] | group_by(.) | max_by(length) | .[0] // empty')
-total_tokens=$(printf '%s' "$input" | jq -r '[.tasks[]? | .tokenCount // 0 | select(type=="number")] | add // 0')
-tokened_count=$(printf '%s' "$input" | jq -r '[.tasks[]? | .tokenCount // empty | select(type=="number" and . > 0)] | length')
 [[ "$total_tokens" =~ ^[0-9]+$ ]] || total_tokens=0
 [[ "$tokened_count" =~ ^[0-9]+$ ]] || tokened_count=0
 
-tjq() { printf '%s' "$task" | jq -r "$1"; }
-
+# NO-FORK RETURN via global REPLY (see disp_width's comment below for the
+# full rationale - every pure-bash helper in this script follows the same
+# pattern now: call sites do `short_model "$x"; y="$REPLY"`, never
+# `y=$(short_model "$x")`, since $(...) forks a subshell on MSYS2 even
+# around a pure-bash function).
 short_model() {
   local m="${1#claude-}"
   if [[ "$m" =~ ^(.*)-20[0-9]{6}$ ]]; then
     m="${BASH_REMATCH[1]}"
   fi
-  printf '%s' "$m"
+  REPLY="$m"
 }
 
 # True terminal DISPLAY width of a plain (no ANSI) string, in cells, for
@@ -154,10 +235,15 @@ short_model() {
 # matching how Windows Terminal's default (non-East-Asian-ambiguous-wide)
 # profile renders them - a terminal configured for East-Asian
 # ambiguous-wide would need those bumped to 2 to match its own rendering.
+# NO-FORK RETURN via global REPLY - this is the hottest helper in the
+# script (called per-task in PASS 1 AND per-CHARACTER in PASS 2's
+# description-cut loop); $(disp_width ...) forked a subshell PER CALL on
+# MSYS2 even though the function is pure bash, which for a long
+# description could mean dozens of forks for ONE cell of ONE row.
 disp_width() {
   local s="$1"
   if [[ "$s" != *[![:ascii:]]* ]]; then
-    printf '%s' "${#s}"
+    REPLY="${#s}"
     return
   fi
   local len=${#s} i c cp w total=0
@@ -185,10 +271,60 @@ disp_width() {
     fi
     total=$(( total + w ))
   done
-  printf '%s' "$total"
+  REPLY="$total"
 }
 
-mapfile -t all_tasks < <(printf '%s' "$input" | jq -c '.tasks[]?' 2>/dev/null | tr -d '\r')
+# PERF: two jq calls total for the whole task list (not per-field, not
+# per-task): raw compact JSON per task (all_tasks, needed only for the
+# tokenSamples sub-parse below, which stays its own small per-task call
+# since its array-slicing/type-checking logic doesn't fit a flat delimited
+# row), and ONE combined extraction (task_rows) for every other per-task
+# field, split per row via `read` instead of one tjq() call per field.
+# .tasks[]? is iterated identically (no filtering) by both queries, so
+# index i of all_tasks and task_rows always describe the same task.
+#
+# CANONICAL COLUMN ORDER - the jq array below and the `read` variable
+# list in the PASS 1 loop MUST stay exactly parallel; if a field is ever
+# added/removed/reordered, update BOTH sites together:
+#   1 id  2 identity  3 type  4 model  5 effort  6 status  7 startTime
+#   8 tokenCount  9 description
+#
+# NOT read as literal TSV, on purpose: @tsv (jq, below) is used only to
+# borrow its per-field backslash/tab/CR/LF ESCAPING (so a literal newline
+# or embedded tab typed into a task's description/name can never split a
+# row or misalign a column); every real separator tab @tsv inserts
+# BETWEEN fields (never inside one - an embedded one is the 2-char escape
+# by then) is then rewritten, in BASH after capture (a plain parameter-
+# expansion replace, matches a raw tab BYTE only - see below), to the
+# ASCII Unit Separator 0x1F. This rewrite is required, not cosmetic:
+# space/tab/newline are BASH "IFS-whitespace" characters, so
+# `IFS=$'\t' read -r a b c <<<...` silently COLLAPSES any run of
+# consecutive tabs - i.e. every empty field, and most tasks have several
+# (no type/model/effort is common) - into a single delimiter, shifting
+# every field after the first empty one into the wrong variable (this hit
+# production: status landing in the type slot, startTime in the model
+# slot, etc). 0x1F is not IFS-whitespace, so empty fields between two
+# 0x1F bytes are preserved exactly; the `read` below uses IFS=$'\x1f' to
+# match.
+all_tasks_out=$(jq -c '.tasks[]?' <<< "$input" 2>/dev/null)
+all_tasks_out=${all_tasks_out//$'\r'/}
+mapfile -t all_tasks <<< "$all_tasks_out"
+task_rows_out=$(jq -r '
+  .tasks[]? | [
+    (.id // ""),
+    (if (.name != null and .name != "") then .name elif (.label != null and .label != "") then .label elif (.type != null and .type != "") then .type else "" end),
+    (.type // ""),
+    (.model // ""),
+    (.effort // "" | tostring),
+    (.status // ""),
+    (.startTime // "" | tostring),
+    (.tokenCount // "" | tostring),
+    (.description // "")
+  ] | @tsv #z")
+' <<< "$input" 2>/dev/null)
+task_rows_out=${task_rows_out//$'\r'/}
+task_rows_out=${task_rows_out//$'\t'/$'\x1f'}
+mapfile -t task_rows <<< "$task_rows_out"
 
 # ---------- PASS 1: compute every row's 6 cells + track column maxima ----------
 ids=()
@@ -200,18 +336,19 @@ col3_c=(); col3_p=()   # token share
 col4_c=(); col4_p=()   # elapsed
 col_max=(0 0 0 0 0)
 
-for task in "${all_tasks[@]}"; do
-  id=$(tjq '.id // empty')
+task_count_total=${#all_tasks[@]}
+for ((ti=0; ti<task_count_total; ti++)); do
+  task="${all_tasks[$ti]}"
+  # Field order matches the CANONICAL COLUMN ORDER comment above exactly.
+  # IFS is the Unit Separator (0x1F), NOT tab - see that comment for why a
+  # literal tab here would silently corrupt any row with an empty field.
+  IFS=$'\x1f' read -r id identity_plain task_type model effort status start_time token_count description <<< "${task_rows[$ti]}"
   [ -z "$id" ] && continue
 
   # column 1: identity segment: "▸ " + identity (bright magenta) + "(type)"
   # (gray) + "·"+short-model (cyan, only when minority) + "·"+effort
   # (heat-colored) + " "+status glyph
-  identity_plain=$(tjq 'if (.name != null and .name != "") then .name elif (.label != null and .label != "") then .label elif (.type != null and .type != "") then .type else empty end')
-  task_type=$(tjq '.type // empty')
-  model=$(tjq '.model // empty')
-  effort=$(tjq '.effort // empty')
-  status=$(tjq '.status // empty')
+  # (identity_plain/task_type/model/effort/status split from task_rows above)
   seg1_plain=""
   seg1=""
   if [ -n "$identity_plain" ]; then
@@ -224,7 +361,7 @@ for task in "${all_tasks[@]}"; do
     fi
 
     if [ -n "$model" ] && [ "$model" != "$majority_model" ]; then
-      model_short=$(short_model "$model")
+      short_model "$model"; model_short="$REPLY"
       seg1_plain="${seg1_plain}·${model_short}"
       seg1="${seg1}${GRAY}·${RESET}${CYAN}${model_short}${RESET}"
     fi
@@ -258,7 +395,7 @@ for task in "${all_tasks[@]}"; do
   # column 2: raw cumulative spend - unconditional whenever tokenCount is
   # numeric; no context-window battery/percentage (tokenCount is
   # cumulative spend, not occupancy; contextWindowSize is not read).
-  token_count=$(tjq '.tokenCount // empty')
+  # (token_count already split from task_rows above)
   spend_seg=""
   spend_plain=""
   if [[ "$token_count" =~ ^[0-9]+$ ]]; then
@@ -270,7 +407,7 @@ for task in "${all_tasks[@]}"; do
   # (shared) elapsed seconds since startTime; values > 1e12 treated as ms.
   # Computed here (ahead of the burn-rate half of column 3, which needs
   # elapsed_s) even though the elapsed segment itself sits in column 5.
-  start_time=$(tjq '.startTime // empty')
+  # (start_time already split from task_rows above)
   elapsed_s=""
   elapsed_seg=""
   elapsed_text=""
@@ -280,7 +417,7 @@ for task in "${all_tasks[@]}"; do
     if [ "$start_time" -gt 1000000000000 ]; then
       start_s=$(( start_time / 1000 ))
     fi
-    now_s=$(date +%s)
+    printf -v now_s '%(%s)T' -1
     elapsed_s=$(( now_s - start_s ))
     [ "$elapsed_s" -lt 0 ] && elapsed_s=0
     if [ "$elapsed_s" -lt 60 ]; then
@@ -290,7 +427,7 @@ for task in "${all_tasks[@]}"; do
     else
       elapsed_text="$(( elapsed_s / 3600 ))h$(( (elapsed_s % 3600) / 60 ))m$(( elapsed_s % 60 ))s"
     fi
-    start_clock=$(date -d "@$start_s" +%H:%M:%S 2>/dev/null)
+    printf -v start_clock '%(%H:%M:%S)T' "$start_s" 2>/dev/null
     elapsed_seg="${WHITE}${elapsed_text}${RESET}"
     elapsed_plain="$elapsed_text"
     if [ -n "$start_clock" ]; then
@@ -301,19 +438,30 @@ for task in "${all_tasks[@]}"; do
 
   # column 3: sparkline + burn rate, ONE combined segment (each half
   # independently optional), matching the main script's token-rate layout.
+  # PERF: the tokenSamples extraction, the >=2-usable-numbers check, and
+  # the last-8 slice are now ONE jq call (this is the only per-task jq
+  # call left; it can't be folded into the whole-payload TSV extraction
+  # above because its array-slicing/type-checking doesn't fit a flat
+  # field). If fewer than 2 valid numbers exist, this jq program
+  # deliberately produces no output at all; the resulting empty herestring
+  # still yields one empty-string array element after mapfile, which the
+  # numeric-regex validation below naturally rejects, so no special-casing
+  # is needed for that case.
   spark_seg=""
   spark_plain=""
-  numbers=$(printf '%s' "$task" | jq -c '[.tokenSamples[]? | if type=="number" then . elif type=="object" then (.tokens // .tokenCount // .count // .value // .v // empty) else empty end | select(type=="number")]' 2>/dev/null)
-  if [ -n "$numbers" ]; then
-    num_count=$(printf '%s' "$numbers" | jq 'length' 2>/dev/null)
-    if [[ "$num_count" =~ ^[0-9]+$ ]] && [ "$num_count" -ge 2 ]; then
-      mapfile -t nums < <(printf '%s' "$numbers" | jq -r '.[-8:] | .[]' 2>/dev/null | tr -d '\r')
-      n_ok=1
-      for nv in "${nums[@]}"; do
-        [[ "$nv" =~ ^-?[0-9]+$ ]] || n_ok=0
-      done
-      n_count=${#nums[@]}
-      if [ "$n_ok" -eq 1 ] && [ "$n_count" -ge 2 ]; then
+  nums_out=$(jq -r '
+    [.tokenSamples[]? | if type=="number" then . elif type=="object" then (.tokens // .tokenCount // .count // .value // .v // empty) else empty end | select(type=="number")] as $n
+    | if ($n|length) >= 2 then ($n[-8:] | .[]) else empty end
+  ' <<< "$task" 2>/dev/null)
+  nums_out=${nums_out//$'\r'/}
+  if [ -n "$nums_out" ]; then
+    mapfile -t nums <<< "$nums_out"
+    n_ok=1
+    for nv in "${nums[@]}"; do
+      [[ "$nv" =~ ^-?[0-9]+$ ]] || n_ok=0
+    done
+    n_count=${#nums[@]}
+    if [ "$n_ok" -eq 1 ] && [ "$n_count" -ge 2 ]; then
         is_nondecreasing=1
         for ((i=1; i<n_count; i++)); do
           if [ "${nums[$i]}" -lt "${nums[$((i-1))]}" ]; then
@@ -336,24 +484,28 @@ for task in "${all_tasks[@]}"; do
             [ "$v" -lt "$min_v" ] && min_v=$v
             [ "$v" -gt "$max_v" ] && max_v=$v
           done
-          glyph_chars=("▁" "▂" "▃" "▄" "▅" "▆" "▇" "█")
+          # Capped at 6 levels (▁-▆, no ▇/█): with multiple task rows
+          # stacked at zero line spacing, a full-height █ in one row can
+          # visually fuse with a bottom-aligned ▁ in the row above/below
+          # it; stopping at ▆ keeps a >=1/4-cell gap at every cell top so
+          # rows can never connect.
+          glyph_chars=("▁" "▂" "▃" "▄" "▅" "▆")
           if [ "$max_v" -eq "$min_v" ]; then
             for v in "${values[@]}"; do
-              spark_plain="${spark_plain}▄"
+              spark_plain="${spark_plain}▃"
             done
           else
             range=$(( max_v - min_v ))
             for v in "${values[@]}"; do
-              idx=$(( (v - min_v) * 7 / range ))
+              idx=$(( (v - min_v) * 5 / range ))
               [ "$idx" -lt 0 ] && idx=0
-              [ "$idx" -gt 7 ] && idx=7
+              [ "$idx" -gt 5 ] && idx=5
               spark_plain="${spark_plain}${glyph_chars[$idx]}"
             done
           fi
-          spark_seg="${CYAN}${spark_plain}${RESET}"
+          # coloring deferred until burn rate (below) is known - item 9
         fi
       fi
-    fi
   fi
 
   burn_seg=""
@@ -375,6 +527,18 @@ for task in "${all_tasks[@]}"; do
     fi
     burn_seg="${burn_color}${burn_text}${RESET}"
     burn_plain="$burn_text"
+  fi
+
+  # item 9: sparkline glyphs take the burn rate's tier color when a rate
+  # is present, cyan only when the sparkline renders alone (no rate).
+  spark_seg=""
+  if [ -n "$spark_plain" ]; then
+    if [ -n "$burn_seg" ]; then
+      spark_color="$burn_color"
+    else
+      spark_color="$CYAN"
+    fi
+    spark_seg="${spark_color}${spark_plain}${RESET}"
   fi
 
   sparkburn_seg=""
@@ -406,7 +570,7 @@ for task in "${all_tasks[@]}"; do
     share_plain="Σ${share}%"
   fi
 
-  description=$(tjq '.description // empty')
+  # (description already split from task_rows above)
 
   ids+=("$id")
   descriptions+=("$description")
@@ -416,11 +580,11 @@ for task in "${all_tasks[@]}"; do
   col3_c+=("$share_seg");     col3_p+=("$share_plain")
   col4_c+=("$elapsed_seg");   col4_p+=("$elapsed_plain")
 
-  dw0=$(disp_width "$seg1_plain")
-  dw1=$(disp_width "$spend_plain")
-  dw2=$(disp_width "$sparkburn_plain")
-  dw3=$(disp_width "$share_plain")
-  dw4=$(disp_width "$elapsed_plain")
+  disp_width "$seg1_plain"; dw0="$REPLY"
+  disp_width "$spend_plain"; dw1="$REPLY"
+  disp_width "$sparkburn_plain"; dw2="$REPLY"
+  disp_width "$share_plain"; dw3="$REPLY"
+  disp_width "$elapsed_plain"; dw4="$REPLY"
   [ "$dw0" -gt "${col_max[0]}" ] && col_max[0]=$dw0
   [ "$dw1" -gt "${col_max[1]}" ] && col_max[1]=$dw1
   [ "$dw2" -gt "${col_max[2]}" ] && col_max[2]=$dw2
@@ -429,7 +593,29 @@ for task in "${all_tasks[@]}"; do
 done
 
 # ---------- PASS 2: build the uniform description budget, pad, emit ----------
-desc_budget=$(( columns - (col_max[0]+col_max[1]+col_max[2]+col_max[3]+col_max[4]) - 15 ))
+# ALIGNMENT FIX: a column that's empty for EVERY row in this payload (e.g.
+# token share with only 1 task in the whole payload - correctly never
+# shown per the >=2-tasks rule - or no task anywhere having a sparkline)
+# used to still render as a padded-blank placeholder + separator on every
+# row, producing a stray "| |" double separator with nothing between.
+# active_cols lists only the original column indices (0-4) that at least
+# ONE row actually used (col_max>0); PASS 2 below renders/pads ONLY
+# those, by position within active_cols, not by the original 0-4 index -
+# a column no row ever used is dropped entirely, no placeholder cell and
+# no separator for it, on any row.
+active_cols=()
+active_col_width_sum=0
+for ci in 0 1 2 3 4; do
+  cw="${col_max[$ci]}"
+  if [ "$cw" -gt 0 ]; then
+    active_cols+=("$ci")
+    active_col_width_sum=$(( active_col_width_sum + cw ))
+  fi
+done
+active_col_count=${#active_cols[@]}
+# Description width budget only counts surviving (active) columns and
+# their separators (one "|" per active column, description always last).
+desc_budget=$(( columns - active_col_width_sum - 3 * active_col_count ))
 
 row_total=${#ids[@]}
 for ((r=0; r<row_total; r++)); do
@@ -447,18 +633,22 @@ for ((r=0; r<row_total; r++)); do
   description="${descriptions[$r]}"
   desc_seg=""
   if [ -n "$description" ] && [ "$desc_budget" -ge 8 ]; then
-    desc_disp_len=$(disp_width "$description")
+    disp_width "$description"; desc_disp_len="$REPLY"
     if [ "$desc_disp_len" -gt "$desc_budget" ]; then
       # Cut by accumulated DISPLAY width, not character count: walk
       # characters, keep adding while the running total stays within
       # budget-1 cells (leaving exactly 1 cell for the "…" appended after).
+      # PERF: this is per-CHARACTER of the description - the single
+      # hottest spot for forks before the REPLY-pattern conversion (a
+      # long description could mean dozens of $(disp_width "$dc") forks
+      # for ONE cell of ONE row); now zero forks regardless of length.
       target=$(( desc_budget - 1 ))
       desc_chars=${#description}
       acc=0
       cut_pos=0
       for ((di=0; di<desc_chars; di++)); do
         dc="${description:di:1}"
-        dw=$(disp_width "$dc")
+        disp_width "$dc"; dw="$REPLY"
         [ "$(( acc + dw ))" -gt "$target" ] && break
         acc=$(( acc + dw ))
         cut_pos=$(( di + 1 ))
@@ -470,45 +660,91 @@ for ((r=0; r<row_total; r++)); do
     desc_seg="${GRAY}${desc_text}${RESET}"
   fi
 
-  # last_idx = highest column index (0-4 mid columns, 5 = description)
-  # that has real content for this row; only trailing-absent columns past
-  # it are dropped, everything up to it renders (empty-padded if absent).
-  last_idx=-1
-  [ "$present0" -eq 1 ] && last_idx=0
-  [ "$present1" -eq 1 ] && last_idx=1
-  [ "$present2" -eq 1 ] && last_idx=2
-  [ "$present3" -eq 1 ] && last_idx=3
-  [ "$present4" -eq 1 ] && last_idx=4
-  [ -n "$desc_seg" ]    && last_idx=5
+  # row_last_idx = highest POSITION WITHIN active_cols (0..active_col_
+  # count-1 for mid columns, active_col_count = description) that has
+  # real content for this row; only trailing-absent slots past it are
+  # dropped, everything up to it renders (empty-padded if absent). A
+  # column dropped from active_cols entirely (see PASS 2's own comment
+  # above) never becomes a slot for any row, so it can never leave a
+  # stray placeholder/separator behind.
+  row_last_idx=-1
+  for ((ai=0; ai<active_col_count; ai++)); do
+    ci="${active_cols[$ai]}"
+    case $ci in
+      0) [ "$present0" -eq 1 ] && row_last_idx=$ai ;;
+      1) [ "$present1" -eq 1 ] && row_last_idx=$ai ;;
+      2) [ "$present2" -eq 1 ] && row_last_idx=$ai ;;
+      3) [ "$present3" -eq 1 ] && row_last_idx=$ai ;;
+      4) [ "$present4" -eq 1 ] && row_last_idx=$ai ;;
+    esac
+  done
+  [ -n "$desc_seg" ] && row_last_idx=$active_col_count
 
-  row=""
-  if [ "$last_idx" -ge 0 ]; then
-    for ((i=0; i<=last_idx; i++)); do
-      if [ "$i" -lt 5 ]; then
-        case $i in
+  # N0(b): every emitted content string starts with a literal reset, to
+  # defend against host/terminal dim-styling bleeding in from whatever
+  # was printed just before this line.
+  row="$RESET"
+  if [ "$row_last_idx" -ge 0 ]; then
+    for ((ai=0; ai<=row_last_idx; ai++)); do
+      if [ "$ai" -lt "$active_col_count" ]; then
+        ci="${active_cols[$ai]}"
+        case $ci in
           0) cell_c="${col0_c[$r]}"; cell_p="${col0_p[$r]}" ;;
           1) cell_c="${col1_c[$r]}"; cell_p="${col1_p[$r]}" ;;
           2) cell_c="${col2_c[$r]}"; cell_p="${col2_p[$r]}" ;;
           3) cell_c="${col3_c[$r]}"; cell_p="${col3_p[$r]}" ;;
           4) cell_c="${col4_c[$r]}"; cell_p="${col4_p[$r]}" ;;
         esac
+        w="${col_max[$ci]}"
       else
         cell_c="$desc_seg"
         cell_p=""
+        w=0
       fi
-      if [ "$i" -eq "$last_idx" ]; then
+      if [ "$ai" -eq "$row_last_idx" ]; then
         row="${row}${cell_c}"
       else
-        plen=$(disp_width "$cell_p")
-        w="${col_max[$i]}"
+        disp_width "$cell_p"; plen="$REPLY"
         pad=$(( w - plen ))
         padding=""
-        [ "$pad" -gt 0 ] && padding=$(printf '%*s' "$pad" '')
+        if [ "$pad" -gt 0 ]; then
+          printf -v padding '%*s' "$pad" ''
+          padding=${padding// /$NBSP}
+        fi
         row="${row}${cell_c}${padding}${SEP}"
       fi
     done
   fi
   row="${row}${RESET}"
 
-  jq -cn --arg id "$id" --arg content "$row" '{id:$id, content:$content}'
+  # PERF: this is the hottest spot in the whole script (runs once per row
+  # per render) - a jq -cn/--arg call here would fork a process per row.
+  # JSON string escaping is instead done inline in pure bash (order
+  # matters: backslash first, so later-inserted backslashes from the
+  # following substitutions are never themselves re-escaped): backslash,
+  # then double quote, then ESC (0x1B - the ANSI color codes baked into
+  # $id/$row are raw ESC bytes, which JSON forbids unescaped, hence
+  #  - a JSON/terminal consumer decodes that back to a real ESC
+  # byte, so this is a lossless re-encoding, not a color-stripping step),
+  # then tab, then newline. Deliberately NOT a helper function called as
+  # $(esc "$x") - that would still fork a subshell per call (bash forks
+  # for command substitution even around pure-bash functions), which on
+  # Windows/MSYS2 is comparably expensive to spawning an external
+  # process and would defeat the point; inlining keeps this row's emit at
+  # zero forks.
+  esc_id="$id"
+  esc_id=${esc_id//\\/\\\\}
+  esc_id=${esc_id//\"/\\\"}
+  esc_id=${esc_id//$'\e'/\\u001b}
+  esc_id=${esc_id//$'\t'/\\t}
+  esc_id=${esc_id//$'\n'/\\n}
+
+  esc_row="$row"
+  esc_row=${esc_row//\\/\\\\}
+  esc_row=${esc_row//\"/\\\"}
+  esc_row=${esc_row//$'\e'/\\u001b}
+  esc_row=${esc_row//$'\t'/\\t}
+  esc_row=${esc_row//$'\n'/\\n}
+
+  printf '{"id":"%s","content":"%s"}\n' "$esc_id" "$esc_row"
 done
