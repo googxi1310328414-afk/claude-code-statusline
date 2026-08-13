@@ -380,10 +380,33 @@ else
 fi
 
 # Parses a cost string ("12", "12.5", "12.34...") to integer cents in pure
-# bash: no bc/awk. Decimal part is truncated/zero-padded to exactly 2
-# digits; 10#$decpart forces base-10 so a leading zero (e.g. "05") is never
-# misread as octal. (Moved ahead of the history block below since the
-# TODAY TOTAL computation needs it.)
+# bash: no bc/awk. Decimal part is TRUNCATED (not rejected) to exactly 2
+# digits - zero-padded if fewer than 2 decimal digits are present
+# (including a bare trailing "." with nothing after it, treated as
+# ".00") - so a raw payload float with 10+ decimal digits (e.g.
+# "1031.5312969999", straight off the live JSON) parses exactly like a
+# clean 2-decimal string. Only the INTEGER part's shape is actually
+# validated (must be all digits, non-empty) - anything else there is
+# rejected outright (return 1, REPLY left empty). 10#$decpart forces
+# base-10 so a leading zero (e.g. "05") is never misread as octal.
+# (Moved ahead of the history block below since the TODAY/WEEK TOTAL
+# computation needs it.)
+#
+# THIS IS THE ONLY COST-TO-CENTS PARSER IN THE SCRIPT - every consumer
+# (the cost-rate segment, TODAY TOTAL, WEEK TOTAL, and the history
+# session-filter/append paths that decide whether a cost value is usable
+# at all) calls this function directly and uses ITS success/failure as
+# the sole validity gate; none of them run a separate regex first. A
+# prior version had a redundant `[[ $x =~ ^[0-9]+(\.[0-9]+)?$ ]]` regex
+# pre-check at some call sites in addition to this function - textually
+# equivalent to this function's own validation at the time, but a second
+# copy of the same rule that could silently drift from this one on a
+# future edit to either side. Removed; every site below calls this
+# function only. The append path also rounds new rows to 2 decimals at
+# write time (see hist_cost_now below) so fresh rows are canonical
+# cents-precision on disk - but that's a courtesy for readability, not a
+# correctness requirement, since this function tolerates any decimal
+# length either way (needed regardless, for old rows already on disk).
 # NO-FORK RETURN: writes to global REPLY instead of printf+stdout: this is
 # called once per history row inside the today/week loops below (up to a
 # few hundred times on a long-lived history file) - $(cost_to_cents ...)
@@ -467,7 +490,15 @@ if [ -n "$session_id" ]; then
       tok_epochs+=("$h_epoch")
       tok_values+=("$h_tok")
     fi
-    if [[ "$h_cost" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    # Validity is decided by actually calling cost_to_cents (the one
+    # shared cost parser - see its own comment), not a separate regex:
+    # this is the only gate a cost value goes through anywhere in this
+    # script now, so it can never diverge from what the rate/today/week
+    # consumers below will themselves get when they parse the SAME stored
+    # string later. Handles pre-this-fix history rows with 3+ decimal
+    # digits (cost_to_cents truncates, never rejects, based on decimal
+    # length) the identical way it handles freshly-written 2-decimal ones.
+    if cost_to_cents "$h_cost"; then
       cost_epochs+=("$h_epoch")
       cost_values+=("$h_cost")
     fi
@@ -487,7 +518,18 @@ if [ -n "$session_id" ]; then
     else
       hist_tokens_now="$in_tokens"
     fi
-    hist_cost_now="$cost"
+    # Rounded to 2 decimals at write time (canonical cents precision) -
+    # the live payload's cost is a raw float and can carry 10+ decimal
+    # digits; every reader-side consumer already tolerates arbitrary
+    # decimal length via cost_to_cents's own truncation (see its comment),
+    # so this isn't strictly required for correctness, but keeps new rows
+    # short/clean and matches history rows written by any older/other
+    # tool that already used 2-decimal costs. Guarded so a non-numeric or
+    # absent $cost still leaves the field empty (omitted), not "0.00".
+    hist_cost_now=""
+    if [[ "$cost" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      printf -v hist_cost_now '%.2f' "$cost"
+    fi
     printf -v new_hist_line '%s\x1f%s\x1f%s\x1f%s' "$now_epoch" "$session_id" "$hist_tokens_now" "$hist_cost_now"
     hist_all_lines+=("$new_hist_line")
     # reflect the just-appended row in the in-memory rate/sparkline arrays
@@ -496,7 +538,7 @@ if [ -n "$session_id" ]; then
       tok_epochs+=("$now_epoch")
       tok_values+=("$hist_tokens_now")
     fi
-    if [[ "$hist_cost_now" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    if cost_to_cents "$hist_cost_now"; then
       cost_epochs+=("$now_epoch")
       cost_values+=("$hist_cost_now")
     fi
@@ -553,7 +595,12 @@ for hline in "${hist_all_lines[@]}"; do
   [ "$h_epoch" -ge "$hist_time_cutoff" ] && hist_trimmed+=("$hline")
 
   [ -z "$h_sid" ] && continue
-  [[ "$h_cost" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+  # Validity is decided by cost_to_cents alone (the one shared cost
+  # parser used everywhere in this script now - see its own comment) -
+  # no separate regex pre-check, so there is no second gate that could
+  # ever disagree with it. Handles arbitrary decimal length (truncates,
+  # never rejects) identically for pre-this-fix long-decimal rows and
+  # freshly-written 2-decimal ones.
   cost_to_cents "$h_cost" || continue
   h_cents="$REPLY"
 
