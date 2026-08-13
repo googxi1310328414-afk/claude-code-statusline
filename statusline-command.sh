@@ -959,15 +959,6 @@ fi
 # PR, only when both substrings are found.
 bypass_seg=""
 bypass_plain=""
-settings_file="$HOME/.claude/settings.json"
-if [ -f "$settings_file" ]; then
-  settings_raw=""
-  IFS= read -r -d '' settings_raw < "$settings_file" || true
-  if [[ "$settings_raw" == *'"defaultMode"'* ]] && [[ "$settings_raw" == *'"bypassPermissions"'* ]]; then
-    bypass_seg="${RED_BRIGHT}⚡bypass${RESET}"
-    bypass_plain="⚡bypass"
-  fi
-fi
 
 # 8. context battery bar: [!]<bar> N% [Xk/Yk]. remaining_int truncates the
 # fractional part (floor for a non-negative percentage), so the integer
@@ -1952,7 +1943,6 @@ else
   [ -n "$repo" ]         && { parts1+=("$repo"); parts1_plain+=("$repo_plain"); }
   [ -n "$branch" ]       && { parts1+=("$branch"); parts1_plain+=("$branch_plain"); }
   [ -n "$pr_seg" ]       && { parts1+=("$pr_seg"); parts1_plain+=("$pr_plain"); }
-  [ -n "$bypass_seg" ]   && { parts1+=("$bypass_seg"); parts1_plain+=("$bypass_plain"); }
 
   # Line 2: context engine
   parts2=()
