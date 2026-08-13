@@ -6,6 +6,31 @@
 # set before any string measurement happens (i.e. before every other line
 # in this script).
 export LC_ALL=C.UTF-8
+
+# PERMANENT ERROR BLACK BOX (not a temp diagnostic - kept intentionally):
+# captures every command's real stderr in this script to a single log
+# file, append-only, for after-the-fact diagnosis of failures that would
+# otherwise be invisible (this is exactly how the fork-exhaustion root
+# cause behind the graceful-degradation guard further down was actually
+# found - a blank statusline alone gives no clue why).
+# SELF-ROTATION: pure-bash line-count heuristic, not a precise byte-size
+# check (that would need `stat`/`wc -c`, both external spawns this script
+# avoids everywhere else) - reusing the same no-fork `mapfile` file-read
+# pattern already used for the history file, count the existing log's
+# lines and truncate it to empty (`: > file`, no external `truncate`/
+# `cp`) once it passes ~500 lines, a rough proxy for ~64KB rather than an
+# exact one. Runs BEFORE the `exec` below opens the append redirect for
+# this render, so a rotation this render triggers starts the file fresh
+# immediately; checked every render rather than on any schedule, but
+# cheap either way since the file is kept capped at ~500 lines by this
+# same mechanism.
+statusline_err_log="$HOME/.claude/statusline-err.log"
+if [ -f "$statusline_err_log" ]; then
+  statusline_err_lines=()
+  mapfile -t statusline_err_lines < "$statusline_err_log" 2>/dev/null
+  [ "${#statusline_err_lines[@]}" -gt 500 ] && : > "$statusline_err_log" 2>/dev/null
+fi
+exec 2>>"$statusline_err_log"
 # Claude Code status line (detailed layout, ANSI colors, FOUR printed
 # lines, column-aligned, narrow-terminal adaptive)
 #
@@ -347,6 +372,28 @@ jq_main_out=$(jq -r '
 ' <<< "$input" 2>/dev/null)
 jq_main_out=${jq_main_out//$'\r'/}
 mapfile -t F <<< "$jq_main_out"
+
+# GRACEFUL DEGRADATION: distinct from the command-v guard above (which
+# only catches jq being ABSENT) - this catches jq being PRESENT but its
+# spawn failing anyway, e.g. Windows/MSYS2 fork exhaustion under a large
+# process tree ("fork: retry: Resource temporarily unavailable"). In that
+# case $(jq ...) captures nothing, but a herestring `mapfile` on a truly
+# empty string still yields ONE element (an empty string - <<< "" feeds
+# just a trailing newline to stdin), never a zero-length array, so
+# emptiness alone isn't a reliable signal; check the SHAPE instead: a
+# healthy jq run always emits exactly 29 lines (every field above is
+# `// ""`, never `// empty`, specifically so field COUNT stays fixed
+# regardless of which fields the payload actually has), so fewer than
+# that means the spawn didn't really run. Backed up by checking the
+# first mandatory field (session_id, always present per the documented
+# stdin contract) for good measure. Every other internal failure path in
+# this script already degrades to omitting a segment, never to dying -
+# this is the one point where a totally absent jq result would otherwise
+# fall through to a blank statusline instead of at least one line.
+if [ "${#F[@]}" -lt 29 ] || [ -z "${F[0]}" ]; then
+  printf '\e[0m\e[97m%(%H:%M:%S)T\e[0m\e[90m | statusline: degraded (fork)\e[0m\n' -1
+  exit 0
+fi
 
 session_id="${F[0]}";    model="${F[1]}";      effort="${F[2]}";     thinking="${F[3]}"
 dir="${F[4]}";           repo_owner="${F[5]}"; repo_name="${F[6]}"; repo_host="${F[7]}"
@@ -893,6 +940,15 @@ fi
 # further line means the tree is dirty (same signal `head -c1` on
 # `status --porcelain` used to give). Branch name is always green; a dirty
 # "*" is appended as its own yellow token.
+# FAILURE SAFETY (confirmed, no change needed): branch/branch_plain are
+# already initialized empty just below, BEFORE this call - if the git
+# spawn itself fails (already stderr-silenced by 2>/dev/null; same
+# fork-exhaustion class of failure the jq guard above now handles),
+# $git_status_out is simply empty, the `if` below is skipped entirely,
+# and branch/branch_plain stay at their empty defaults - the rest of the
+# script continues normally with the branch segment omitted, same as any
+# other optional segment whose data isn't available. Nothing here can
+# abort the script.
 branch=""
 branch_plain=""
 git_status_out=$(git -C "$dir" --no-optional-locks status --porcelain=v1 --branch 2>/dev/null)
