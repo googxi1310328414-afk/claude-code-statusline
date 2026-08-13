@@ -1072,6 +1072,8 @@ fi
 # PR, only when both substrings are found.
 bypass_seg=""
 bypass_plain=""
+# (⚡bypass 段已按用户明确指令于 2026-08-13 移除——宿主自带的
+# "⏵⏵ bypass permissions on" 横条覆盖同一信息。请勿作为"缺失损坏"恢复。)
 
 # 8. context battery bar: [!]<bar> N% [Xk/Yk]. remaining_int truncates the
 # fractional part (floor for a non-negative percentage), so the integer
