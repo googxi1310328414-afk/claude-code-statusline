@@ -566,7 +566,14 @@ cost_to_cents() {
   else
     decpart=""
   fi
-  [[ "$intpart" =~ ^[0-9]+$ ]] || return 1
+  # {1,9} DIGIT CAP (round-5): this is the ONE parsing gate every cost
+  # consumer funnels through (history write, $/h rate, today/week fold),
+  # and it was the only numeric gate left uncapped - a 20-digit cost
+  # overflowed intpart*100 into a garbage cents value that the rollup
+  # then PERMANENTLY closed into closed_cents (9-day retention, no
+  # self-heal), and a 12-digit one sailed through display caps into a
+  # "week $123456789012.00" render. One cap here covers them all.
+  [[ "$intpart" =~ ^[0-9]{1,9}$ ]] || return 1
   decpart="${decpart:0:2}"
   while [ "${#decpart}" -lt 2 ]; do
     decpart="${decpart}0"
@@ -634,6 +641,7 @@ last_hist_epoch=""
 # STORE comment further down for the file format and the monotonic-run
 # state-machine semantics; only the ORDER moved here.
 daily_file="${STATUSLINE_DAILY_FILE:-$HOME/.claude/statusline-daily.tsv}"
+max_persisted_wm=0
 declare -A du_closed du_peak du_prev du_epoch
 declare -A du_watermark
 printf -v today_str '%(%Y%m%d)T' -1
@@ -657,10 +665,13 @@ if [ -f "$daily_file" ]; then
     [[ "$d_epoch" == *$'\x1f'* ]] && continue
     [[ "$d_day" =~ ^[0-9]{8}$ ]] || continue
     [ -n "$d_sid" ] || continue
-    [[ "$d_closed" =~ ^[0-9]+$ ]] || continue
-    [[ "$d_peak" =~ ^[0-9]+$ ]] || continue
-    [[ "$d_prev" =~ ^[0-9]+$ ]] || continue
-    [[ "$d_epoch" =~ ^[0-9]+$ ]] || continue
+    # digit caps (round-5): cents fields at 12 digits (multi-session
+    # multi-day sums stay far below; keeps every later addition inside
+    # bash integer range even summed), epoch at 13 (same as resets_at)
+    [[ "$d_closed" =~ ^[0-9]{1,12}$ ]] || continue
+    [[ "$d_peak" =~ ^[0-9]{1,12}$ ]] || continue
+    [[ "$d_prev" =~ ^[0-9]{1,12}$ ]] || continue
+    [[ "$d_epoch" =~ ^[0-9]{1,13}$ ]] || continue
     # CLOCK-ROLLBACK GUARDS: state stamped in the FUTURE (wall clock
     # stepped back after it was persisted - NTP step correction, VM
     # snapshot restore) is untrustworthy rollback-era output, and it is
@@ -684,6 +695,7 @@ if [ -f "$daily_file" ]; then
     du_prev[$dkey]=$d_prev
     du_epoch[$dkey]=$d_epoch
     [ "$d_epoch" -gt "${du_watermark[$d_sid]:-0}" ] && du_watermark[$d_sid]=$d_epoch
+    [ "$d_epoch" -gt "$max_persisted_wm" ] && max_persisted_wm=$d_epoch
   done
 fi
 
@@ -717,49 +729,62 @@ hist_future_cutoff=$(( now_epoch + 3600 ))
 hist_trimmed=()
 hist_oldest_epoch=""
 daily_dirty=0
-# smallest watermark across every session the rollup knows: rows at or
-# below it AND older than every live consumer window are provably inert
-# (already folded, outside all display windows) - the tail scan below
-# stops there. No watermark at all (first run / fresh rollup) leaves it
-# 0 = full scan, which is exactly the seeding path.
-global_min_wm=0
-first_wm=1
-for _wms in "${!du_watermark[@]}"; do
-  if [ "$first_wm" -eq 1 ]; then global_min_wm=${du_watermark[$_wms]}; first_wm=0
-  elif [ "${du_watermark[$_wms]}" -lt "$global_min_wm" ]; then global_min_wm=${du_watermark[$_wms]}; fi
-done
-# HOT PATH, TAIL-FIRST (round-4 fix): every steady-state consumer of
-# this file lives in the TAIL - $/h needs 60min, the token rate 5min,
-# the sparkline the last 9 samples, the rollup only rows above the
-# watermarks. The old head-to-tail full walk therefore spent ~59% of a
-# realistic frame (measured: 1039 rows = ~555ms) fully parsing rows it
-# then discarded. Phase 1 walks BACKWARDS with a 4-statement epoch-only
-# probe per row and stops at the first row that is both older than the
-# 65min consumer horizon AND at-or-below every watermark; phase 2
-# replays just the surviving tail slice (~130 rows/session) FORWARDS
-# through the full parse + arrays + rollup fold (the fold state machine
-# is order-sensitive, hence the replay). Full-file work now happens only
-# on the ~30min rewrite path (see the write block below). Correctness
-# relies on the file being append-ordered, which O_APPEND writes give
-# us; the seeding run (no watermarks) still scans everything.
+# HOT PATH, TAIL-FIRST (round-4, early-stop test REBUILT in round-5):
+# every steady-state consumer of this file lives in the TAIL - $/h needs
+# 60min, the token rate 5min, the sparkline the last 9 samples, the
+# rollup only rows above each session's watermark. Phase 1 walks
+# BACKWARDS with a cheap probe per row; phase 2 replays just the
+# surviving tail slice FORWARDS through the full parse + arrays + fold
+# (the fold state machine is order-sensitive, hence the replay).
+#
+# The early-stop verdict is PER-ROW against that row's OWN session
+# watermark - round 4 used the global minimum watermark across every
+# session the rollup knew, but the rollup retains 9 days of (day, sid)
+# rows while the fine file holds ~3.5h: ANY session idle longer than
+# the fine window (a yesterday session, or one that just went quiet
+# today) pinned that minimum below every fine row and the early stop
+# NEVER fired on a real machine - the "-30%" win existed only in
+# single-session sandboxes while real frames paid a full probe pass ON
+# TOP of the full parse. A row is inert iff it is older than the 65min
+# consumer horizon AND at-or-below its own sid's watermark; THREE
+# consecutive inert rows trigger the stop (the streak absorbs the
+# seconds-level epoch interleaving concurrent O_APPEND writers can
+# produce - a single inert row mid-tail is not proof the tail ended).
+# A row of an unknown sid (watermark 0) can never look inert, so the
+# seeding run still scans everything. Probe separators accept BOTH 0x1f
+# and legacy TAB (round-5: the epoch-only probe missed the TAB
+# normalization the full parser does, so a legacy-format file yielded
+# zero valid probes - no oldest epoch -> the rewrite/migration path
+# never fired and the file grew to the 10k cap while every frame paid
+# a full-file double walk).
 hist_scan_horizon=$(( now_epoch - 3900 ))
 hist_count=${#hist_all_lines[@]}
 hist_tail_start=0
+hist_stop_streak=0
 for (( hi=hist_count-1; hi>=0; hi-- )); do
   hline=${hist_all_lines[hi]}
-  h_epoch=${hline%%$'\x1f'*}
+  h_epoch=${hline%%[$'\x1f\t']*}
   h_epoch=${h_epoch//$'\r'/}
-  [[ "$h_epoch" =~ ^[0-9]+$ ]] || continue
-  if [ "$h_epoch" -lt "$hist_scan_horizon" ] && [ "$h_epoch" -le "$global_min_wm" ]; then
-    hist_tail_start=$(( hi + 1 ))
-    break
+  [[ "$h_epoch" =~ ^[0-9]+$ ]] || { hist_stop_streak=0; continue; }
+  if [ "$h_epoch" -lt "$hist_scan_horizon" ]; then
+    h_psid=${hline#*[$'\x1f\t']}
+    h_psid=${h_psid%%[$'\x1f\t']*}
+    if [ -n "$h_psid" ] && [ "$h_epoch" -le "${du_watermark[$h_psid]:-0}" ]; then
+      hist_stop_streak=$(( hist_stop_streak + 1 ))
+      if [ "$hist_stop_streak" -ge 3 ]; then
+        hist_tail_start=$(( hi + 1 ))
+        break
+      fi
+      continue
+    fi
   fi
+  hist_stop_streak=0
 done
 # oldest VALID epoch, for the rewrite-due decision: probe forward from
 # the head - the first few rows suffice (a bounded 20-row cap keeps a
 # pathological all-garbage head from re-importing a full scan)
 for (( hi=0; hi<hist_count && hi<20; hi++ )); do
-  h_epoch=${hist_all_lines[hi]%%$'\x1f'*}
+  h_epoch=${hist_all_lines[hi]%%[$'\x1f\t']*}
   h_epoch=${h_epoch//$'\r'/}
   if [[ "$h_epoch" =~ ^[0-9]+$ ]] && [ "$h_epoch" -le "$hist_future_cutoff" ]; then
     hist_oldest_epoch="$h_epoch"
@@ -935,7 +960,27 @@ done
 # Rollup rewrite - only on renders that actually folded something new.
 # Retention: 9 local days (7-day week window + margin); the row count is
 # naturally tiny (days x sessions), no cap needed.
+# PERSIST THROTTLE (round-5): folding marks the state dirty on EVERY
+# sampling frame (~30s), which made this rewrite a per-sampling-frame
+# tmp+mv fork pair that the documented frame budget never accounted
+# for. The rollup is REPLAY-SAFE by construction (a lost write is
+# rebuilt from the still-present fine rows on the next render, and
+# folding always happens in the same frame BEFORE any trim could drop
+# those rows), so persistence can lag: only write when the newest
+# in-memory watermark has moved >=300s past what disk already has
+# (max_persisted_wm, collected at load). Seeding (empty file, max 0)
+# still writes immediately. Worst case on a crash: <=300s of folds
+# replayed next render - zero data loss.
+daily_persist_due=0
 if [ "$daily_dirty" -eq 1 ]; then
+  daily_mem_max=0
+  for _pk in "${!du_epoch[@]}"; do
+    [ "${du_epoch[$_pk]}" -gt "$daily_mem_max" ] && daily_mem_max=${du_epoch[$_pk]}
+  done
+  [ $(( daily_mem_max - max_persisted_wm )) -ge 300 ] && daily_persist_due=1
+  [ "$max_persisted_wm" -eq 0 ] && daily_persist_due=1
+fi
+if [ "$daily_persist_due" -eq 1 ]; then
   printf -v daily_keep_str '%(%Y%m%d)T' "$(( now_epoch - 777600 ))"
   daily_out_lines=()
   for dkey in "${!du_peak[@]}"; do

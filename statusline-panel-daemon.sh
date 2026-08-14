@@ -116,7 +116,6 @@ tick_fifo="$panel_dir/.tick.fifo"
 shopt -s nullglob
 idle=0
 render_seq=0
-last_own=0
 last_hb=0
 [ "$once" -eq 0 ] && last_hb=$hb_now
 # WALL-CLOCK heartbeat (round-4 fix for a round-3 regression): the first
@@ -131,12 +130,32 @@ last_hb=0
 # one write per 5s, checked every loop AND every 0.3s render-wait tick,
 # so no code path can starve the beat. Atomic tmp+mv (one fork per 5s
 # worst case, off the hot hook path).
+# OWNERSHIP-GATED (round-5 PRODUCTION hotfix): only the currently
+# REGISTERED instance may refresh the heartbeat. The first wall-clock
+# version wrote itself unconditionally, which turned every live
+# instance into a per-5s registration usurper: with just two instances
+# momentarily alive (dual-session spawn race), each kept overwriting
+# the other's claim, every hook tick then saw a claim whose owner had
+# already conceded and spawned yet another daemon - 112 stacked
+# instances were reaped off the real machine. Now: registered -> beat;
+# someone ELSE registered and alive -> concede (exit) on the spot;
+# dead/missing claim -> take over via the exclusive-create discipline.
+# This also folds the old separate ownership self-check into the beat.
 hb_beat() {
   [ "$once" -eq 1 ] && return 0
   printf -v hb_t '%(%s)T' -1
   [ $(( hb_t - last_hb )) -lt 5 ] && return 0
   last_hb=$hb_t
-  printf '%s\n%s\n' "$$" "$hb_t" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
+  hb_cur=""
+  [ -r "$panel_dir/daemon.pid" ] && read -r hb_cur < "$panel_dir/daemon.pid"
+  if [ "$hb_cur" = "$$" ]; then
+    printf '%s\n%s\n' "$$" "$hb_t" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
+  elif [ -n "$hb_cur" ] && kill -0 "$hb_cur" 2>/dev/null; then
+    exit 0
+  else
+    rm -f "$panel_dir/daemon.pid" 2>/dev/null
+    ( set -C; printf '%s\n%s\n' "$$" "$hb_t" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
+  fi
 }
 # per-key consecutive bad-frame counter (round-3 fix): the -s keep-frame
 # gate protects the cache from TRANSIENT blank renders, but a PERSISTENT
@@ -158,18 +177,10 @@ while :; do
   # CONVERGES the transient double-daemon fast - an instance that finds
   # a DIFFERENT live pid registered concedes and exits instead of
   # coasting to the 2-minute idle death.
-  if [ "$once" -eq 0 ]; then
-    printf -v own_t '%(%s)T' -1
-    if [ $(( own_t - last_own )) -ge 9 ]; then
-      last_own=$own_t
-      cur_owner=""
-      [ -r "$panel_dir/daemon.pid" ] && read -r cur_owner < "$panel_dir/daemon.pid"
-      if [ -n "$cur_owner" ] && [ "$cur_owner" != "$$" ] && kill -0 "$cur_owner" 2>/dev/null; then
-        exit 0
-      fi
-    fi
-    hb_beat
-  fi
+  # ownership + heartbeat in ONE gate (hb_beat handles both: beat when
+  # registered, concede when someone else holds a live claim, take over
+  # a dead one)
+  [ "$once" -eq 0 ] && hb_beat
   for sp in "$panel_dir"/spool.*.new; do
     key=${sp##*/spool.}
     key=${key%.new}

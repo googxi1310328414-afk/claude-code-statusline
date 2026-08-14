@@ -376,6 +376,31 @@ if [ "$1" = "--assert" ]; then
   bigctx=$(jq -n '{session_id:"bc1",model:{display_name:"M"},workspace:{current_dir:"/x"},context_window:{remaining_percentage:99999999999999999999999}}' | bash ./statusline-command.sh | strip)
   printf '%s' "$bigctx" | grep -q 'ctx' && bad "giant remaining rendered fake battery" || ok "giant remaining drops ctx segment"
 
+  # ---- adversarial-review round-5 regression asserts (2026-08-14) ----
+  # R22: a legacy TAB-separated history file must still be trimmed and
+  # self-migrate to 0x1F (the epoch probes must accept both separators)
+  for ((ti=0; ti<20; ti++)); do printf '%s\tlegacy\t%s\t0.10\n' "$((now-14400+ti*60))" "$((1000+ti))"; done > "$STATUSLINE_HISTORY_FILE"
+  jq -n '{session_id:"legacy",model:{display_name:"M"},workspace:{current_dir:"/x"}}' | bash ./statusline-command.sh >/dev/null
+  tabrows=$(grep -cP "	" "$STATUSLINE_HISTORY_FILE" 2>/dev/null); tabrows=${tabrows:-99}
+  rowcnt=$(grep -c . "$STATUSLINE_HISTORY_FILE" 2>/dev/null); rowcnt=${rowcnt:-99}
+  if [ "$tabrows" -eq 0 ] && [ "$rowcnt" -le 2 ]; then ok "legacy TAB file trimmed + migrated"; else bad "TAB file stuck (rows=$rowcnt tabs=$tabrows)"; fi
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R23: a giant cost must be rejected at the ONE parsing gate - it may
+  # not reach the week sum (previously it skipped the display cap but
+  # got folded into the rollup permanently)
+  : > "$STATUSLINE_DAILY_FILE"
+  bigcost=$(jq -n '{session_id:"bigc",model:{display_name:"M"},workspace:{current_dir:"/x"},cost:{total_cost_usd:123456789012}}' | bash ./statusline-command.sh | strip)
+  printf '%s' "$bigcost" | grep -q 'week \$1234' && bad "giant cost folded into week" || ok "giant cost rejected at cost_to_cents"
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R24: a stale rollup row from a long-gone session must not corrupt
+  # week math (and, per round-5, must not pin the tail-scan early stop -
+  # asserted here by semantics; the perf side is covered by design)
+  printf '20260809\x1fsess-OLD\x1f0\x1f500\x1f500\x1f%s\n' "$((now-432000))" >> "$STATUSLINE_DAILY_FILE"
+  staleout=$(bash ./statusline-command.sh < fixtures/full.json | strip)
+  printf '%s' "$staleout" | grep -q 'week \$' && ok "week renders alongside stale rollup row" || bad "stale rollup row broke week"
+  : > "$STATUSLINE_DAILY_FILE"
+
   # panel daemon architecture: the hook must spool the payload, stay
   # silent on a cold cache, serve the cached frame instantly, and the
   # daemon (--once) must render a spool into that cache
