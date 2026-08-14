@@ -15,3 +15,5 @@ run_control.sh
 *.fifo
 test-home*/
 test-out.*
+innocent.txt
+mg.sh
