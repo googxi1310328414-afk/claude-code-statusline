@@ -23,18 +23,23 @@ input+="$slurp_chunk"
 # one tick - same as a fresh spawn always was). Sanitized hard for
 # filename use; no id at all (shouldn't happen - the host doesn't invoke
 # this hook without tasks) -> serve nothing, spool nothing.
+# STRICT STRING-VALUE FORMS ONLY (round-2 fix): the old "skip to the
+# next quote after the id key" grabbed whatever quote came next, so a
+# NON-string id ("id":123 / "id":null) made the key the following JSON
+# KEY NAME (e.g. "name") - the same for every session, silently merging
+# all sessions onto one spool/cache pair. Now the colon+quote must be
+# adjacent (compact or one-space pretty form, the only shapes the host
+# emits); anything else yields no key = serve nothing, which fails SAFE
+# (default rows) instead of cross-serving another session's cache.
 key=""
 case "$input" in
-  *'"id"'*)
-    # tolerant of compact ("id":"x") AND pretty ("id": "x") JSON: skip
-    # to the first quote after the "id" key = the value's opening quote
-    key=${input#*\"id\"}
-    key=${key#*\"}
-    key=${key%%\"*}
-    key=${key//[!A-Za-z0-9_-]/}
-    key=${key:0:24}
-    ;;
+  *'"id":"'*)  key=${input#*\"id\":\"};  key=${key%%\"*} ;;
+  *'"id": "'*) key=${input#*\"id\": \"}; key=${key%%\"*} ;;
 esac
+if [ -n "$key" ]; then
+  key=${key//[!A-Za-z0-9_-]/}
+  key=${key:0:24}
+fi
 [ -n "$key" ] || exit 0
 [ -d "$panel_dir" ] || exit 0
 

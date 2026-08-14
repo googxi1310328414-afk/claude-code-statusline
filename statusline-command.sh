@@ -26,8 +26,13 @@ export LC_ALL=C.UTF-8
 # same mechanism.
 statusline_err_log="$HOME/.claude/statusline-err.log"
 if [ -f "$statusline_err_log" ]; then
+  # BOUNDED read (-n 501): only the rotation THRESHOLD matters, so 501
+  # lines answer it - an unbounded mapfile re-read the whole log every
+  # frame (a storm can leave megabytes of "fork: retry" spam in one
+  # burst, which then taxed every later frame ~0.13s and made the very
+  # first post-storm frame slurp it all at the worst possible moment).
   statusline_err_lines=()
-  mapfile -t statusline_err_lines < "$statusline_err_log" 2>/dev/null
+  mapfile -t -n 501 statusline_err_lines < "$statusline_err_log" 2>/dev/null
   [ "${#statusline_err_lines[@]}" -gt 500 ] && : > "$statusline_err_log" 2>/dev/null
 fi
 exec 2>>"$statusline_err_log"
@@ -381,7 +386,14 @@ jq_main_out=$(jq -r '
   # tostring first so a weird non-string value can never make gsub abort
   # the whole extraction. Numeric fields skip this (numbers cannot carry
   # control characters).
-  def clean: tostring | gsub("[\r\n]"; " ");
+  # clean, PANEL-GRADE (round-2 fix): fold tab/LF/CR to a space and
+  # STRIP every other C0 outright - the first version only folded
+  # CR/LF, so a session_name carrying raw ESC/BEL walked straight
+  # into stdout as a working terminal escape (an OSC-0 title
+  # injection was demonstrated), and a raw TAB rendered at tabstop
+  # width while counting as 1 char in the plain twin, skewing that
+  # whole column of col_widths. Same def as the panel renderer.
+  def clean: tostring | gsub("[\t\n\r]"; " ") | gsub("[\u0001-\u001f]"; "");
   (.session_id // "" | clean),
   (.model.display_name // "" | clean),
   (.effort.level // "" | clean),
@@ -629,25 +641,43 @@ if [ -f "$daily_file" ]; then
   mapfile -t daily_raw_lines < "$daily_file" 2>/dev/null
   for dline in "${daily_raw_lines[@]}"; do
     dline=${dline//$'\r'/}
-    IFS=$'\x1f' read -r d_day d_sid d_closed d_peak d_prev d_epoch d_extra <<< "$dline"
-    # whole-row shape check, 6 exact columns, every numeric field guarded
-    # - malformed/foreign rows dropped whole, same discipline as the fine
-    # file's reader below
+    # split via parameter expansions, NOT `read <<<` - a herestring costs
+    # ~0.25ms per row on MSYS (same law as the fine-file HOT LOOP below;
+    # this loop runs every frame over days x sessions rows)
+    d_day=${dline%%$'\x1f'*};   d_rest=${dline#*$'\x1f'}
+    d_sid=${d_rest%%$'\x1f'*};  d_rest=${d_rest#*$'\x1f'}
+    d_closed=${d_rest%%$'\x1f'*}; d_rest=${d_rest#*$'\x1f'}
+    d_peak=${d_rest%%$'\x1f'*};   d_rest=${d_rest#*$'\x1f'}
+    d_prev=${d_rest%%$'\x1f'*}
+    d_epoch=${d_rest#*$'\x1f'}
+    # whole-row shape check, 6 exact columns (5 separators, none left in
+    # the last field), every numeric field guarded - malformed/foreign
+    # rows dropped whole, same discipline as the fine file's reader below
+    [ "$d_prev" = "$d_rest" ] && continue
+    [[ "$d_epoch" == *$'\x1f'* ]] && continue
     [[ "$d_day" =~ ^[0-9]{8}$ ]] || continue
     [ -n "$d_sid" ] || continue
     [[ "$d_closed" =~ ^[0-9]+$ ]] || continue
     [[ "$d_peak" =~ ^[0-9]+$ ]] || continue
     [[ "$d_prev" =~ ^[0-9]+$ ]] || continue
     [[ "$d_epoch" =~ ^[0-9]+$ ]] || continue
-    [ -n "$d_extra" ] && continue
-    # CLOCK-ROLLBACK GUARD: a watermark stamped in the future (wall clock
+    # CLOCK-ROLLBACK GUARDS: state stamped in the FUTURE (wall clock
     # stepped back after it was persisted - NTP step correction, VM
-    # snapshot restore) would make every REAL new fine row compare as
-    # already-folded until the clock catches back up, freezing today/week
-    # for the whole rollback span. Reset it to 0 instead: the fold state
-    # machine is replay-safe by design, so refolding the still-present
-    # fine rows is harmless.
-    [ "$d_epoch" -gt $(( now_epoch + 60 )) ] && d_epoch=0
+    # snapshot restore) is untrustworthy rollback-era output, and it is
+    # dropped WHOLE, not patched: the first fix here only zeroed the
+    # watermark but kept the row's closed/peak/prev, and the replayed
+    # fine rows then walked the monotonic state machine AGAINST that
+    # stale state - a replayed value below the stale prev "closed" the
+    # stale peak into closed_cents a second time, permanently double-
+    # counting today/week. Dropping the whole row makes the replay
+    # rebuild that (day, session) from zero - by-design replay-safe;
+    # spend older than the fine window may be undercounted for that day,
+    # which is the accepted direction (never inflate). A future d_day
+    # (only reachable with a hand-forged epoch, since row_day derives
+    # from the epoch) is dropped by the same test for the same reason:
+    # it would otherwise sit in the week sum as ghost spend for days.
+    [ "$d_epoch" -gt $(( now_epoch + 60 )) ] && continue
+    [ "$d_day" -gt "$today_str" ] && continue
     dkey="${d_day}"$'\x1f'"${d_sid}"
     du_closed[$dkey]=$d_closed
     du_peak[$dkey]=$d_peak
@@ -1186,7 +1216,14 @@ fi
 branch=""
 branch_plain=""
 stash_count=""
-git_status_out=$(git -C "$dir" --no-optional-locks status --porcelain=v2 --branch --show-stash 2>/dev/null)
+# [ -n "$dir" ] gate: `git -C ""` is defined by git as "don't change
+# directory", so a payload with no workspace.current_dir would run
+# status in whatever CWD the host launched this script from and float
+# an unrelated repo's branch/dirty/stash onto line 1 (while the
+# directory segment itself correctly disappeared) - empty dir must mean
+# NO git segments, same silent-omission rule as every other segment.
+git_status_out=""
+[ -n "$dir" ] && git_status_out=$(git -C "$dir" --no-optional-locks status --porcelain=v2 --branch --show-stash 2>/dev/null)
 if [ -n "$git_status_out" ]; then
   # PERF: everything this block needs lives in the header lines (which
   # always precede entry lines) plus "does ANY entry line exist" - but a
@@ -1322,6 +1359,26 @@ if [ -n "$pr_number" ]; then
       esac
       [ -n "$ci_glyph_plain" ] && pr_plain="${pr_plain} ${ci_glyph_plain}"
     else
+      # IN-FLIGHT DEDUP: a slow/hanging gh (offline TCP timeouts run
+      # 20-75s) used to get a NEW detached gh chain forked on top of it
+      # every 10s frame - a self-amplifier in exactly the fork-budget
+      # regime that matters. One epoch-stamped marker file (builtin
+      # write, zero spawns on the render path) suppresses respawns for
+      # 120s; the job removes it when done, and a marker orphaned by a
+      # killed job simply ages out of the gate (plus it matches the
+      # statusline-ci-cache.* housekeeping glob).
+      ci_inflight="${ci_cache_file}.inflight"
+      ci_spawn=1
+      if [ -f "$ci_inflight" ]; then
+        ci_if_epoch=""
+        read -r ci_if_epoch < "$ci_inflight" 2>/dev/null
+        if [[ "$ci_if_epoch" =~ ^[0-9]+$ ]]; then
+          ci_if_age=$(( now_epoch - ci_if_epoch ))
+          [ "$ci_if_age" -ge 0 ] && [ "$ci_if_age" -lt 120 ] && ci_spawn=0
+        fi
+      fi
+      if [ "$ci_spawn" -eq 1 ]; then
+      printf '%s\n' "$now_epoch" > "$ci_inflight" 2>/dev/null
       (
         gh_states=$(gh pr checks "$pr_number" --repo "$ci_repo_pr" --json state -q '.[].state' 2>/dev/null)
         new_ci_state="none"
@@ -1340,8 +1397,10 @@ if [ -n "$pr_number" ]; then
         # render path): per-key rows for PRs nobody has rendered in a day
         # + the pre-per-key shared file a previous version left behind
         find "$HOME/.claude" -maxdepth 1 \( -name 'statusline-ci-cache.*' -o -name 'statusline-ci-cache' \) -mmin +1440 -delete 2>/dev/null
+        rm -f "$ci_inflight" 2>/dev/null
       ) >/dev/null 2>&1 &
       disown
+      fi
     fi
   fi
 fi
@@ -1699,7 +1758,7 @@ fi
 [[ "$COLUMNS" =~ ^[0-9]+$ ]] || COLUMNS=120
 
 tail_lines=()
-cache_cand_line=""
+cache_cand_ts=""
 if [ "$COLUMNS" -ge 100 ] && [ -n "$transcript_path" ] && [ -f "$transcript_path" ] && command -v tail >/dev/null 2>&1 && command -v awk >/dev/null 2>&1; then
   # Window default 512KiB (was 128KiB), env-overridable via
   # STATUSLINE_TRANSCRIPT_TAIL_BYTES: single JSONL entries were measured
@@ -1724,9 +1783,16 @@ if [ "$COLUMNS" -ge 100 ] && [ -n "$transcript_path" ] && [ -f "$transcript_path
   # unchanged. awk sits behind the same command -v guard as tail (both
   # are core Git-Bash tools); if either is missing the two segments
   # simply stay absent, like any other optional segment.
+  # The "A" record carries ONLY the extracted timestamp VALUE, never the
+  # whole matched line: a heavy assistant entry can be >100KiB, and both
+  # `mapfile <<<` on it (~3.5us/B) and the later `#*"timestamp"`
+  # prefix-strip (bash glob matching goes QUADRATIC on that pattern -
+  # measured 13.6s on a 116KiB line) would re-import the exact O(bytes)
+  # tax this pipeline exists to remove. Compact-boundary lines are tiny
+  # system entries and pass through whole for the N3 parser below.
   tail_scan=$(tail -c "$tail_bytes" -- "$transcript_path" 2>/dev/null | awk '
     /"subtype":"compact_boundary"/ && !/"isSidechain":true/ { print "C" $0; next }
-    /"type":"assistant"/ && !/"isSidechain":true/ && /"timestamp":"/ && (/"cache_read_input_tokens": ?[1-9]/ || /"cache_creation_input_tokens": ?[1-9]/) { last = $0 }
+    /"type":"assistant"/ && !/"isSidechain":true/ && (/"cache_read_input_tokens": ?[1-9]/ || /"cache_creation_input_tokens": ?[1-9]/) && match($0, /"timestamp":"[^"]*"/) { last = substr($0, RSTART+13, RLENGTH-14) }
     END { if (last != "") print "A" last }
   ' 2>/dev/null)
   tail_scan=${tail_scan//$'\r'/}
@@ -1735,7 +1801,7 @@ if [ "$COLUMNS" -ge 100 ] && [ -n "$transcript_path" ] && [ -f "$transcript_path
     for tsl in "${tail_scan_lines[@]}"; do
       case "$tsl" in
         C*) tail_lines+=("${tsl#C}") ;;
-        A*) cache_cand_line="${tsl#A}" ;;
+        A*) cache_cand_ts="${tsl#A}" ;;
       esac
     done
   fi
@@ -1801,14 +1867,12 @@ fi
 # the cache segment (10) above, space-separated, only when that segment
 # is itself already present - a bare countdown with no "cache N%" next
 # to it would be a floating, context-less fragment.
-if [ -n "$cache_seg" ] && [ -n "$cache_cand_line" ] && command -v date >/dev/null 2>&1; then
+if [ -n "$cache_seg" ] && [ -n "$cache_cand_ts" ] && command -v date >/dev/null 2>&1; then
   # awk already filtered for assistant + non-sidechain + nonzero cache
-  # counts + timestamp presence, so the old newest-first bash scan over
-  # the whole window reduces to extracting this one line's timestamp.
-  cache_ts=""
-  ts_rest="${cache_cand_line#*\"timestamp\":\"}"
-  ts_val="${ts_rest%%\"*}"
-  [ -n "$ts_val" ] && cache_ts="$ts_val"
+  # counts AND extracted the timestamp VALUE itself (never the whole
+  # line - see the pipeline comment above), so bash starts from the
+  # ready-made value with zero big-string work.
+  cache_ts="$cache_cand_ts"
   if [ -n "$cache_ts" ]; then
     cache_ts_epoch=$(date -d "$cache_ts" +%s 2>/dev/null)
     if [[ "$cache_ts_epoch" =~ ^[0-9]+$ ]]; then
@@ -1867,15 +1931,18 @@ fi
 cost_seg=""
 cost_plain=""
 cost_compact_seg=""
-if [ -n "$cost" ]; then
+# DOUBLE GUARD (hard-rule 2, same as the ctx fallback): only a NUMERIC
+# cost enters at all - the old [ -n ] let a garbage string reach printf,
+# which errored into the blackbox and rendered a fake "$0.00" (and next
+# to a real historical $/h rate that fake reads as a live figure). Digit
+# cap keeps the later integer comparisons inside bash arithmetic range.
+if [[ "$cost" =~ ^[0-9]{1,9}(\.[0-9]+)?$ ]]; then
   cost_int="${cost%%.*}"
   cost_color="$GRAY"
-  if [[ "$cost_int" =~ ^[0-9]+$ ]]; then
-    if [ "$cost_int" -ge 5 ]; then
-      cost_color="$RED_BRIGHT"
-    elif [ "$cost_int" -ge 1 ]; then
-      cost_color="$YELLOW"
-    fi
+  if [ "$cost_int" -ge 5 ]; then
+    cost_color="$RED_BRIGHT"
+  elif [ "$cost_int" -ge 1 ]; then
+    cost_color="$YELLOW"
   fi
   printf -v cost_amount '%.2f' "$cost"
   cost_seg="\$${cost_color}${cost_amount}${RESET}"
@@ -1978,15 +2045,21 @@ fi
 rl_seg=""
 rl_plain=""
 five_compact_seg=""
-if [ -n "$five" ]; then
+# DOUBLE GUARD (hard-rule 2): numeric-or-absent - the old [ -n ] let a
+# garbage used_percentage reach printf and render a fake healthy green
+# "5h 0%" instead of the segment disappearing; a negative or over-100
+# reading clamps into the 0..100 domain (ctx-fallback precedent), and
+# the 3-digit cap keeps every later -ge comparison inside bash
+# arithmetic range (a 21-digit number would otherwise blow it up).
+if [[ "$five" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]]; then
+  if [ "${five:0:1}" = "-" ]; then five="0"; fi
   five_int="${five%%.*}"
+  [ "$five_int" -gt 100 ] && { five_int=100; five="100"; }
   five_color="$GREEN"
-  if [[ "$five_int" =~ ^[0-9]+$ ]]; then
-    if [ "$five_int" -ge 80 ]; then
-      five_color="$RED_BRIGHT"
-    elif [ "$five_int" -ge 50 ]; then
-      five_color="$YELLOW"
-    fi
+  if [ "$five_int" -ge 80 ]; then
+    five_color="$RED_BRIGHT"
+  elif [ "$five_int" -ge 50 ]; then
+    five_color="$YELLOW"
   fi
   printf -v five_pct '%.0f' "$five"
   # REVERTED (N1 micro-bar rejected on visual review: two meanings in one
@@ -2023,15 +2096,16 @@ if [ -n "$five" ]; then
   rl_seg="$five_part"
   rl_plain="$five_part_plain"
 fi
-if [ -n "$week" ]; then
+# DOUBLE GUARD (hard-rule 2) - see the 5h window's comment above.
+if [[ "$week" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]]; then
+  if [ "${week:0:1}" = "-" ]; then week="0"; fi
   week_int="${week%%.*}"
+  [ "$week_int" -gt 100 ] && { week_int=100; week="100"; }
   week_color="$GREEN"
-  if [[ "$week_int" =~ ^[0-9]+$ ]]; then
-    if [ "$week_int" -ge 80 ]; then
-      week_color="$RED_BRIGHT"
-    elif [ "$week_int" -ge 50 ]; then
-      week_color="$YELLOW"
-    fi
+  if [ "$week_int" -ge 80 ]; then
+    week_color="$RED_BRIGHT"
+  elif [ "$week_int" -ge 50 ]; then
+    week_color="$YELLOW"
   fi
   printf -v week_pct '%.0f' "$week"
   # REVERTED (N1 micro-bar rejected - see the 5h window's comment above).
@@ -2127,6 +2201,10 @@ if [ -f "$usage_cache_file" ]; then
   usage_epoch="${usage_fields[0]}"
   if [[ "$usage_epoch" =~ ^[0-9]+$ ]]; then
     usage_age=$(( now_epoch - usage_epoch ))
+    # negative-age guard (clock rollback, same pattern as the CI cache):
+    # a future-stamped cache would otherwise both suppress refreshes AND
+    # keep serving frozen numbers for the whole rollback span
+    [ "$usage_age" -lt 0 ] && usage_age=999999
     [ "$usage_age" -lt 180 ] && usage_needs_refresh=0
     if [ "$usage_age" -le 1800 ]; then
       usage_extra_en="${usage_fields[1]}"
@@ -2270,8 +2348,11 @@ if [ "$usage_needs_refresh" -eq 1 ] && command -v curl >/dev/null 2>&1; then
       if [ -f "$cred_file" ] && command -v jq >/dev/null 2>&1; then
         oauth_token=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred_file" 2>/dev/null)
         if [ -n "$oauth_token" ]; then
-          usage_hdr_tmp="$HOME/.claude/.statusline-usage-hdr.$$.tmp"
-          usage_body_tmp="$HOME/.claude/.statusline-usage-body.$$.tmp"
+          # tmp names MUST match the orphan-sweep glob statusline-*.tmp.*
+          # (the old dot-prefixed .statusline-usage-*.$$.tmp form escaped
+          # every sweep - a killed background job stranded them forever)
+          usage_hdr_tmp="$HOME/.claude/statusline-usage-hdr.tmp.$$"
+          usage_body_tmp="$HOME/.claude/statusline-usage-body.tmp.$$"
           usage_http_code=$(curl -sS -m 5 -D "$usage_hdr_tmp" -o "$usage_body_tmp" -w '%{http_code}' \
             -H "Authorization: Bearer $oauth_token" \
             -H "anthropic-beta: oauth-2025-04-20" \
@@ -2349,12 +2430,11 @@ fi
 # parts*_plain arrays built alongside every colored segment above (OSC 8
 # sequences and color codes are never part of those plain strings, so
 # hyperlinks/colors can't skew alignment). Recomputed fresh every refresh.
-# Caveat: plain length is a bash CHARACTER count, not a terminal cell
-# count - CJK glyphs (e.g. in session_name) occupy two terminal cells, so
-# a column containing CJK text would align only approximately; none of
-# this script's non-last-cell segments are expected to contain CJK text
-# in practice (session_name is always the last cell on line 3 anyway, so
-# it is never padded regardless).
+# Widths are measured by disp_width() in TRUE terminal cells (East-Asian
+# wide chars count 2), so columns containing CJK text align exactly, not
+# approximately - the old character-count caveat predates disp_width and
+# no longer applies. session_name additionally sits as the last cell of
+# its line, so it is never padded regardless.
 SEP="${RESET}${GRAY}${NBSP}|${NBSP}${RESET}"
 
 # NARROW-TERMINAL ADAPTIVE: $COLUMNS is set by Claude Code (v2.1.153+) to

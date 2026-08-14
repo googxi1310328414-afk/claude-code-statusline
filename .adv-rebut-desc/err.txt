@@ -1,0 +1,1 @@
+DEBUG active_cols=[0 5 1 2 3 4] active_col_count=6 active_col_width_sum=89 columns=200 desc_budget=93 doc_formula_15=96

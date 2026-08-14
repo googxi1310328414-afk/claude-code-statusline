@@ -258,6 +258,42 @@ if [ "$1" = "--assert" ]; then
   # line got eaten, every 2-min task run popped an error dialog)
   LC_ALL=C grep -qP '[\x80-\xff]' statusline-watchdog.vbs && bad "watchdog vbs contains non-ASCII bytes" || ok "watchdog vbs pure ASCII"
 
+  # ---- adversarial-review round-2 regression asserts (2026-08-14) ----
+  # R10: garbage rate-limit percentage drops the segment (no green "0%")
+  rl_garb=$(jq -n '{session_id:"rg",model:{display_name:"M"},workspace:{current_dir:"/x"},rate_limits:{five_hour:{used_percentage:"garbage",resets_at:"soon"}}}' | bash ./statusline-command.sh | strip)
+  printf '%s' "$rl_garb" | grep -q '5h' && bad "garbage 5h rendered fake data" || ok "garbage 5h segment dropped"
+  # R11: raw ESC/BEL in session_name must NOT reach stdout (OSC-injection)
+  escout=$(jq -n '{session_id:"esc",model:{display_name:"M"},workspace:{current_dir:"/x"},session_name:("evil"+"\u001b"+"]0;PWNED"+"\u0007"+"tail")}' | bash ./statusline-command.sh)
+  if printf '%s' "$escout" | LC_ALL=C grep -qP '\\x1b\\]0;PWNED'; then
+    bad "session_name OSC injection reaches terminal"
+  elif printf '%s' "$escout" | grep -q 'PWNED'; then
+    ok "session_name C0 stripped (OSC text inert)"
+  else
+    bad "session_name vanished entirely"
+  fi
+  # R12: a future-day rollup row must not inflate the week sum
+  futday=$(date -d '+5 days' +%Y%m%d 2>/dev/null || date -v+5d +%Y%m%d)
+  printf "%s\x1fghost\x1f500\x1f250\x1f250\x1f0\n" "$futday" > "$STATUSLINE_DAILY_FILE"
+  ghostout=$(bash ./statusline-command.sh < fixtures/minimal.json | strip)
+  printf '%s' "$ghostout" | grep -q 'week \$7.50' && bad "ghost future-day row counted into week" || ok "future-day rollup row dropped"
+  : > "$STATUSLINE_DAILY_FILE"
+  # R13: empty current_dir must NOT run git in the script's CWD (we ARE
+  # in a git repo right now - a leaked branch segment would show main)
+  nodir=$(jq -n '{session_id:"nd",model:{display_name:"M"}}' | bash ./statusline-command.sh | strip | head -1)
+  printf '%s' "$nodir" | grep -qE '\bmain\b' && bad "empty dir leaked CWD repo branch" || ok "empty dir renders no git segments"
+  # R14: non-string task id must not fabricate a cache key from the next
+  # JSON key name (hook would cross-serve sessions) - no spool, no output
+  rm -f "$STATUSLINE_PANEL_DIR"/spool.* 2>/dev/null
+  numout=$(printf '{"columns":120,"tasks":[{"id":123,"name":"x","status":"running"}]}' | bash ./statusline-panel-hook.sh)
+  if [ -z "$numout" ] && ! ls "$STATUSLINE_PANEL_DIR"/spool.* >/dev/null 2>&1; then ok "numeric id yields no cache key"; else bad "numeric id fabricated a key"; fi
+  # R15: a renderer that exits 0 with EMPTY output must not clobber the
+  # last good cache frame (fork-exhaustion blank-frame guard)
+  printf '#!/bin/bash\nexit 0\n' > "$tmpd/emptyrender.sh"
+  printf '%s\n' '{"id":"tmo2","content":"GOOD_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.tmo2"
+  printf '{"columns":120,"tasks":[{"id":"tmo2","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.tmo2.new"
+  STATUSLINE_PANEL_RENDERER="$tmpd/emptyrender.sh" bash ./statusline-panel-daemon.sh --once
+  grep -q GOOD_FRAME "$STATUSLINE_PANEL_DIR/cache.tmo2" 2>/dev/null && ok "empty render keeps last good frame" || bad "empty render clobbered cache"
+
   # panel daemon architecture: the hook must spool the payload, stay
   # silent on a cold cache, serve the cached frame instantly, and the
   # daemon (--once) must render a spool into that cache

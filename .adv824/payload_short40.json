@@ -1,0 +1,1 @@
+{"columns": 140, "tasks": [{"id": "t0", "name": "worker", "type": "general", "status": "running", "effort": "max", "model": "claude-sonnet-5", "tokenCount": 12345, "startTime": 1700000000, "description": "Review the auth module for bugs now pls"}]}

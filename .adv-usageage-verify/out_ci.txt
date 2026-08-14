@@ -1,0 +1,2 @@
+[0m[97m08:58:32[0m         [0m[90m | [0m]8;;https://github.com/acme/widgets\[36macme[0m[90m/[0m[96mwidgets[0m]8;;\[0m[90m | [0m[32mmain[0m[33m*[0m[0m[90m | [0m[35mPR#42[0m[0m
+[0m[90mextra[0m [37m$0.50/$1.00[0m[0m

@@ -47,6 +47,7 @@ fi
 
 # ---------- 语法门 + 原子安装 ----------
 mkdir -p "$CLAUDE_DIR" "$CLAUDE_DIR/statusline-panel.d" || die "无法创建 $CLAUDE_DIR"
+daemon_updated=0
 for f in "${INSTALL_FILES[@]}"; do
   [ -f "$src_dir/$f" ] || die "包内缺少 $f"
   case "$f" in *.sh) bash -n "$src_dir/$f" || die "$f 语法检查未过（下载损坏？）" ;; esac
@@ -58,7 +59,22 @@ for f in "${INSTALL_FILES[@]}"; do
   cp "$src_dir/$f" "$CLAUDE_DIR/.install.$f.$$" && mv -f "$CLAUDE_DIR/.install.$f.$$" "$CLAUDE_DIR/$f" || die "安装 $f 失败"
   chmod +x "$CLAUDE_DIR/$f" 2>/dev/null
   say "✓ $f 已安装"
+  [ "$f" = "statusline-panel-daemon.sh" ] && daemon_updated=1
 done
+
+# ---------- 常驻 daemon 回收（仅 daemon 本体更新时） ----------
+# daemon 是常驻进程：磁盘上换了新文件，跑着的还是旧代码——不回收的话
+# 修复对活跃会话永不生效，卡死的旧实例更是探活恒真、永不被替换。渲染
+# 脚本(subagent-statusline.sh)不用重启——daemon 每帧都是新的子进程读盘。
+if [ "$daemon_updated" -eq 1 ]; then
+  daemon_pid_file="$CLAUDE_DIR/statusline-panel.d/daemon.pid"
+  old_dp=""
+  [ -r "$daemon_pid_file" ] && read -r old_dp < "$daemon_pid_file" 2>/dev/null
+  if [ -n "$old_dp" ] && kill -0 "$old_dp" 2>/dev/null; then
+    kill "$old_dp" 2>/dev/null
+    say "✓ 旧面板 daemon(pid $old_dp) 已回收——下一拍面板钩子自动以新版拉起"
+  fi
+fi
 
 # ---------- settings.json 合并（保留既有键；失败不落地） ----------
 snippet="$src_dir/settings-snippet.json"

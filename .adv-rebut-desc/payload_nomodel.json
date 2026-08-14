@@ -1,0 +1,44 @@
+{
+  "columns": 200,
+  "tasks": [
+    {
+      "id": "t1",
+      "name": "Alpha builder",
+      "type": "local_agent",
+      "effort": "high",
+      "status": "running",
+      "startTime": 1786665427,
+      "tokenCount": 221000,
+      "tokenSamples": [
+        1000,
+        5000,
+        12000,
+        20000,
+        33000,
+        50000,
+        70000,
+        95000,
+        125000
+      ],
+      "description": "Some fairly long description text to test the truncation budget behavior of the script when many columns are active simultaneously padding out the row layout end to end"
+    },
+    {
+      "id": "t2",
+      "name": "Beta reviewer",
+      "type": "local_agent",
+      "effort": "medium",
+      "status": "completed",
+      "startTime": 1786668968,
+      "tokenCount": 50000,
+      "tokenSamples": [
+        1000,
+        3000,
+        7000,
+        15000,
+        25000,
+        40000
+      ],
+      "description": "Short desc"
+    }
+  ]
+}

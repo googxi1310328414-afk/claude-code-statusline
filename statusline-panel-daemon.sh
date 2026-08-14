@@ -66,7 +66,7 @@ render_ticks=$(( render_timeout * 10 / 3 ))
 
 err_log="$panel_dir/daemon-err.log"
 if [ -f "$err_log" ]; then
-  mapfile -t _el < "$err_log" 2>/dev/null
+  mapfile -t -n 501 _el < "$err_log" 2>/dev/null
   [ "${#_el[@]}" -gt 500 ] && : > "$err_log" 2>/dev/null
 fi
 exec 2>>"$err_log"
@@ -98,8 +98,25 @@ tick_fifo="$panel_dir/.tick.fifo"
 shopt -s nullglob
 idle=0
 render_seq=0
+own_check=0
 while :; do
   worked=0
+  # OWNERSHIP SELF-CHECK (~9s cadence, zero spawns): the rm+exclusive-
+  # recreate takeover still has a narrow TOCTOU where two racers both
+  # end up running with only the later one's pid registered. The exit-
+  # time ownership check (below) already stops the cascade; this check
+  # CONVERGES the transient double-daemon fast - an instance that finds
+  # a DIFFERENT live pid registered concedes and exits instead of
+  # coasting to the 2-minute idle death.
+  own_check=$(( own_check + 1 ))
+  if [ "$once" -eq 0 ] && [ "$own_check" -ge 30 ]; then
+    own_check=0
+    cur_owner=""
+    [ -r "$panel_dir/daemon.pid" ] && read -r cur_owner < "$panel_dir/daemon.pid"
+    if [ -n "$cur_owner" ] && [ "$cur_owner" != "$$" ] && kill -0 "$cur_owner" 2>/dev/null; then
+      exit 0
+    fi
+  fi
   for sp in "$panel_dir"/spool.*.new; do
     key=${sp##*/spool.}
     key=${key%.new}
@@ -129,7 +146,13 @@ while :; do
       kill "$r_pid" 2>/dev/null
       wait "$r_pid" 2>/dev/null
       rm -f "$cache_tmp" 2>/dev/null
-    elif wait "$r_pid" 2>/dev/null; then
+    elif wait "$r_pid" 2>/dev/null && [ -s "$cache_tmp" ]; then
+      # -s gate: a renderer that exits 0 with EMPTY output (fork
+      # exhaustion makes its jq capture come back blank and the script
+      # end cleanly with no rows) must NOT overwrite the last good frame
+      # with a zero-byte cache - the hook would then serve nothing and
+      # every session's panel would blank precisely during the storms
+      # this cache exists to ride out. Skip the frame instead.
       mv -f "$cache_tmp" "$panel_dir/cache.$key" 2>/dev/null
     else
       rm -f "$cache_tmp" 2>/dev/null

@@ -1,32 +1,34 @@
 # claude-code-statusline
 
-An information-dense, colorized status line for Claude Code (Windows / Git Bash): a three-line themed grid for the main session plus a fully custom subagent panel row. Segments with missing data disappear cleanly; empty lines vanish; key metrics change color with state.
+An information-dense, colorized status line for Claude Code (Windows / Git Bash): a FOUR-line themed grid for the main session plus a fully custom subagent panel row. Segments with missing data disappear cleanly; empty lines vanish; key metrics change color with state.
 
 > 中文原版（权威）见 [README.md](README.md)。This English page is a condensed translation.
 
 ![preview](assets/preview.svg)
 
 ```
-08:17:08               | Fable 5·max·think | ~\claude-code-statusline  | main*
-ctx ████░ 71% 294k/1M  | ▂▃▂▄ 2.9k/m       | cache 99.3%
-$74.94 $79.8/h         | +2005/-585        | 5h 32%→09:10 7d 12%→08-15 | » session-name
+08:17:08                 | fable-5·max·think | ~\claude-code-statusline  | main*
+ctx ███░│ 71% 294k/1M    | ▂▃▂▄ 2.9k/m       | cache 99.3% r337.0k hot   | ↻2 ↓230k
+$74.94 $79.8/h           | today $848.27     | week $3822.68             | +2005/-585
+5h 32%·t60%→09:10 7d 12% | wk Fab8%          | » session-name
 ```
 
-- **Line 1 — identity & location**: seconds clock · model + effort heat + thinking marker · abbreviated directory · `⎇ worktree` · repo (OSC 8 hyperlink) · branch + dirty `*` · `⚑N` stash count (bright red at ≥5, hidden at zero) · PR (hyperlink + review state)
-- **Line 2 — context engine**: `ctx` battery (occupancy = input + latest output tokens, `k`/`M` units) · token sparkline + burn rate (from a cross-refresh history file) · cache hit rate
-- **Line 3 — spend & quota**: cost + `$X.X/h` rate · lines changed · 5h/7d rate-limit windows with reset times · `»` session name
+- **Line 1 — identity & location**: seconds clock · short model id (panel-style, keeps the `[1m]` tag) + effort heat + thinking marker · abbreviated directory · `⎇ worktree` · repo (OSC 8 hyperlink) · branch + dirty `*` · `⚑N` stash count (bright red at ≥5, hidden at zero) · PR (hyperlink + review state + CI badge)
+- **Line 2 — context engine**: `ctx` battery (occupancy = input + latest output tokens; the fifth cell renders as the `│` 80%-compaction marker, `k`/`M` units) · token sparkline (6 glyph levels capped at `▆`) + burn rate · cache hit rate (one decimal) + freshness (hot→countdown→cold) · `↻` compaction count + reclaimed tokens
+- **Line 3 — spend**: cost + `$X.X/h` rate · `today` cross-session total · `week` 7-day total · lines changed
+- **Line 4 — quota & session**: 5h/7d windows with `·t` pace cursor and reset times · `wk` per-model weekly quota · `»` session name
 
-The subagent panel row (via `subagentStatusLine`) renders every agent as an aligned table row:
+The subagent panel row (via `subagentStatusLine`) renders every agent as an aligned table row (standalone model column; sparkline capped at `▆`):
 
 ```
-▸ 0.2.79 收尾与发布(local_agent) ● | 295k tok | █▄▁ 14.9k/m | Σ78% | 19m44s@08:11:18 | description…
+▸ 0.2.79 收尾与发布(local_agent) ● | fable-5 | 295k tok | ▆▄▁ 14.9k/m | Σ78% | 19m44s@08:11:18 | description…
 ```
 
 with bright-magenta identity (vs. the main line's bright cyan), a standalone always-on short-model column, status glyphs (● ○ ✓ ✗), cumulative token spend (deliberately **not** a fake "context battery" — `tokenCount` is cumulative), sparkline + rate, Σ fleet-share, seconds-precision elapsed time, and a width-budgeted description. Columns align using true display-width measurement (CJK = 2 cells).
 
 ## Install
 
-Requirements: Claude Code (≥ 2.1.205 for some subagent fields), Git Bash (bash ≥ 4, UTF-8), `jq`, `git` (≥ 2.35 for the stash segment).
+Requirements: Claude Code ≥ 2.1.221 (subagent effort field), Git Bash (bash ≥ 4.3 — `local -n` namerefs, UTF-8), `jq`, `git` (≥ 2.35 for the stash segment).
 
 One-liner (idempotent — re-running updates; offline when run inside a local clone):
 
@@ -48,7 +50,7 @@ It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES s
 ```bash
 bash test.sh          # render all fixtures (see real colors in your terminal)
 bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
-bash test.sh --assert # 60 assertions (CI mode; perf gates + adversarial-review regression group)
+bash test.sh --assert # 66 assertions (CI mode; perf gates + two adversarial-review regression groups)
 ```
 
 ## Notable engineering notes

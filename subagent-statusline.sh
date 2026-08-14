@@ -151,14 +151,16 @@ export LC_ALL=C.UTF-8
 #      "@HH:MM:SS" in gray - the local clock time startTime normalizes to
 #   6  description - gray, width-budgeted against `columns` (default 120),
 #      the budget measured in display CELLS, not characters. Because
-#      alignment forces columns 1-5 to their globally padded widths
+#      alignment pads every ACTIVE column to its global max width
 #      whenever description follows, the budget is UNIFORM across every
-#      row in the payload (not per-row): budget = columns - (sum of the
-#      five columns' max display widths) - 15 (5 columns' worth of " | "
-#      separators, one between each pair plus one before the description
-#      itself). Omitted if budget < 8, else cut - by accumulating each
-#      character's disp_width() until budget-1 cells are used - + "…"
-#      when longer than budget.
+#      row in the payload (not per-row); the authoritative formula (one
+#      place in code, PASS 2):
+#        budget = columns - active_col_width_sum - 3*active_col_count
+#      i.e. only columns at least one row actually uses are billed (the
+#      standalone model column makes SIX candidates), each active column
+#      paying its max width + 3 cells of separator. Omitted if budget
+#      < 8, else cut - by accumulating each character's disp_width()
+#      until budget-1 cells are used - + "…" when longer than budget.
 #
 # Example row content (id omitted here):
 #   ▸ 0.2.79 收尾与发布(local_agent) ● | 221k tok | ▁▂▄ 11.2k/m | Σ84% | 19m41s@07:41:30 | 描述…
@@ -821,7 +823,18 @@ for ((r=0; r<row_total; r++)); do
   description="${descriptions[$r]}"
   desc_seg=""
   if [ -n "$description" ] && [ "$desc_budget" -ge 8 ]; then
-    disp_width "$description"; desc_disp_len="$REPLY"
+    # BOUNDED measure (round-2 fix): display width is always >= char
+    # count (every char is 1 or 2 cells), so a description with more
+    # CHARS than the budget must overflow - decide that with ${#} alone
+    # instead of walking a full disp_width over an arbitrarily long
+    # string (~0.3ms/char measured on CJK; the truncation walk below is
+    # already budget-bounded by its own break, so with this gate every
+    # per-char cost in this block is capped at ~budget chars total).
+    if [ "${#description}" -le "$desc_budget" ]; then
+      disp_width "$description"; desc_disp_len="$REPLY"
+    else
+      desc_disp_len=$(( desc_budget + 1 ))
+    fi
     if [ "$desc_disp_len" -gt "$desc_budget" ]; then
       # Cut by accumulated DISPLAY width, not character count: walk
       # characters, keep adding while the running total stays within

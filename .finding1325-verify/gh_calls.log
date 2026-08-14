@@ -1,0 +1,4 @@
+1786667218 gh invoked: pr checks 42 --repo acme/widgets --json state -q .[].state
+1786667220 gh invoked: pr checks 42 --repo acme/widgets --json state -q .[].state
+1786667221 gh invoked: pr checks 42 --repo acme/widgets --json state -q .[].state
+1786667223 gh invoked: pr checks 42 --repo acme/widgets --json state -q .[].state
