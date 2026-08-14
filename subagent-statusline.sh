@@ -484,6 +484,20 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # disappear rather than showing invented numbers.
   [[ "$token_count" =~ ^[0-9]{1,12}$ ]] || token_count=""
   [[ "$start_time" =~ ^[0-9]{1,15}$ ]] || start_time=""
+  # SANITY WINDOW (round-14, same discipline as the main bar's
+  # resets_at): a digit cap alone let startTime=0 render
+  # "496318h25m16s@08:00:00" - a 1970 wall clock in the bright-red
+  # long-runner tier, which this project forbids everywhere else; a
+  # 15-digit (microsecond) value landed in the year 5138 the other
+  # way. A negative value was already dropped by the digit cap, so
+  # the two ends behaved differently as well. Out-of-window now blanks
+  # the field, i.e. the elapsed cell disappears for that row instead
+  # of showing an invented time.
+  if [ -n "$start_time" ]; then
+    st_probe=$start_time
+    [ "$st_probe" -gt 1000000000000 ] && st_probe=$(( st_probe / 1000 ))
+    { [ "$st_probe" -lt $(( samp_now - 604800 )) ] || [ "$st_probe" -gt $(( samp_now + 3600 )) ]; } && start_time=""
+  fi
   identity_plain=${identity_plain//"$BSL2"/"$BSL1"}
   task_type=${task_type//"$BSL2"/"$BSL1"}
   description=${description//"$BSL2"/"$BSL1"}

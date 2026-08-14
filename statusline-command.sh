@@ -681,6 +681,10 @@ last_hist_epoch=""
 # state-machine semantics; only the ORDER moved here.
 daily_file="${STATUSLINE_DAILY_FILE:-$HOME/.claude/statusline-daily.tsv}"
 max_persisted_wm=0
+# "this machine has no rollup history at all" (first run / fresh
+# install / deleted file). It is the ONLY state in which an unknown
+# session may be seeded at base 0 - see fold_daily_row's baseline note.
+daily_had_rows=0
 declare -A du_closed du_peak du_prev du_epoch du_base du_sidprev du_sidepoch
 declare -A du_watermark
 printf -v today_str '%(%Y%m%d)T' -1
@@ -738,16 +742,36 @@ if [ -f "$daily_file" ]; then
     du_peak[$dkey]=$d_peak
     du_prev[$dkey]=$d_prev
     du_epoch[$dkey]=$d_epoch
-    [[ "$d_base" =~ ^[0-9]{1,12}$ ]] || d_base=0
-    du_base[$dkey]=$d_base
+    # EMPTY 7th field = "no baseline established yet" (round-14). A key
+    # created by mark_daily_seen (a cost-less row) has no baseline at
+    # all, and persisting it as 0 froze that lie: the next frame read a
+    # KNOWN base of 0, the first real cost row was seeded against it,
+    # and the cross-midnight double count came right back (a $5.10
+    # session rendering week $10.10, measured across two frames). Left
+    # unset here, it is seeded by fold_daily_row when the first cents
+    # actually arrive. A legacy 6-column row still reads as a KNOWN 0
+    # (see above), so migration cannot move an old day's total.
+    if [ -n "$d_base" ]; then
+      [[ "$d_base" =~ ^[0-9]{1,12}$ ]] || d_base=0
+      du_base[$dkey]=$d_base
+    fi
     # newest row per sid carries that session's last cumulative value,
-    # which is the midnight baseline for any later day it folds into
-    if [ "$d_epoch" -gt "${du_sidepoch[$d_sid]:-0}" ]; then
+    # which is the midnight baseline for any later day it folds into.
+    # WATERMARK-ONLY ROWS ARE NOT EVIDENCE (round-14): mark_daily_seen
+    # writes an all-zero row purely to persist a watermark, and letting
+    # it win the "newest row" race made the session claim a last
+    # cumulative of 0 - overwriting the real one from yesterday and
+    # re-arming the very double count the baseline exists to prevent.
+    # A post-/clear row is still evidence (its closed column carries the
+    # runs that already ended), so only an ALL-zero row is skipped.
+    if [ "$d_epoch" -gt "${du_sidepoch[$d_sid]:-0}" ] &&
+       { [ "$d_prev" != "0" ] || [ "$d_peak" != "0" ] || [ "$d_closed" != "0" ]; }; then
       du_sidepoch[$d_sid]=$d_epoch
       du_sidprev[$d_sid]=$d_prev
     fi
     [ "$d_epoch" -gt "${du_watermark[$d_sid]:-0}" ] && du_watermark[$d_sid]=$d_epoch
     [ "$d_epoch" -gt "$max_persisted_wm" ] && max_persisted_wm=$d_epoch
+    daily_had_rows=1
   done
 fi
 
@@ -761,21 +785,51 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
   printf -v row_day '%(%Y%m%d)T' "$1"
   dkey="${row_day}"$'\x1f'"$2"
   d_prev=${du_prev[$dkey]:-}
+  # MIDNIGHT BASELINE (round-12, rewritten round-14): .cost.total_cost_usd
+  # is a running per-SESSION total that does NOT reset at midnight, while
+  # this rollup is keyed (day, sid). Seeding a new day with the FULL
+  # cumulative made week (which sums both days) count the pre-midnight
+  # money twice - a session that spent $5.10 rendered week $10.10. The day
+  # records the cumulative it inherited as its BASE and contributes
+  # closed+peak-base, i.e. only what was actually spent during it.
+  #
+  # SEEDED INDEPENDENTLY OF THE RUN STATE MACHINE (round-14): this used to
+  # live inside the "first observation" branch below, which mark_daily_seen
+  # walks straight past - a cost-less row (the payload contract allows a
+  # missing total_cost_usd) creates the key with prev="0", so the first
+  # REAL cost row took the monotonic branch and the base stayed unset =
+  # 0 forever. One such frame at the wrong moment re-armed the exact
+  # $5.10-renders-as-$10.10 double count, permanently (the fine rows are
+  # gone 90min later). The base is now computed the first time the key
+  # needs one, whichever branch created it.
+  #
+  # UNKNOWN BASELINE IS NOT ZERO (round-14): du_sidprev only survives in
+  # PER-SESSION rows, and three paths replace those with an _agg row
+  # (settled-day fold, the >400-row overflow merge at 3h, the 9-day trim).
+  # A session that returns afterwards - a background tab resuming, a
+  # yesterday row merged away on a busy machine - was then seeded at base
+  # 0, i.e. its whole inherited cumulative was booked as today's spend
+  # while that same money already sat inside _agg: today AND week
+  # double-counted, in the direction this file everywhere forbids. With no
+  # baseline on record the honest answer is "this day owns only what we
+  # OBSERVE it spend", so the base becomes the seeded value itself. For a
+  # genuinely new session that costs nothing (its first frame lands within
+  # seconds of session start, at ~$0.00); the one case that legitimately
+  # wants base 0 - a machine with NO rollup state at all, seeding from
+  # whatever fine rows exist - is kept explicitly.
+  if [ -z "${du_base[$dkey]+x}" ]; then
+    dbase=${du_sidprev[$2]-}
+    if [ -z "$dbase" ]; then
+      if [ "$daily_had_rows" -eq 1 ]; then dbase=$3; else dbase=0; fi
+    fi
+    # a base above the seeded value means the counter reset (/clear)
+    # across the boundary - fall back to 0
+    [ "$dbase" -gt "$3" ] && dbase=0
+    du_base[$dkey]=$dbase
+  fi
   if [ -z "$d_prev" ]; then
     du_closed[$dkey]=${du_closed[$dkey]:-0}
     du_peak[$dkey]=$3
-    # MIDNIGHT BASELINE (round-12): .cost.total_cost_usd is a running
-    # per-SESSION total that does NOT reset at midnight, while this
-    # rollup is keyed (day, sid). Seeding a new day with the FULL
-    # cumulative made week (which sums both days) count the
-    # pre-midnight money twice - a session that spent $5.10 rendered
-    # week $10.10. The day now records the cumulative it inherited as
-    # its BASE and contributes closed+peak-base, i.e. only what was
-    # actually spent during it. A base above the seeded value means
-    # the counter reset (/clear) across the boundary - fall back to 0.
-    dbase=${du_sidprev[$2]:-0}
-    [ "$dbase" -gt "$3" ] && dbase=0
-    du_base[$dkey]=$dbase
   elif [ "$3" -lt "$d_prev" ]; then
     du_closed[$dkey]=$(( ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} ))
     du_peak[$dkey]=$3
@@ -805,7 +859,9 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
 # regression round-7 claimed to fix). A zero-cents row persists the
 # watermark; it adds nothing to today/week and leaves the monotonic run
 # untouched (prev defaults to 0, so a later real cost row seeds the
-# peak exactly as a first observation would).
+# peak exactly as a first observation would - the BASE is seeded by
+# fold_daily_row's own independent block, precisely because it cannot
+# rely on this key still looking untouched).
 mark_daily_seen() { # $1=epoch $2=sid
   printf -v row_day '%(%Y%m%d)T' "$1"
   dkey="${row_day}"$''"$2"
@@ -1152,7 +1208,7 @@ if [ "$daily_persist_due" -eq 1 ]; then
       daily_agg[$d_day]=$(( ${daily_agg[$d_day]:-0} + d_contrib ))
       continue
     fi
-    daily_out_lines+=("${d_day}"$''"${d_sid}"$''"${du_closed[$dkey]:-0}"$''"${du_peak[$dkey]:-0}"$''"${du_prev[$dkey]:-0}"$''"${du_epoch[$dkey]:-0}"$''"${du_base[$dkey]:-0}")
+    daily_out_lines+=("${d_day}"$''"${d_sid}"$''"${du_closed[$dkey]:-0}"$''"${du_peak[$dkey]:-0}"$''"${du_prev[$dkey]:-0}"$''"${du_epoch[$dkey]:-0}"$''"${du_base[$dkey]-}")
   done
   for d_day in "${!daily_agg[@]}"; do
     # 7 columns like every other row (round-13): the aggregate is

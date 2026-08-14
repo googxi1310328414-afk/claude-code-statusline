@@ -484,7 +484,12 @@ if [ "$1" = "--assert" ]; then
   printf '%smg11000.50
 ' "$((now-100))" > "$STATUSLINE_HISTORY_FILE"
   mgout=$(bash ./statusline-command.sh < fixtures/full.json | strip)
-  printf '%s' "$mgout" | grep -q 'week \$68' && ok "settled-day merge preserves week total" || bad "settled-day merge changed week total"
+  # 9 settled rows x $7.50 = $67.50. The two sids that appear only in the
+  # fine file (mg, and the fixture's own abc) contribute NOTHING: round-14
+  # stopped seeding an unknown session at base 0 (see fold_daily_row), so
+  # a session with no baseline on record owns only what it is OBSERVED to
+  # spend from here on - the never-inflate direction.
+  printf '%s' "$mgout" | grep -q 'week \$67\.5' && ok "settled-day merge preserves week total" || bad "settled-day merge changed week total ($(printf '%s' "$mgout" | grep -o 'week \$[0-9.]*'))"
   [ "$(grep -c '_agg' "$STATUSLINE_DAILY_FILE")" -eq 3 ] && ok "settled days merged to one row each" || bad "settled-day merge row count wrong"
   # ---- adversarial-review round-8 regression asserts (2026-08-14) ----
   # R33: .thinking as a scalar/array must not collapse the bar (the
@@ -731,6 +736,24 @@ ELJSON
 ' "$((now-40))" "$S13" "$S13" "$S13" > "$STATUSLINE_HISTORY_FILE"
   mn_out=$(jq '.cost.total_cost_usd=32.00' fixtures/full.json | bash ./statusline-command.sh | strip)
   printf '%s' "$mn_out" | grep -q 'today \$3\.' && ok "cross-midnight session still shows today" || bad "today segment vanished for a cross-midnight session"
+  # R58: the installer's Windows-side reclaim must use the SAME strict
+  # judgement as the watchdog. A bare "the command line mentions the
+  # filename" match, aimed at a winpid that Windows has since recycled,
+  # is precisely the 2026-08-13/14 mis-kill shape - and this branch is
+  # the one that actually calls Stop-Process -Force.
+  if grep -q 'CommandLine -notmatch' ./install.sh && grep -qF 'statusline-panel-daemon\.sh' ./install.sh; then
+    ok "installer's Windows-side reclaim uses the strict argv judgement"
+  else
+    bad "installer still reclaims by a bare filename mention"
+  fi
+  grep -q 'ps_killed' ./install.sh && ok "installer reports a reclaim only when one happened" || bad "installer reports a reclaim unconditionally"
+  # R59: startTime needs a sanity WINDOW, not just a digit cap - 0 used to
+  # render "496318h25m16s@08:00:00", a 1970 wall clock in the bright-red
+  # long-runner tier (the main bar has had this guard since round-6)
+  zt14=$(jq -nc '{columns:120,tasks:[{id:"zt1",label:"zero",status:"running",tokenCount:0,startTime:0,description:"y"}]}' | bash ./subagent-statusline.sh | jq -r .content)
+  printf '%s' "$zt14" | grep -qE '[0-9]+h[0-9]+m[0-9]+s' && bad "panel renders a 1970 clock for startTime=0" || ok "out-of-window startTime drops the elapsed cell"
+  zt14b=$(jq -nc --argjson n "$(date +%s)" '{columns:120,tasks:[{id:"zt2",label:"okk",status:"running",tokenCount:0,startTime:(($n-45)*1000),description:"y"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  printf '%s' "$zt14b" | grep -qE '4[0-9]s@' && ok "in-window startTime still renders elapsed" || bad "sane startTime lost its elapsed cell"
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   # R51: a wedged daemon's IN-FLIGHT RENDER CHILD must be reaped. Round-12
@@ -810,6 +833,48 @@ sleep 300
   # R55: PowerShell 5.1 decodes a BOM-less .ps1 with the system ANSI code
   # page - the same trap that broke the .vbs under GBK
   [ "$(head -c 3 ./statusline-watchdog.ps1 | od -An -tx1 | tr -d ' \n')" = "efbbbf" ] && ok "watchdog ps1 carries a UTF-8 BOM" || bad "watchdog ps1 has no BOM (PS 5.1 decodes it as ANSI)"
+  # ---- adversarial-review round-14 regression asserts (2026-08-15) ----
+  S14=''
+  # R56: a COST-LESS first row must not destroy the day's midnight
+  # baseline. mark_daily_seen creates the key with prev="0", which sent
+  # the first real cost row down the monotonic branch - and the baseline
+  # used to be seeded only in the other one, so it stayed 0 forever and
+  # the cross-midnight double count came straight back ($5.10 -> $10.10).
+  : > "$STATUSLINE_DAILY_FILE"
+  ymd14=$(date -d "-1 days" +%Y%m%d 2>/dev/null || date -v-1d +%Y%m%d)
+  printf '%s%sS1%s0%s500%s500%s%s%s0
+' "$ymd14" "$S14" "$S14" "$S14" "$S14" "$S14" "$((now-86400))" "$S14" > "$STATUSLINE_DAILY_FILE"
+  {
+    printf '%s%sS1%s1000%s
+' "$((now-70))" "$S14" "$S14" "$S14"
+    printf '%s%sS1%s1000%s5.10
+' "$((now-35))" "$S14" "$S14" "$S14"
+  } > "$STATUSLINE_HISTORY_FILE"
+  mn14=$(jq '.session_id="S1"|.cost.total_cost_usd=5.10' fixtures/full.json | bash ./statusline-command.sh | strip)
+  printf '%s' "$mn14" | grep -q 'week \$5\.1' && ok "cost-less row keeps the midnight baseline" || bad "cost-less row zeroed the baseline ($(printf '%s' "$mn14" | grep -o 'week \$[0-9.]*'))"
+  b14=$(grep "$(date +%Y%m%d)" "$STATUSLINE_DAILY_FILE" | head -1 | cut -d"$S14" -f7)
+  [ "${b14:-0}" = "500" ] && ok "baseline column seeded despite the cost-less row" || bad "baseline column is ${b14:-none}, want 500"
+  # R57: a session whose per-session row was folded into _agg comes back
+  # with NO baseline on record - seeding it at 0 booked its whole
+  # inherited cumulative as today's spend while that money already sat
+  # inside _agg (today and week double-counted).
+  : > "$STATUSLINE_DAILY_FILE"
+  d14=$(date -d "-3 days" +%Y%m%d 2>/dev/null || date -v-3d +%Y%m%d)
+  {
+    printf '%s%s_agg%s500%s0%s0%s0%s0
+' "$d14" "$S14" "$S14" "$S14" "$S14" "$S14" "$S14"
+    printf '%s%sother%s0%s10%s10%s%s%s0
+' "$(date +%Y%m%d)" "$S14" "$S14" "$S14" "$S14" "$S14" "$((now-60))" "$S14"
+  } > "$STATUSLINE_DAILY_FILE"
+  : > "$STATUSLINE_HISTORY_FILE"
+  ag14=$(jq '.session_id="S1"|.cost.total_cost_usd=6.00' fixtures/full.json | bash ./statusline-command.sh | strip)
+  if printf '%s' "$ag14" | grep -q 'week \$5\.1'; then
+    ok "returning session is not re-seeded at base 0"
+  else
+    bad "returning session re-counted its inherited cumulative ($(printf '%s' "$ag14" | grep -o 'week \$[0-9.]*'))"
+  fi
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   : > "$STATUSLINE_DAILY_FILE"

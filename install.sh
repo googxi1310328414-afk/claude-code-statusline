@@ -138,9 +138,20 @@ if [ "$daemon_updated" -eq 1 ]; then
         kill -9 -- "-$old_rp" 2>/dev/null ;;
     esac
   fi
+  # Windows 侧兜底（cygwin 的 ps/kill 看不到全部实例）。判据必须与看门狗
+  # 完全同款（round-14）：此前只有 `-match 'statusline-panel-daemon'`，
+  # 既无 argv 位置尾锚也不排除 `-c` 外壳——正是 AI-GUIDE §4 明令「绝不可」
+  # 的提及型匹配。daemon 没有 trap，任何强杀都会把 pid 文件连同第 3 行
+  # winpid 留在盘上，而 Windows pid 重启后从低位重排、回收极快：那个陈旧
+  # winpid 只要落到任意一个命令行里**提到**该文件名的 bash.exe（诊断命令、
+  # 测试脚本、AI 代理自己的 bash——本机极常见），跑一次更新就会把它
+  # -Force 杀掉，与 2026-08-13/14 两次误杀事故同型。
+  # 这条路刻意不受上面 old_ok 约束：cygwin 侧确认不了（进程它根本看不到）
+  # 正是它存在的理由；安全性由这里自己这份同等严格的判据保证。
+  # 且只有真的杀掉了才算「已回收」——原先无条件置位，什么都没杀也报成功。
   if [[ "$old_wp" =~ ^[0-9]+$ ]] && command -v powershell.exe >/dev/null 2>&1; then
-    powershell.exe -NoProfile -NonInteractive -Command "\$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$old_wp\" -ErrorAction SilentlyContinue; if (\$p -and \$p.Name -eq 'bash.exe' -and \$p.CommandLine -match 'statusline-panel-daemon') { Stop-Process -Id $old_wp -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1
-    recycled=1
+    ps_killed=$(powershell.exe -NoProfile -NonInteractive -Command "\$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$old_wp\" -ErrorAction SilentlyContinue; if (\$p -and \$p.Name -eq 'bash.exe' -and \$p.CommandLine -notmatch '\s-c\s' -and \$p.CommandLine -match 'statusline-panel-daemon\.sh\"?\s*\$') { Stop-Process -Id $old_wp -Force -ErrorAction SilentlyContinue; 'KILLED' }" 2>/dev/null | tr -d '\r\n')
+    [ "$ps_killed" = "KILLED" ] && recycled=1
   fi
   [ "$recycled" -gt 0 ] && say "✓ 旧面板 daemon 已回收——下一拍钩子自动以新版拉起"
   # pid 文件与在途渲染残骸一并清掉，避免新实例读到陈旧注册
