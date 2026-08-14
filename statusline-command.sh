@@ -392,6 +392,13 @@ jq_main_out=$(jq -r '
   # injection was demonstrated), and a raw TAB rendered at tabstop
   # width while counting as 1 char in the plain twin, skewing that
   # whole column of col_widths. Same def as the panel renderer.
+  # TYPE-SAFE PATHS (round-7): every nested access uses `?` so a
+  # container that arrives as a SCALAR or ARRAY (upstream schema
+  # drift - `effort` is already a bare scalar in the SUBAGENT payload
+  # shape) yields empty for that one field instead of aborting the
+  # WHOLE filter with "Cannot index string with ...", which used to
+  # truncate the output, knock the sentinel off F[30] and collapse the
+  # entire bar into a misleading "degraded (fork)" every single frame.
   # EVERY field gets clean (round-6): "numeric fields cannot carry
   # control chars" only holds if they REALLY are numbers. A host or
   # upstream that ships pr.number (or any numeric field) as a STRING
@@ -403,36 +410,36 @@ jq_main_out=$(jq -r '
   # for session_name in round 2). clean does tostring first, so a real
   # numeric 42 passes through untouched.
   def clean: tostring | gsub("[\t\n\r]"; " ") | gsub("[\u0001-\u001f]"; "");
-  (.session_id // "" | clean),
-  (.model.display_name // "" | clean),
-  (.effort.level // "" | clean),
-  (if .thinking.enabled == true then "think" else "" end),
-  (.workspace.current_dir // "" | clean),
-  (.workspace.repo.owner // "" | clean),
-  (.workspace.repo.name // "" | clean),
-  (.workspace.repo.host // "github.com" | clean),
-  (.worktree.name // "" | clean),
-  (.worktree.branch // "" | clean),
-  (.pr.number // "" | clean),
-  (.pr.review_state // "" | clean),
-  (.pr.url // "" | clean),
-  (.context_window.remaining_percentage // "" | clean),
-  (.context_window.total_input_tokens // "" | clean),
-  (.context_window.context_window_size // "" | clean),
-  (.context_window.total_output_tokens // "" | clean),
-  (.context_window.current_usage.cache_read_input_tokens // "" | clean),
-  (.context_window.current_usage.cache_creation_input_tokens // "" | clean),
-  (.context_window.current_usage.input_tokens // "" | clean),
-  (.cost.total_cost_usd // "" | clean),
-  (.cost.total_lines_added // "" | clean),
-  (.cost.total_lines_removed // "" | clean),
-  (.rate_limits.five_hour.used_percentage // "" | clean),
-  (.rate_limits.five_hour.resets_at // "" | clean),
-  (.rate_limits.seven_day.used_percentage // "" | clean),
-  (.rate_limits.seven_day.resets_at // "" | clean),
-  (.session_name // "" | clean),
-  (.transcript_path // "" | clean),
-  (.model.id // "" | clean),
+  (.session_id? // "" | clean),
+  (.model?.display_name? // "" | clean),
+  (.effort?.level? // "" | clean),
+  (if (.thinking?.enabled?) == true then "think" else "" end),
+  (.workspace?.current_dir? // "" | clean),
+  (.workspace?.repo?.owner? // "" | clean),
+  (.workspace?.repo?.name? // "" | clean),
+  (.workspace?.repo?.host? // "github.com" | clean),
+  (.worktree?.name? // "" | clean),
+  (.worktree?.branch? // "" | clean),
+  (.pr?.number? // "" | clean),
+  (.pr?.review_state? // "" | clean),
+  (.pr?.url? // "" | clean),
+  (.context_window?.remaining_percentage? // "" | clean),
+  (.context_window?.total_input_tokens? // "" | clean),
+  (.context_window?.context_window_size? // "" | clean),
+  (.context_window?.total_output_tokens? // "" | clean),
+  (.context_window?.current_usage?.cache_read_input_tokens? // "" | clean),
+  (.context_window?.current_usage?.cache_creation_input_tokens? // "" | clean),
+  (.context_window?.current_usage?.input_tokens? // "" | clean),
+  (.cost?.total_cost_usd? // "" | clean),
+  (.cost?.total_lines_added? // "" | clean),
+  (.cost?.total_lines_removed? // "" | clean),
+  (.rate_limits?.five_hour?.used_percentage? // "" | clean),
+  (.rate_limits?.five_hour?.resets_at? // "" | clean),
+  (.rate_limits?.seven_day?.used_percentage? // "" | clean),
+  (.rate_limits?.seven_day?.resets_at? // "" | clean),
+  (.session_name? // "" | clean),
+  (.transcript_path? // "" | clean),
+  (.model?.id? // "" | clean),
   ("__END__")
 ' <<< "$input" 2>/dev/null)
 jq_main_out=${jq_main_out//$'\r'/}
@@ -750,7 +757,13 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
   daily_dirty=1
 }
 
-hist_time_cutoff=$(( now_epoch - 10800 ))
+# RETENTION 90min (round-7, was 3h): the widest consumer window is the
+# $/h rate at 60min, so 3 hours of rows were kept purely to be read,
+# split and thrown away - and the whole-file `mapfile` split is priced
+# per BYTE on MSYS (~2.8-3.5us/B), i.e. a per-frame tax the tail-first
+# walk could not remove (it skips PARSING old rows, not SPLITTING
+# them). 90min keeps 30min of slack past the widest window.
+hist_time_cutoff=$(( now_epoch - 5400 ))
 hist_future_cutoff=$(( now_epoch + 3600 ))
 hist_trimmed=()
 hist_oldest_epoch=""
@@ -864,10 +877,19 @@ for (( hi=hist_tail_start; hi<hist_count; hi++ )); do
   # of rows that appeared since its previous render.
   [ -z "$h_sid" ] && continue
   [ "$h_epoch" -le "${du_watermark[$h_sid]:-0}" ] && continue
-  # A row whose cost doesn't parse is skipped WITHOUT advancing the
-  # watermark - it contributes nothing anywhere.
-  cost_to_cents "$h_cost" || continue
-  fold_daily_row "$h_epoch" "$h_sid" "$REPLY"
+  # A cost-less row contributes nothing to the rollup, but its
+  # watermark MUST still advance (round-7): "skip without advancing"
+  # meant one payload without .cost.total_cost_usd pinned that
+  # session's watermark at 0 forever, so its rows never looked inert,
+  # the 3-in-a-row early-stop streak never completed, and EVERY
+  # session sharing the file paid a full-file double walk on every
+  # frame, permanently (+82% frame time measured). Re-folding it later
+  # is impossible anyway - the parse failure is deterministic.
+  if cost_to_cents "$h_cost"; then
+    fold_daily_row "$h_epoch" "$h_sid" "$REPLY"
+  else
+    [ "$h_epoch" -gt "${du_watermark[$h_sid]:-0}" ] && du_watermark[$h_sid]=$h_epoch
+  fi
 done
 
 if [ -n "$session_id" ]; then
@@ -1008,13 +1030,32 @@ if [ "$daily_dirty" -eq 1 ]; then
 fi
 if [ "$daily_persist_due" -eq 1 ]; then
   printf -v daily_keep_str '%(%Y%m%d)T' "$(( now_epoch - 777600 ))"
+  # SETTLED-DAY MERGE (round-7): rows are keyed (day, session_id) and a
+  # fresh session id is minted every time Claude Code starts, so this
+  # file grew with USAGE, not with days - "days x sessions, no cap"
+  # was wrong (measured: 450 rows added ~350ms to EVERY frame, since
+  # each row is re-parsed per render). Days older than yesterday can
+  # no longer receive folds (the fine window is 90min), so their rows
+  # collapse into ONE row per day under the reserved sid "_agg"
+  # carrying the summed cents; today and yesterday stay per-session
+  # for the live state machine. A 500-row cap backstops the rest.
+  printf -v daily_settled_str '%(%Y%m%d)T' "$(( now_epoch - 172800 ))"
+  declare -A daily_agg
   daily_out_lines=()
   for dkey in "${!du_peak[@]}"; do
-    d_day="${dkey%%$'\x1f'*}"
-    d_sid="${dkey#*$'\x1f'}"
+    d_day="${dkey%%$''*}"
+    d_sid="${dkey#*$''}"
     [ "$d_day" -ge "$daily_keep_str" ] || continue
-    daily_out_lines+=("${d_day}"$'\x1f'"${d_sid}"$'\x1f'"${du_closed[$dkey]:-0}"$'\x1f'"${du_peak[$dkey]:-0}"$'\x1f'"${du_prev[$dkey]:-0}"$'\x1f'"${du_epoch[$dkey]:-0}")
+    if [ "$d_day" -lt "$daily_settled_str" ]; then
+      daily_agg[$d_day]=$(( ${daily_agg[$d_day]:-0} + ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} ))
+      continue
+    fi
+    daily_out_lines+=("${d_day}"$''"${d_sid}"$''"${du_closed[$dkey]:-0}"$''"${du_peak[$dkey]:-0}"$''"${du_prev[$dkey]:-0}"$''"${du_epoch[$dkey]:-0}")
   done
+  for d_day in "${!daily_agg[@]}"; do
+    daily_out_lines+=("${d_day}"$''"_agg"$''"${daily_agg[$d_day]}"$''"0"$''"0"$''"0")
+  done
+  [ "${#daily_out_lines[@]}" -gt 500 ] && daily_out_lines=("${daily_out_lines[@]: -500}")
   if [ "${#daily_out_lines[@]}" -gt 0 ]; then
     printf '%s\n' "${daily_out_lines[@]}" > "${daily_file}.tmp.$$" 2>/dev/null && mv -f "${daily_file}.tmp.$$" "$daily_file" 2>/dev/null
   fi
@@ -1036,7 +1077,7 @@ fi
 # every-tick rewrite race.
 if [ -n "$session_id" ] && [ "$should_append" -eq 1 ]; then
   hist_rewrite_due=0
-  [ -n "$hist_oldest_epoch" ] && [ $(( now_epoch - hist_oldest_epoch )) -gt 12600 ] && hist_rewrite_due=1
+  [ -n "$hist_oldest_epoch" ] && [ $(( now_epoch - hist_oldest_epoch )) -gt 7200 ] && hist_rewrite_due=1
   [ "$hist_count" -gt 10000 ] && hist_rewrite_due=1
   if [ "$hist_rewrite_due" -eq 1 ]; then
     # ON-DEMAND TRIM WALK (round-4): the every-frame loop no longer
@@ -2439,7 +2480,12 @@ if [ -f "$usage_cache_file" ]; then
 
       wk_names=()
       wk_pcts=()
-      if [ "$current_model_idx" -ge 0 ] && [[ "$current_model_pct" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      # {1,3} cap: round-6 capped only the candidate loop below, but
+      # THIS is the always-shown current-model row - an out-of-int64
+      # percent made both tier tests fail with status 2 and fall
+      # through to the green default with a 24-digit number rendered
+      # verbatim (and the whole grid column widened to match)
+      if [ "$current_model_idx" -ge 0 ] && [[ "$current_model_pct" =~ ^[0-9]{1,3}(\.[0-9]+)?$ ]]; then
         wk_names+=("${usage_fields[$current_model_idx]}")
         wk_pcts+=("$current_model_pct")
       fi
@@ -2803,3 +2849,12 @@ else
   [ -n "$line3" ] && printf '%s\n' "${RESET}${line3}${RESET}"
   [ -n "$line4" ] && printf '%s\n' "${RESET}${line4}${RESET}"
 fi
+
+# EXPLICIT SUCCESS (round-7): the last statement above is a
+# `[ -n ... ] && printf` short-circuit, so a payload whose 4th line is
+# empty (no rate_limits - API-key/Bedrock/Vertex accounts have none -
+# plus no session_name and no wk cache) made the SCRIPT exit 1 even
+# after printing three perfectly good lines, tripping this project's
+# own "a non-zero exit blanks the whole bar" red line. Nothing caught
+# it because every assertion only ever inspected stdout.
+exit 0

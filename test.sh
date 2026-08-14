@@ -426,6 +426,50 @@ if [ "$1" = "--assert" ]; then
   # R28: the panel caps tokenCount too (no fabricated spend)
   wrappanel=$(jq -n '{columns:150,tasks:[{id:"wp",label:"L",status:"running",tokenCount:9999999999999999999,description:"d"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
   printf '%s' "$wrappanel" | grep -q 'tok' && bad "panel rendered wrapped spend" || ok "over-cap panel tokenCount drops spend cell"
+
+  # ---- adversarial-review round-7 regression asserts (2026-08-14) ----
+  # R29: EXIT CODE. A non-zero exit blanks the whole bar per this
+  # project's own red line, and an empty 4th line used to leave the
+  # last `[ -n ] && printf` short-circuit as the script's exit status.
+  for _fx in fixtures/full.json fixtures/minimal.json fixtures/low-context.json; do
+    bash ./statusline-command.sh < "$_fx" >/dev/null 2>&1
+    [ $? -eq 0 ] || { bad "non-zero exit on $_fx"; break; }
+  done
+  bash ./statusline-command.sh < fixtures/minimal.json >/dev/null 2>&1 && ok "exit 0 on every fixture" || bad "non-zero exit (minimal)"
+  jq -c 'del(.rate_limits)|del(.session_name)' fixtures/full.json | bash ./statusline-command.sh >/dev/null 2>&1 && ok "exit 0 with empty 4th line" || bad "non-zero exit on empty line 4"
+  # R30: a container field arriving as a SCALAR/ARRAY must not abort
+  # the whole jq filter into a misleading whole-bar degrade
+  drift_ok=1
+  for _mut in '.effort="max"' '.model="F5"' '.workspace.repo="a/b"' '.context_window.current_usage=5' '.cost=0.42' '.rate_limits=[]'; do
+    jq -c "$_mut" fixtures/full.json | bash ./statusline-command.sh 2>/dev/null | strip | grep -q 'degraded' && drift_ok=0
+  done
+  [ "$drift_ok" -eq 1 ] && ok "scalar/array container drift never degrades the bar" || bad "container type drift degrades whole bar"
+  # R31: a cost-less row must still advance its session watermark, or
+  # the tail-scan early stop can never arm again
+  : > "$STATUSLINE_DAILY_FILE"
+  { printf "%snc1100
+" "$((now-400))"
+    printf "%snc1200
+" "$((now-300))"; } > "$STATUSLINE_HISTORY_FILE"
+  jq -n --arg s nc1 '{session_id:$s,model:{display_name:"M"},workspace:{current_dir:"/x"}}' | bash ./statusline-command.sh >/dev/null 2>&1
+  grep -q 'nc1' "$STATUSLINE_DAILY_FILE" 2>/dev/null && bad "cost-less row folded into rollup" || ok "cost-less rows skip the rollup"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  : > "$STATUSLINE_DAILY_FILE"
+  # R32: settled days (older than yesterday) merge to one _agg row per
+  # day, and the week total is preserved
+  for _d in 3 4 5; do
+    for _sid in a b c; do
+      printf '%s%s-%s500250250%s
+' "$(date -d "-$_d days" +%Y%m%d 2>/dev/null || date -v-${_d}d +%Y%m%d)" "$_sid" "$_d" "$((now-_d*86400))"
+    done
+  done > "$STATUSLINE_DAILY_FILE"
+  printf '%smg11000.50
+' "$((now-100))" > "$STATUSLINE_HISTORY_FILE"
+  mgout=$(bash ./statusline-command.sh < fixtures/full.json | strip)
+  printf '%s' "$mgout" | grep -q 'week \$68' && ok "settled-day merge preserves week total" || bad "settled-day merge changed week total"
+  [ "$(grep -c '_agg' "$STATUSLINE_DAILY_FILE")" -eq 3 ] && ok "settled days merged to one row each" || bad "settled-day merge row count wrong"
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
   : > "$STATUSLINE_DAILY_FILE"
 
   # panel daemon architecture: the hook must spool the payload, stay

@@ -127,8 +127,12 @@ fi
 
 # ---------- 冒烟验证（状态文件全部隔离，不碰真实数据） ----------
 smoke_payload=$(printf '{"session_id":"install-smoke","model":{"display_name":"Smoke"},"workspace":{"current_dir":"%s"}}' "$HOME")
-smoke_out=$(printf '%s' "$smoke_payload" | STATUSLINE_HISTORY_FILE="$CLAUDE_DIR/.smoke-h.$$" STATUSLINE_DAILY_FILE="$CLAUDE_DIR/.smoke-d.$$" bash "$CLAUDE_DIR/statusline-command.sh" 2>/dev/null)
-rm -f "$CLAUDE_DIR/.smoke-h.$$" "$CLAUDE_DIR/.smoke-d.$$" 2>/dev/null
+# 全部 env 覆盖都要给（round-7）：只隔离 history/daily 时，wk 段仍会
+# 派生后台任务读真实 .credentials.json 的 OAuth token 去打非官方 usage
+# 端点，并往真实 ~/.claude 写缓存/退避——一行安装命令不该在用户不知情
+# 时动用其凭据发网络请求。CRED 指向不存在的路径即可完全断开该链路。
+smoke_out=$(printf '%s' "$smoke_payload" |   STATUSLINE_HISTORY_FILE="$CLAUDE_DIR/.smoke-h.$$"   STATUSLINE_DAILY_FILE="$CLAUDE_DIR/.smoke-d.$$"   STATUSLINE_CI_CACHE_PREFIX="$CLAUDE_DIR/.smoke-ci.$$"   STATUSLINE_USAGE_CACHE_FILE="$CLAUDE_DIR/.smoke-uc.$$"   STATUSLINE_USAGE_BACKOFF_FILE="$CLAUDE_DIR/.smoke-ub.$$"   STATUSLINE_CRED_FILE="$CLAUDE_DIR/.smoke-nocred.$$"   bash "$CLAUDE_DIR/statusline-command.sh" 2>/dev/null)
+rm -f "$CLAUDE_DIR"/.smoke-*."$$" 2>/dev/null
 [ -n "$smoke_out" ] || die "主状态栏冒烟渲染无输出"
 smoke_line1=$(printf '%s' "$smoke_out" | sed -n 1p | sed 's/\x1b\[[0-9;]*m//g; s/\x1b\]8;;[^\x1b]*\x1b\\\\//g')
 say "✓ 主状态栏冒烟通过：$smoke_line1"
