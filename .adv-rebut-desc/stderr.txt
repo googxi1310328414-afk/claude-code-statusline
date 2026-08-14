@@ -1,1 +1,0 @@
-DEBUG active_col_count=6 active_col_width_sum=85 desc_budget=17 active_cols=0 5 1 2 3 4

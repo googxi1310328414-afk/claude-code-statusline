@@ -1,3 +1,0 @@
-1786667750	PID=127860	gh pr checks 42 --repo acme/widgets --json state -q .[].state
-1786667760	PID=127987	gh pr checks 42 --repo acme/widgets --json state -q .[].state
-1786667770	PID=128059	gh pr checks 42 --repo acme/widgets --json state -q .[].state

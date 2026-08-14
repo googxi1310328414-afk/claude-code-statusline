@@ -1,6 +1,0 @@
-1786667866	PID=128810	gh pr checks 42 --repo acme/widgets --json state -q .[].state
-1786667866	PID=128811	gh pr checks 42 --repo acme/widgets --json state -q .[].state
-1786667876	PID=128940	gh pr checks 42 --repo acme/widgets --json state -q .[].state
-1786667876	PID=128942	gh pr checks 42 --repo acme/widgets --json state -q .[].state
-1786667886	PID=129057	gh pr checks 42 --repo acme/widgets --json state -q .[].state
-1786667886	PID=129058	gh pr checks 42 --repo acme/widgets --json state -q .[].state

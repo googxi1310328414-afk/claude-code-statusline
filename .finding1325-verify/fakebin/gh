@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# Simulates a stalled `gh` call (black-holed proxy / TCP connect timeout):
-# hangs well past the 10s render cadence and the 60s cache TTL before ever
-# producing output or exiting.
-printf '%s gh invoked: %s\n' "$(date +%s)" "$*" >> "$GH_CALL_LOG"
-sleep 90

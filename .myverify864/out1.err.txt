@@ -1,1 +1,0 @@
-./statusline-command.sh: line 33: /tmp/claude/C--Users-Administrator/ab8f6c17-a514-4972-928d-d5470eaeab98/scratchpad/claude-code-statusline/.myverify864/state/.claude/statusline-err.log: No such file or directory

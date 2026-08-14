@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# Simulated black-holed `gh`: TCP SYN dropped by firewall -> gh's HTTP
-# client has no built-in timeout -> the call just hangs. We simulate with
-# a bounded sleep (25s) instead of literally infinite, so the test finishes,
-# but 25s already exceeds the 10s render cadence by 2.5x.
-printf '%s\tPID=%s\tgh %s\n' "$(date +%s)" "$$" "$*" >> "$GH_CALL_LOG"
-sleep 25

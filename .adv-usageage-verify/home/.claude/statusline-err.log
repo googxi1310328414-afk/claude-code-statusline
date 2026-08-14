@@ -1,6 +1,0 @@
-DEBUG now_epoch=1786669112
-DEBUG ci_age=-7200 ci_state=''
-DEBUG CI-REFRESH-SPAWNED
-DEBUG usage_epoch=1786676259 usage_age=-7147 usage_needs_refresh=0
-DEBUG cached-numbers-path-taken (usage_age<=1800)
-DEBUG about-to-test-refresh-gate usage_needs_refresh=0

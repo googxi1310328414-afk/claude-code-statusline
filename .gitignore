@@ -1,3 +1,14 @@
 .tmphome*/
 raw-out.json
 *.tmp.*
+.adv*/
+.rebut*/
+.verify*/
+.myverify*/
+.finding*/
+.repro*/
+repro_*
+err*.txt
+out*.txt
+run_repro.sh
+run_control.sh
