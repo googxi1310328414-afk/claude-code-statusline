@@ -1075,6 +1075,7 @@ if [ "$daily_persist_due" -eq 1 ]; then
   # collapse into ONE row per day under the reserved sid "_agg"
   # carrying the summed cents; today and yesterday stay per-session
   # for the live state machine. A 500-row cap backstops the rest.
+  SEP1=$''
   printf -v daily_settled_str '%(%Y%m%d)T' "$(( now_epoch - 172800 ))"
   declare -A daily_agg
   daily_out_lines=()
@@ -1091,7 +1092,38 @@ if [ "$daily_persist_due" -eq 1 ]; then
   for d_day in "${!daily_agg[@]}"; do
     daily_out_lines+=("${d_day}"$''"_agg"$''"${daily_agg[$d_day]}"$''"0"$''"0"$''"0")
   done
-  [ "${#daily_out_lines[@]}" -gt 500 ] && daily_out_lines=("${daily_out_lines[@]: -500}")
+  # NO BLIND TAIL SLICE (round-10): the old cap kept the LAST 500 entries
+  # of a bash associative-array walk, i.e. HASH order - it silently
+  # dropped live today/yesterday per-session state rows (closed/peak/
+  # prev), which have no rebuild path once the 90min fine window rolls,
+  # so today/week shrank permanently and invisibly. Instead: a row whose
+  # own watermark predates the fine window can never receive another
+  # fold, so its state is FINAL and merges into that day's _agg row -
+  # the file is bounded by ACTIVE sessions, not lifetime session count,
+  # and not one cent is lost.
+  if [ "${#daily_out_lines[@]}" -gt 400 ]; then
+    declare -A daily_agg2
+    daily_keep_lines=()
+    for dl in "${daily_out_lines[@]}"; do
+      dl_day=${dl%%$SEP1*}
+      dl_rest=${dl#*$SEP1}
+      dl_sid=${dl_rest%%$SEP1*}
+      dl_ep=${dl##*$SEP1}
+      if [ "$dl_sid" != "_agg" ] && [[ "$dl_ep" =~ ^[0-9]+$ ]] && [ "$dl_ep" -lt "$(( now_epoch - 7200 ))" ]; then
+        dl_r2=${dl_rest#*$SEP1}
+        dl_closed=${dl_r2%%$SEP1*}
+        dl_r3=${dl_r2#*$SEP1}
+        dl_peak=${dl_r3%%$SEP1*}
+        daily_agg2[$dl_day]=$(( ${daily_agg2[$dl_day]:-0} + ${dl_closed:-0} + ${dl_peak:-0} ))
+      else
+        daily_keep_lines+=("$dl")
+      fi
+    done
+    for dl_day in "${!daily_agg2[@]}"; do
+      daily_keep_lines+=("${dl_day}${SEP1}_agg${SEP1}${daily_agg2[$dl_day]}${SEP1}0${SEP1}0${SEP1}0")
+    done
+    daily_out_lines=("${daily_keep_lines[@]}")
+  fi
   if [ "${#daily_out_lines[@]}" -gt 0 ]; then
     printf '%s\n' "${daily_out_lines[@]}" > "${daily_file}.tmp.$$" 2>/dev/null && mv -f "${daily_file}.tmp.$$" "$daily_file" 2>/dev/null
   fi

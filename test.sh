@@ -308,9 +308,7 @@ if [ "$1" = "--assert" ]; then
   # R15: a renderer that exits 0 with EMPTY output must not clobber the
   # last good cache frame (fork-exhaustion blank-frame guard)
   printf '#!/bin/bash\nexit 0\n' > "$tmpd/emptyrender.sh"
-  printf '%s
-%s
-' "$now" '{"id":"tmo2","content":"GOOD_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.tmo2"
+  printf '%s\n%s\n' "$(date +%s)" '{"id":"tmo2","content":"GOOD_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.tmo2"
   printf '{"columns":120,"tasks":[{"id":"tmo2","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.tmo2.new"
   STATUSLINE_PANEL_RENDERER="$tmpd/emptyrender.sh" bash ./statusline-panel-daemon.sh --once
   grep -q GOOD_FRAME "$STATUSLINE_PANEL_DIR/cache.tmo2" 2>/dev/null && ok "empty render keeps last good frame" || bad "empty render clobbered cache"
@@ -337,9 +335,7 @@ if [ "$1" = "--assert" ]; then
   # R17: three consecutive bad frames make the daemon EMPTY the cache
   # (honest degradation instead of serving stale numbers forever) -
   # needs the RESIDENT daemon since the streak lives in its memory
-  printf '%s
-%s
-' "$now" '{"id":"st1","content":"STALE_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.st1"
+  printf '%s\n%s\n' "$(date +%s)" '{"id":"st1","content":"STALE_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.st1"
   STATUSLINE_PANEL_RENDERER="$tmpd/emptyrender.sh" STATUSLINE_PANEL_DIR="$STATUSLINE_PANEL_DIR" bash ./statusline-panel-daemon.sh &
   st_dpid=$!
   for _i in 1 2 3; do
@@ -426,9 +422,7 @@ if [ "$1" = "--assert" ]; then
   wrapctx=$(jq -n '{session_id:"wc",model:{display_name:"M"},workspace:{current_dir:"/x"},context_window:{total_input_tokens:130000000000000000,context_window_size:200000,total_output_tokens:0}}' | bash ./statusline-command.sh | strip)
   printf '%s' "$wrapctx" | grep -q 'ctx' && bad "wrapping token count rendered fake battery" || ok "over-cap token count drops ctx"
   # R27: an unrefreshable cache must stop being served past 60s
-  printf '%s
-%s
-' "$((now-300))" '{"id":"old1","content":"FROZEN"}' > "$STATUSLINE_PANEL_DIR/cache.old1"
+  printf '%s\n%s\n' "$((now-300))" '{"id":"old1","content":"FROZEN"}' > "$STATUSLINE_PANEL_DIR/cache.old1"
   staleserve=$(printf '{"columns":120,"tasks":[{"id":"old1","label":"x","status":"running","tokenCount":5}]}' | bash ./statusline-panel-hook.sh)
   printf '%s' "$staleserve" | grep -q FROZEN && bad "stale cache still served" || ok "stale cache refused (age gate)"
   rm -f "$STATUSLINE_PANEL_DIR"/cache.old1 "$STATUSLINE_PANEL_DIR"/spool.old1.new 2>/dev/null
@@ -532,9 +526,7 @@ sleep 60
   # on the real machine)
   sleep 300 &
   fake_wedged=$!
-  printf '%s
-%s
-' "$fake_wedged" "$((now-600))" > "$STATUSLINE_PANEL_DIR/daemon.pid"
+  printf '%s\n%s\n' "$fake_wedged" "$((now-600))" > "$STATUSLINE_PANEL_DIR/daemon.pid"
   printf '{"columns":120,"tasks":[{"id":"rp1","label":"x","status":"running","tokenCount":5}]}' | STATUSLINE_PANEL_DAEMON=/dev/null bash ./statusline-panel-hook.sh >/dev/null 2>&1
   sleep 0.5
   if kill -0 "$fake_wedged" 2>/dev/null; then
@@ -552,7 +544,48 @@ sleep 60
   grep -q 'daemon_max_life' ./statusline-panel-daemon.sh && ok "daemon has an absolute lifetime cap" || bad "daemon lifetime cap missing"
   # R39: the installer must reclaim EVERY daemon instance, not just a
   # freshly-registered one
-  grep -qE "pgrep -f 'statusline-panel-daemon|statusline-panel-daemon\\.sh'" ./install.sh && ok "installer reclaims all daemon instances" || bad "installer still reclaims only the registered pid"
+  grep -q 'old_wp' ./install.sh && ok "installer reclaims via registered pid (no fuzzy match)" || bad "installer reclaim missing winpid path"
+  # ---- adversarial-review round-10 regression asserts (2026-08-14) ----
+  # R40: the hook must actually KILL a wedged daemon (round-9's assert
+  # only ever exercised the DON'T-kill side, so deleting the whole fix
+  # still passed)
+  cp ./statusline-panel-daemon.sh "$tmpd/statusline-panel-daemon.sh"
+  printf '#!/bin/bash
+sleep 120
+' > "$tmpd/statusline-panel-daemon.sh"
+  bash "$tmpd/statusline-panel-daemon.sh" &
+  wedged=$!
+  printf '%s
+%s
+%s
+' "$wedged" "$((now-600))" "0" > "$STATUSLINE_PANEL_DIR/daemon.pid"
+  printf '{"columns":120,"tasks":[{"id":"kl1","label":"x","status":"running","tokenCount":5}]}' | STATUSLINE_PANEL_DAEMON=/dev/null bash ./statusline-panel-hook.sh >/dev/null 2>&1
+  sleep 1
+  if kill -0 "$wedged" 2>/dev/null; then
+    bad "hook did NOT reap the wedged daemon"
+    kill -9 "$wedged" 2>/dev/null
+  else
+    ok "hook reaps a wedged daemon (kill side covered)"
+  fi
+  rm -f "$STATUSLINE_PANEL_DIR/daemon.pid" "$STATUSLINE_PANEL_DIR"/spool.kl1.new 2>/dev/null
+  # R41: the daily row cap must never lose money - overflow merges
+  # settled per-session rows into _agg instead of slicing in hash order
+  : > "$STATUSLINE_DAILY_FILE"
+  {
+    for _i in $(seq 1 450); do printf '%ss%03d1005050%s
+' "$(date +%Y%m%d)" "$_i" "$((now-20000))"; done
+  } > "$STATUSLINE_DAILY_FILE"
+  printf '%scapx1000.50
+' "$((now-100))" > "$STATUSLINE_HISTORY_FILE"
+  cap1=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'today \$[0-9.]*' | head -1)
+  cap2=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'today \$[0-9.]*' | head -1)
+  [ -n "$cap1" ] && [ "$cap1" = "$cap2" ] && ok "daily cap keeps today stable ($cap1)" || bad "daily cap lost money ($cap1 -> $cap2)"
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R42: the watchdog must not match shells that merely MENTION the
+  # daemon filename (the 2026-08-13 mis-kill class)
+  grep -q 'CommandLine -match' ./statusline-watchdog.ps1 && ok "watchdog uses an argv-position match" || bad "watchdog still uses a mention match"
+  grep -q 'ProcessId=' ./statusline-watchdog.ps1 && ok "watchdog targets the registered Windows pid" || bad "watchdog does not use the registered winpid"
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   : > "$STATUSLINE_DAILY_FILE"
@@ -564,9 +597,7 @@ sleep 60
   [ -f "$STATUSLINE_PANEL_DIR/spool.ms.new" ] && ok "panel hook spools payload" || bad "hook spool missing"
   [ -n "$hookout" ] && bad "hook emitted on cold cache" || ok "hook silent on cold cache"
   # cache format (round-6): line 1 = render epoch, rows follow
-  printf '%s
-%s
-' "$now" '{"id":"ms","content":"CACHED_MARKER"}' > "$STATUSLINE_PANEL_DIR/cache.ms"
+  printf '%s\n%s\n' "$(date +%s)" '{"id":"ms","content":"CACHED_MARKER"}' > "$STATUSLINE_PANEL_DIR/cache.ms"
   subagent_payload "$now" | bash ./statusline-panel-hook.sh | grep -q CACHED_MARKER && ok "panel hook serves cache" || bad "hook cache serve failed"
   bash ./statusline-panel-daemon.sh --once
   grep -q '"id":"ms"' "$STATUSLINE_PANEL_DIR/cache.ms" && ! grep -q CACHED_MARKER "$STATUSLINE_PANEL_DIR/cache.ms" && ok "panel daemon renders spool to cache" || bad "daemon render failed"

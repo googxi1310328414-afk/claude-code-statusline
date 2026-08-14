@@ -1,50 +1,50 @@
 # statusline-watchdog.ps1 — 清理挂死的状态栏 bash（cygwin fork 竞争偶发挂起的自愈层）
 # 计划任务每 2 分钟经 statusline-watchdog.vbs（wscript，GUI 子系统）零窗口拉起——
 # 直接由计划任务跑 powershell 会在 -WindowStyle Hidden 生效前闪一下控制台窗口。
-# 只动命令行含渲染脚本/面板 daemon 文件名的 bash（宽泛的 '*statusline*' 会误杀
-# 碰巧提及 statusline 的诊断/测试命令，2026-08-13 实际发生过）。
 #
-# 两类清理，判据不同：
-#   1. 渲染脚本（statusline-command.sh / subagent-statusline.sh）——一次渲染
-#      正常 0.4–1.3s，存活 >30s 即判挂死。
-#   2. 面板常驻 daemon（statusline-panel-daemon.sh）——它本就长命，绝不能按
-#      存活时长杀。判据是**心跳陈旧**：daemon 每 5 秒把 pid+epoch 写进
-#      statusline-panel.d/daemon.pid，凡不是当前注册者、或注册者心跳超过 180
-#      秒没动的，都是卡死/被遗弃的实例。2026-08-14 实测过一次事故：一个卡死
-#      实例使钩子每 ~65 秒拉起一个新 daemon，累计 78 个孤儿常驻烧掉 22 CPU
-#      小时——当时看门狗刻意不匹配 daemon，全系统没有任何组件会回收它们。
+# 渲染脚本（statusline-command.sh / subagent-statusline.sh）：一次渲染正常
+# 0.4–1.3s，存活 >30s 即判挂死。匹配面刻意收窄到两个文件名——宽泛的
+# '*statusline*' 会误杀碰巧提及 statusline 的诊断/测试命令（2026-08-13 实际发生过）。
+#
+# 面板常驻 daemon：**只按 pid 文件第 3 行记录的 Windows pid 精确清理**，绝不按
+# 「命令行提及 statusline-panel-daemon.sh」匹配——那种模糊判据会把任何谈到该文件
+# 名的外壳（诊断命令、测试脚本、AI 代理自己的 bash）算作 daemon，实测会 -Force
+# 杀掉无关进程，甚至因「保留最新启动的那个」而杀掉真正注册且心跳新鲜的 daemon
+# （2026-08-14 第 10 轮审查实锤，与 2026-08-13 的误杀事故同型）。
+# 判据：pid 文件第 2 行心跳陈旧（>180s）→ 说明注册者卡死 → 杀掉第 3 行那个
+# Windows pid 并清掉注册，下一拍钩子会拉起新实例。心跳新鲜则一律不动。
+# 没有 pid 文件、格式不对、或第 3 行缺失（非 MSYS 环境无 /proc）→ 什么都不做，
+# 失败方向永远是「少管闲事」而不是「乱杀」。
 $cutoff = (Get-Date).AddSeconds(-30)
+# ARGV-POSITION ONLY（round-10 实锤）：`-like '*name*'` 只要求命令行里
+# 出现该文件名，于是 `bash -c "... # subagent-statusline.sh"` 这类**提及型**
+# 外壳（诊断命令、测试脚本、AI 代理自己的 bash）同样命中并被 -Force 杀掉。
+# 判据收窄为「bash 的参数位就是该脚本」：命令行以脚本名（可带引号）结尾，
+# 且不含 ` -c `（-c 形态一律是外壳，真渲染永远是 `bash <script>`）。
 Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
-  Where-Object { ($_.CommandLine -like '*statusline-command.sh*' -or $_.CommandLine -like '*subagent-statusline.sh*') -and $_.CreationDate -lt $cutoff } |
+  Where-Object {
+    $_.CommandLine -notmatch '\s-c\s' -and
+    $_.CommandLine -match '(statusline-command|subagent-statusline)\.sh"?\s*$' -and
+    $_.CreationDate -lt $cutoff
+  } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-# ---- 面板 daemon：只保留「当前注册且心跳新鲜」的那一个 ----
-$panelDir = Join-Path $env:USERPROFILE '.claude\statusline-panel.d'
-$pidFile  = Join-Path $panelDir 'daemon.pid'
-$ownerPid = $null
+# ---- 面板 daemon：仅在「注册者心跳陈旧」时，按记录的 Windows pid 精确回收 ----
+$pidFile = Join-Path $env:USERPROFILE '.claude\statusline-panel.d\daemon.pid'
 if (Test-Path $pidFile) {
   $lines = @(Get-Content $pidFile -ErrorAction SilentlyContinue)
-  if ($lines.Count -ge 2 -and $lines[0] -match '^\d+$' -and $lines[1] -match '^\d+$') {
+  if ($lines.Count -ge 3 -and $lines[1] -match '^\d+$' -and $lines[2] -match '^\d+$') {
     $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$lines[1]
-    # 心跳新鲜才认这个注册者；陈旧则连它一起清（它正是卡死的那个）
-    if ($age -ge -60 -and $age -le 180) { $ownerPid = [int]$lines[0] }
-  }
-}
-$daemons = @(Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
-  Where-Object { $_.CommandLine -like '*statusline-panel-daemon.sh*' })
-# cygwin pid 与 Windows pid 不同：pid 文件里存的是 cygwin pid，无法直接比对，
-# 故用「最新启动的那一个」近似当前注册者——钩子每拍保证有且仅有一个新实例被
-# 拉起，多余的都是历史遗留（正是事故里那 78 个）。
-if ($daemons.Count -gt 1) {
-  $keep = ($daemons | Sort-Object CreationDate -Descending | Select-Object -First 1).ProcessId
-  foreach ($d in $daemons) {
-    if ($d.ProcessId -ne $keep) { Stop-Process -Id $d.ProcessId -Force -ErrorAction SilentlyContinue }
-  }
-} elseif ($daemons.Count -eq 1 -and $ownerPid -eq $null -and (Test-Path $pidFile)) {
-  # 唯一实例但注册心跳陈旧 = 它卡死了：杀掉并清理注册，下一拍钩子会拉起新的
-  $only = $daemons[0]
-  if ($only.CreationDate -lt (Get-Date).AddSeconds(-180)) {
-    Stop-Process -Id $only.ProcessId -Force -ErrorAction SilentlyContinue
-    Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+    if ($age -gt 180) {
+      $wpid = [int]$lines[2]
+      # 二次确认：该 Windows pid 现在确实是一个执行 daemon 脚本的 bash
+      # （pid 可能已被系统回收给别的进程）——参数位匹配，排除 `-c` 外壳。
+      $p = Get-CimInstance Win32_Process -Filter "ProcessId=$wpid" -ErrorAction SilentlyContinue
+      if ($p -and $p.Name -eq 'bash.exe' -and $p.CommandLine -notmatch '\s-c\s' -and $p.CommandLine -match 'statusline-panel-daemon\.sh"?\s*$') {
+        Stop-Process -Id $wpid -Force -ErrorAction SilentlyContinue
+      }
+      # 注册已确认陈旧：无论进程是否还在，都清掉它，下一拍钩子会重建
+      Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+    }
   }
 }

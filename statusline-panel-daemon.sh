@@ -55,6 +55,17 @@
 # harness mode; skips the single-instance gate).
 export LC_ALL=C.UTF-8
 panel_dir="${STATUSLINE_PANEL_DIR:-$HOME/.claude/statusline-panel.d}"
+# WINDOWS PID (round-10): the pid file's 3rd line carries the NATIVE
+# Windows pid, because cygwin pids are meaningless to the PowerShell
+# watchdog - without it the watchdog could only match daemons by
+# "command line mentions the script name", which also matches any shell
+# that merely TALKS about the file (a diagnostic, a test, an AI agent's
+# own bash) and let it -Force kill unrelated processes AND the healthy
+# registered daemon. Absent /proc (non-MSYS) leaves it empty and the
+# watchdog then simply does nothing - fail safe, never fail deadly.
+daemon_winpid=""
+[ -r /proc/self/winpid ] && read -r daemon_winpid < /proc/self/winpid 2>/dev/null
+[[ "$daemon_winpid" =~ ^[0-9]+$ ]] || daemon_winpid=""
 renderer="${STATUSLINE_PANEL_RENDERER:-$HOME/.claude/subagent-statusline.sh}"
 [ -d "$panel_dir" ] || exit 0
 once=0
@@ -83,7 +94,7 @@ exec 2>>"$err_log"
 # (missing/old-format heartbeat counts as stale -> smooth migration).
 if [ "$once" -eq 0 ]; then
   printf -v hb_now '%(%s)T' -1
-  if ! ( set -C; printf '%s\n%s\n' "$$" "$hb_now" > "$panel_dir/daemon.pid" ) 2>/dev/null; then
+  if ! ( set -C; printf '%s\n%s\n%s\n' "$$" "$hb_now" "$daemon_winpid" > "$panel_dir/daemon.pid" ) 2>/dev/null; then
     holder=""
     holder_hb=""
     [ -r "$panel_dir/daemon.pid" ] && { read -r holder; read -r holder_hb; } < "$panel_dir/daemon.pid"
@@ -100,7 +111,7 @@ if [ "$once" -eq 0 ]; then
     # the noclobber race, the loser exits and the next hook tick
     # re-probes the winner
     rm -f "$panel_dir/daemon.pid" 2>/dev/null
-    ( set -C; printf '%s\n%s\n' "$$" "$hb_now" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
+    ( set -C; printf '%s\n%s\n%s\n' "$$" "$hb_now" "$daemon_winpid" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
   fi
   # startup housekeeping: orphaned in-flight claims from a crashed
   # predecessor, caches nothing has touched for a day, and orphaned
@@ -169,12 +180,12 @@ hb_beat() {
   hb_cur=""
   [ -r "$panel_dir/daemon.pid" ] && read -r hb_cur < "$panel_dir/daemon.pid"
   if [ "$hb_cur" = "$$" ]; then
-    printf '%s\n%s\n' "$$" "$hb_t" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
+    printf '%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
   elif [ -n "$hb_cur" ] && kill -0 "$hb_cur" 2>/dev/null; then
     exit 0
   else
     rm -f "$panel_dir/daemon.pid" 2>/dev/null
-    ( set -C; printf '%s\n%s\n' "$$" "$hb_t" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
+    ( set -C; printf '%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
   fi
 }
 # per-key consecutive bad-frame counter (round-3 fix): the -s keep-frame

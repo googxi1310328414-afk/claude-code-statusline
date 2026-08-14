@@ -109,10 +109,16 @@ if [ "$daemon_alive" -eq 0 ]; then
   # recycling because the pid came from OUR pid file AND we verify the
   # process is really a panel daemon before signalling.
   if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+    # confirm the pid really IS our daemon before signalling: the
+    # cmdline is NUL-separated so the SCRIPT PATH is its tail -
+    # matching the tail (not "mentions anywhere") keeps a shell that
+    # merely TALKS about the file (a diagnostic, a test, an agent's
+    # own bash) out of the kill set.
     _cmd=""
-    [ -r "/proc/$daemon_pid/cmdline" ] && read -r _cmd < "/proc/$daemon_pid/cmdline" 2>/dev/null
+    [ -r "/proc/$daemon_pid/cmdline" ] && _cmd=$(tr '\0' ' ' < "/proc/$daemon_pid/cmdline" 2>/dev/null)
     case "$_cmd" in
-      *statusline-panel-daemon*) kill "$daemon_pid" 2>/dev/null; kill -9 "$daemon_pid" 2>/dev/null ;;
+      *statusline-panel-daemon.sh|*"statusline-panel-daemon.sh ")
+        kill "$daemon_pid" 2>/dev/null; kill -9 "$daemon_pid" 2>/dev/null ;;
     esac
   fi
   ( bash "$panel_daemon" </dev/null >/dev/null 2>&1 & )

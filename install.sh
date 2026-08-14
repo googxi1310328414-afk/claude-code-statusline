@@ -74,33 +74,28 @@ if [ "$daemon_updated" -eq 1 ]; then
   # 孤儿 daemon 常驻烧掉 22 CPU 小时，且全都在跑旧代码。现按命令行匹配
   # 杀掉**所有**面板 daemon（它们是本项目自己的进程、名字唯一），下一拍
   # 钩子会以新版拉起一个。
-  list_daemons() {
-    if command -v pgrep >/dev/null 2>&1; then
-      pgrep -f 'statusline-panel-daemon\.sh' 2>/dev/null
-    else
-      ps -ef 2>/dev/null | grep 'statusline-panel-daemon\.sh' | grep -v grep | awk '{print $2}'
-    fi
-  }
+  # 只回收「注册在案」的那一个（round-10）：早先按命令行匹配的做法看似
+  # 稳妥，实测却会把任何**提及**该文件名的外壳（诊断命令、测试脚本、AI
+  # 代理自己的 bash——它们的命令行同样以该文件名结尾）一并 -Force 杀掉，
+  # 与 2026-08-13 的误杀事故同型。现改为读 pid 文件：第 1 行 cygwin pid
+  # 用于 kill，第 3 行 Windows pid 交给 PowerShell 兜底（cygwin 的 ps 看
+  # 不到全部实例）。未注册的孤儿由看门狗按心跳陈旧回收，或随其 1 小时
+  # 寿命闸自然退出——两条路都不需要模糊匹配。
   recycled=0
-  for dp in $(list_daemons); do
-    [ "$dp" = "$$" ] && continue
-    kill "$dp" 2>/dev/null && recycled=$(( recycled + 1 ))
-  done
-  # TERM 未必立刻生效（阻塞在 read/fifo 的实例可能拖一拍），补一轮 KILL：
-  # 回收不彻底就等于「新版装好了、旧代码还在跑」，正是本次事故的形态
-  sleep 1
-  for dp in $(list_daemons); do
-    [ "$dp" = "$$" ] && continue
-    kill -9 "$dp" 2>/dev/null
-  done
-  # Windows 侧兜底清扫（实测必需）：cygwin 的 ps 看不到全部实例——孤儿
-  # daemon 可以在 Windows 进程表里活着而 `ps -ef` 一行都不显示，正是 78
-  # 个孤儿能长期幸存、每个还在跑旧代码的直接原因。按命令行匹配（名字是
-  # 本项目独有）做一次 Windows 侧回收。
-  if command -v powershell.exe >/dev/null 2>&1; then
-    powershell.exe -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \"Name='bash.exe'\" | Where-Object { \$_.CommandLine -match 'statusline-panel-daemon' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1
+  old_dp=""; old_hb=""; old_wp=""
+  if [ -r "$daemon_pid_file" ]; then
+    { read -r old_dp; read -r old_hb; read -r old_wp; } < "$daemon_pid_file" 2>/dev/null
   fi
-  [ "$recycled" -gt 0 ] && say "✓ 已回收 $recycled 个旧面板 daemon——下一拍钩子自动以新版拉起"
+  if [[ "$old_dp" =~ ^[0-9]+$ ]] && kill -0 "$old_dp" 2>/dev/null; then
+    kill "$old_dp" 2>/dev/null && recycled=1
+    sleep 1
+    kill -9 "$old_dp" 2>/dev/null
+  fi
+  if [[ "$old_wp" =~ ^[0-9]+$ ]] && command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -NonInteractive -Command "\$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$old_wp\" -ErrorAction SilentlyContinue; if (\$p -and \$p.Name -eq 'bash.exe' -and \$p.CommandLine -match 'statusline-panel-daemon') { Stop-Process -Id $old_wp -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1
+    recycled=1
+  fi
+  [ "$recycled" -gt 0 ] && say "✓ 旧面板 daemon 已回收——下一拍钩子自动以新版拉起"
   # pid 文件与在途渲染残骸一并清掉，避免新实例读到陈旧注册
   rm -f "$daemon_pid_file" "$CLAUDE_DIR/statusline-panel.d"/render.* "$CLAUDE_DIR/statusline-panel.d"/*.raw 2>/dev/null
 fi
@@ -141,13 +136,18 @@ elif command -v schtasks.exe >/dev/null 2>&1 && ! schtasks.exe /Query /TN claude
 fi
 
 # ---------- 冒烟验证（状态文件全部隔离，不碰真实数据） ----------
+# 冒烟状态文件改放临时目录（round-10）：脱离式 usage 子壳会在父渲染退出
+# **之后**才写退避文件，放在 $CLAUDE_DIR 时那次写入总是晚于清理行，于是
+# 每装一次就在真实 ~/.claude 永久留一个 .smoke-ub.<pid>，且没有任何清扫
+# glob 覆盖它。临时目录整体删除，不留痕。
+smoke_tmp=$(mktemp -d) || die "mktemp 失败"
 smoke_payload=$(printf '{"session_id":"install-smoke","model":{"display_name":"Smoke"},"workspace":{"current_dir":"%s"}}' "$HOME")
 # 全部 env 覆盖都要给（round-7）：只隔离 history/daily 时，wk 段仍会
 # 派生后台任务读真实 .credentials.json 的 OAuth token 去打非官方 usage
 # 端点，并往真实 ~/.claude 写缓存/退避——一行安装命令不该在用户不知情
 # 时动用其凭据发网络请求。CRED 指向不存在的路径即可完全断开该链路。
-smoke_out=$(printf '%s' "$smoke_payload" |   STATUSLINE_HISTORY_FILE="$CLAUDE_DIR/.smoke-h.$$"   STATUSLINE_DAILY_FILE="$CLAUDE_DIR/.smoke-d.$$"   STATUSLINE_CI_CACHE_PREFIX="$CLAUDE_DIR/.smoke-ci.$$"   STATUSLINE_USAGE_CACHE_FILE="$CLAUDE_DIR/.smoke-uc.$$"   STATUSLINE_USAGE_BACKOFF_FILE="$CLAUDE_DIR/.smoke-ub.$$"   STATUSLINE_CRED_FILE="$CLAUDE_DIR/.smoke-nocred.$$"   bash "$CLAUDE_DIR/statusline-command.sh" 2>/dev/null)
-rm -f "$CLAUDE_DIR"/.smoke-*."$$" 2>/dev/null
+smoke_out=$(printf '%s' "$smoke_payload" |   STATUSLINE_HISTORY_FILE="$smoke_tmp/h"   STATUSLINE_DAILY_FILE="$smoke_tmp/d"   STATUSLINE_CI_CACHE_PREFIX="$smoke_tmp/ci"   STATUSLINE_USAGE_CACHE_FILE="$smoke_tmp/uc"   STATUSLINE_USAGE_BACKOFF_FILE="$smoke_tmp/ub"   STATUSLINE_CRED_FILE="$smoke_tmp/nocred"   bash "$CLAUDE_DIR/statusline-command.sh" 2>/dev/null)
+rm -rf "$smoke_tmp" 2>/dev/null
 [ -n "$smoke_out" ] || die "主状态栏冒烟渲染无输出"
 smoke_line1=$(printf '%s' "$smoke_out" | sed -n 1p | sed 's/\x1b\[[0-9;]*m//g; s/\x1b\]8;;[^\x1b]*\x1b\\\\//g')
 say "✓ 主状态栏冒烟通过：$smoke_line1"
