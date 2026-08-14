@@ -3,7 +3,7 @@
 # 直接由计划任务跑 powershell 会在 -WindowStyle Hidden 生效前闪一下控制台窗口。
 #
 # 渲染脚本（statusline-command.sh / subagent-statusline.sh）：一次渲染正常
-# 0.4–1.3s，存活 >30s 即判挂死。匹配面刻意收窄到两个文件名——宽泛的
+# 0.4–1.3s，>90s 才判挂死（见下方门槛说明）。匹配面刻意收窄到两个文件名——宽泛的
 # '*statusline*' 会误杀碰巧提及 statusline 的诊断/测试命令（2026-08-13 实际发生过）。
 #
 # 面板常驻 daemon：**只按 pid 文件第 3 行记录的 Windows pid 精确清理**，绝不按

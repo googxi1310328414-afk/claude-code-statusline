@@ -681,7 +681,7 @@ last_hist_epoch=""
 # state-machine semantics; only the ORDER moved here.
 daily_file="${STATUSLINE_DAILY_FILE:-$HOME/.claude/statusline-daily.tsv}"
 max_persisted_wm=0
-declare -A du_closed du_peak du_prev du_epoch
+declare -A du_closed du_peak du_prev du_epoch du_base du_sidprev du_sidepoch
 declare -A du_watermark
 printf -v today_str '%(%Y%m%d)T' -1
 if [ -f "$daily_file" ]; then
@@ -695,13 +695,19 @@ if [ -f "$daily_file" ]; then
     d_sid=${d_rest%%$'\x1f'*};  d_rest=${d_rest#*$'\x1f'}
     d_closed=${d_rest%%$'\x1f'*}; d_rest=${d_rest#*$'\x1f'}
     d_peak=${d_rest%%$'\x1f'*};   d_rest=${d_rest#*$'\x1f'}
-    d_prev=${d_rest%%$'\x1f'*}
-    d_epoch=${d_rest#*$'\x1f'}
+    d_prev=${d_rest%%$''*};   d_rest2=${d_rest#*$''}
+    d_epoch=${d_rest2%%$''*}
+    # 7th column (round-12): the day's midnight BASELINE. Legacy
+    # 6-column rows have no 7th field - d_rest2 then still equals
+    # d_epoch, which reads as base 0 (exactly the old behaviour).
+    d_base=${d_rest2#*$''}
+    [ "$d_base" = "$d_epoch" ] && d_base=0
+    [ "$d_base" = "$d_epoch" ] && d_base=0
     # whole-row shape check, 6 exact columns (5 separators, none left in
     # the last field), every numeric field guarded - malformed/foreign
     # rows dropped whole, same discipline as the fine file's reader below
     [ "$d_prev" = "$d_rest" ] && continue
-    [[ "$d_epoch" == *$'\x1f'* ]] && continue
+    [[ "$d_epoch" == *$''* ]] && continue
     [[ "$d_day" =~ ^[0-9]{8}$ ]] || continue
     [ -n "$d_sid" ] || continue
     # digit caps (round-5): cents fields at 12 digits (multi-session
@@ -733,6 +739,14 @@ if [ -f "$daily_file" ]; then
     du_peak[$dkey]=$d_peak
     du_prev[$dkey]=$d_prev
     du_epoch[$dkey]=$d_epoch
+    [[ "$d_base" =~ ^[0-9]{1,12}$ ]] || d_base=0
+    du_base[$dkey]=$d_base
+    # newest row per sid carries that session's last cumulative value,
+    # which is the midnight baseline for any later day it folds into
+    if [ "$d_epoch" -gt "${du_sidepoch[$d_sid]:-0}" ]; then
+      du_sidepoch[$d_sid]=$d_epoch
+      du_sidprev[$d_sid]=$d_prev
+    fi
     [ "$d_epoch" -gt "${du_watermark[$d_sid]:-0}" ] && du_watermark[$d_sid]=$d_epoch
     [ "$d_epoch" -gt "$max_persisted_wm" ] && max_persisted_wm=$d_epoch
   done
@@ -751,6 +765,18 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
   if [ -z "$d_prev" ]; then
     du_closed[$dkey]=${du_closed[$dkey]:-0}
     du_peak[$dkey]=$3
+    # MIDNIGHT BASELINE (round-12): .cost.total_cost_usd is a running
+    # per-SESSION total that does NOT reset at midnight, while this
+    # rollup is keyed (day, sid). Seeding a new day with the FULL
+    # cumulative made week (which sums both days) count the
+    # pre-midnight money twice - a session that spent $5.10 rendered
+    # week $10.10. The day now records the cumulative it inherited as
+    # its BASE and contributes closed+peak-base, i.e. only what was
+    # actually spent during it. A base above the seeded value means
+    # the counter reset (/clear) across the boundary - fall back to 0.
+    dbase=${du_sidprev[$2]:-0}
+    [ "$dbase" -gt "$3" ] && dbase=0
+    du_base[$dkey]=$dbase
   elif [ "$3" -lt "$d_prev" ]; then
     du_closed[$dkey]=$(( ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} ))
     du_peak[$dkey]=$3
@@ -760,6 +786,7 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
   du_prev[$dkey]=$3
   du_epoch[$dkey]=$1
   du_watermark[$2]=$1
+  du_sidprev[$2]=$3
   daily_dirty=1
 }
 
@@ -1036,7 +1063,10 @@ week_total_cents=0
 printf -v week_first_str '%(%Y%m%d)T' "$(( now_epoch - 518400 ))"
 for dkey in "${!du_peak[@]}"; do
   d_day="${dkey%%$'\x1f'*}"
-  d_total=$(( ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} ))
+  # minus the midnight baseline (see fold_daily_row): a day owns only
+  # the spend that happened DURING it, never the cumulative it inherited
+  d_total=$(( ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} - ${du_base[$dkey]:-0} ))
+  [ "$d_total" -lt 0 ] && d_total=0
   [ "$d_day" = "$today_str" ] && today_total_cents=$(( today_total_cents + d_total ))
   [ "$d_day" -ge "$week_first_str" ] && week_total_cents=$(( week_total_cents + d_total ))
 done
@@ -1087,7 +1117,7 @@ if [ "$daily_persist_due" -eq 1 ]; then
       daily_agg[$d_day]=$(( ${daily_agg[$d_day]:-0} + ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} ))
       continue
     fi
-    daily_out_lines+=("${d_day}"$''"${d_sid}"$''"${du_closed[$dkey]:-0}"$''"${du_peak[$dkey]:-0}"$''"${du_prev[$dkey]:-0}"$''"${du_epoch[$dkey]:-0}")
+    daily_out_lines+=("${d_day}"$''"${d_sid}"$''"${du_closed[$dkey]:-0}"$''"${du_peak[$dkey]:-0}"$''"${du_prev[$dkey]:-0}"$''"${du_epoch[$dkey]:-0}"$''"${du_base[$dkey]:-0}")
   done
   for d_day in "${!daily_agg[@]}"; do
     daily_out_lines+=("${d_day}"$''"_agg"$''"${daily_agg[$d_day]}"$''"0"$''"0"$''"0")

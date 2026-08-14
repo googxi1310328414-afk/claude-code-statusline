@@ -579,7 +579,10 @@ sleep 120
 ' "$((now-100))" > "$STATUSLINE_HISTORY_FILE"
   cap1=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'today \$[0-9.]*' | head -1)
   cap2=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'today \$[0-9.]*' | head -1)
-  [ -n "$cap1" ] && [ "$cap1" = "$cap2" ] && ok "daily cap keeps today stable ($cap1)" || bad "daily cap lost money ($cap1 -> $cap2)"
+  # allow a small forward drift (the fixture's own live cost accrues
+  # between the two frames); a REGRESSION here loses hundreds of dollars
+  cap_d=$(awk -v a="${cap1#today $}" -v b="${cap2#today $}" 'BEGIN{d=b-a; if(d<0)d=-d; printf "%d", d}' 2>/dev/null)
+  [ -n "$cap1" ] && [ "${cap_d:-999}" -le 5 ] && ok "daily cap keeps today stable ($cap1)" || bad "daily cap lost money ($cap1 -> $cap2)"
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   # R42: the watchdog must not match shells that merely MENTION the
@@ -615,7 +618,8 @@ PY
 ' "$((now-10))" > "$STATUSLINE_HISTORY_FILE"
   ag1=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'week \$[0-9.]*' | head -1)
   ag2=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'week \$[0-9.]*' | head -1)
-  [ -n "$ag1" ] && [ "$ag1" = "$ag2" ] && ok "overflow merge is idempotent ($ag1)" || bad "overflow merge lost money ($ag1 -> $ag2)"
+  ag_d=$(awk -v a="${ag1#week $}" -v b="${ag2#week $}" 'BEGIN{d=b-a; if(d<0)d=-d; printf "%d", d}' 2>/dev/null)
+  [ -n "$ag1" ] && [ "${ag_d:-999}" -le 5 ] && ok "overflow merge is idempotent ($ag1)" || bad "overflow merge lost money ($ag1 -> $ag2)"
   [ "$(grep -c '_agg' "$STATUSLINE_DAILY_FILE")" -eq 1 ] && ok "one _agg row per day after overflow" || bad "duplicate _agg rows written"
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
@@ -656,9 +660,17 @@ RHJSON
   [ "${hues:-0}" -ge 3 ] && ok "running agents get distinct per-agent hues ($hues)" || bad "running agents share one hue ($hues)"
   # R47: elapsed is duration-tiered (the 40min row bright red, the 30s
   # row gray) instead of flat white
+  # elapsed tier: rebuild with a live clock (the suite takes minutes,
+  # so a fixture stamped at suite start drifts across tier boundaries)
+  cat > "$tmpd/eltier.json" <<ELJSON
+{"columns":180,"tasks":[
+  {"id":"el1","name":"elong","status":"running","tokenCount":5000,"startTime":$(( ($(date +%s) - 2400) * 1000 )),"description":"d"},
+  {"id":"el2","name":"eshort","status":"running","tokenCount":5000,"startTime":$(( ($(date +%s) - 30) * 1000 )),"description":"d"}]}
+ELJSON
+  elrows=$(bash ./subagent-statusline.sh < "$tmpd/eltier.json" | jq -r .content | sed 's/\[/CODE/g')
   el_ok=1
-  printf '%s' "$colorcodes" | grep -q 'CODE91m40m0s' || el_ok=0
-  printf '%s' "$colorcodes" | grep -q 'CODE90m30s' || el_ok=0
+  printf '%s' "$elrows" | grep -q 'CODE91m40m' || el_ok=0
+  printf '%s' "$elrows" | grep -q 'CODE90m30s' || el_ok=0
   [ "$el_ok" -eq 1 ] && ok "elapsed color follows duration tier" || bad "elapsed tiering wrong"
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"

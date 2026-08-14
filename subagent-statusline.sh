@@ -360,8 +360,8 @@ jq_all_out=$(jq -r '
             ($task.model // "" | clean),
             ($task.effort // "" | clean),
             ($task.status // "" | clean),
-            ($task.startTime // "" | tostring),
-            ($task.tokenCount // "" | tostring),
+            ($task.startTime // "" | clean),
+            ($task.tokenCount // "" | clean),
             ($task.description // "" | clean)
           ] | @tsv
         ),

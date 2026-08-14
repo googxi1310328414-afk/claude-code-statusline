@@ -46,8 +46,18 @@ input+="$slurp_chunk"
 key=""
 key_head=${input:0:4096}
 case "$key_head" in
-  *'"id":"'*)  key=${key_head#*\"id\":\"};  key=${key%%\"*} ;;
-  *'"id": "'*) key=${key_head#*\"id\": \"}; key=${key%%\"*} ;;
+  *'"id":"'*)  key=${key_head#*\"id\":\"} ;;
+  *'"id": "'*) key=${key_head#*\"id\": \"} ;;
+esac
+# the CLOSING quote must also be inside the slice (round-12): an id that
+# straddles the 4KiB boundary left %%\"* with nothing to strip, so the
+# key became "id-prefix + slice tail garbage" - non-empty, so the awk
+# fallback never fired, and since the payload's byte length shifts every
+# tick the key CHANGED EVERY FRAME: permanent cache misses, one orphan
+# cache file per tick. No closing quote -> treat as not found.
+case "$key" in
+  *'"'*) key=${key%%\"*} ;;
+  *)     key="" ;;
 esac
 if [ -z "$key" ] && command -v awk >/dev/null 2>&1; then
   case "$input" in
@@ -138,7 +148,15 @@ if [ "$daemon_alive" -eq 0 ]; then
     [ -r "/proc/$daemon_pid/cmdline" ] && _cmd=$(tr '\0' ' ' < "/proc/$daemon_pid/cmdline" 2>/dev/null)
     case "$_cmd" in
       *statusline-panel-daemon.sh|*"statusline-panel-daemon.sh ")
-        kill "$daemon_pid" 2>/dev/null; kill -9 "$daemon_pid" 2>/dev/null ;;
+        # kill the whole process GROUP (round-12): a wedged daemon is
+        # usually wedged BECAUSE its render child is stuck, and killing
+        # only the daemon orphaned that child - it kept running (and
+        # holding its tmp file) with no parent to reap it, so the very
+        # leak this reap exists to stop was replaced by a slower one.
+        kill -- "-$daemon_pid" 2>/dev/null
+        kill "$daemon_pid" 2>/dev/null
+        kill -9 -- "-$daemon_pid" 2>/dev/null
+        kill -9 "$daemon_pid" 2>/dev/null ;;
     esac
   fi
   ( bash "$panel_daemon" </dev/null >/dev/null 2>&1 & )
