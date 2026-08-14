@@ -635,11 +635,25 @@ PY
   # grep pattern is brittle, and the raw ESC byte cannot be typed here
   colorcodes=$(printf '%s' "$colorrows" | sed 's/\[/CODE/g')
   col_ok=1
-  for _pair in '95m:runner' '32m:doner' '91m:failer' '33m:waiter' '94m:weirdo'; do
+  for _pair in '32m:doner' '91m:failer' '33m:waiter'; do
     _c=${_pair%%:*}; _n=${_pair#*:}
     printf '%s' "$colorcodes" | grep -q "CODE${_c}${_n}" || col_ok=0
   done
-  [ "$col_ok" -eq 1 ] && ok "identity color follows task state" || bad "identity state coloring wrong"
+  [ "$col_ok" -eq 1 ] && ok "terminal/waiting states keep semantic colors" || bad "state coloring wrong"
+  # running agents must NOT all share one hue: five ids must produce at
+  # least three distinct color codes (the panel used to be one solid
+  # block of magenta because running is the overwhelmingly common state)
+  cat > "$tmpd/runhues.json" <<RHJSON
+{"columns":180,"tasks":[
+  {"id":"a1x","name":"ra","status":"running","tokenCount":5000,"description":"d"},
+  {"id":"b2y","name":"rb","status":"running","tokenCount":5000,"description":"d"},
+  {"id":"c3z","name":"rc","status":"running","tokenCount":5000,"description":"d"},
+  {"id":"d4w","name":"rd","status":"running","tokenCount":5000,"description":"d"},
+  {"id":"e5v","name":"re","status":"running","tokenCount":5000,"description":"d"}]}
+RHJSON
+  runrows=$(bash ./subagent-statusline.sh < "$tmpd/runhues.json" | jq -r .content)
+  hues=$(printf '%s' "$runrows" | sed 's/\[/CODE/g' | grep -o 'CODE[0-9]*mr[a-e]' | sed 's/mr[a-e]$//' | sort -u | wc -l)
+  [ "${hues:-0}" -ge 3 ] && ok "running agents get distinct per-agent hues ($hues)" || bad "running agents share one hue ($hues)"
   # R47: elapsed is duration-tiered (the 40min row bright red, the 30s
   # row gray) instead of flat white
   el_ok=1
