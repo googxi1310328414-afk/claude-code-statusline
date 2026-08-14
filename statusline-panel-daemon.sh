@@ -192,8 +192,12 @@ while :; do
     render_seq=$(( render_seq + 1 ))
     cache_tmp="$panel_dir/cache.$key.tmp.$$.$render_seq"
     raw_tmp="$cache_tmp.raw"
+    # own process group (job control) so the timeout path can signal
+    # the renderer AND its grandchildren as one unit
+    set -m 2>/dev/null
     bash "$renderer" < "$panel_dir/render.$key" > "$raw_tmp" 2>>"$err_log" &
     r_pid=$!
+    set +m 2>/dev/null
     r_waited=0
     while kill -0 "$r_pid" 2>/dev/null; do
       [ "$r_waited" -ge "$render_ticks" ] && break
@@ -213,8 +217,29 @@ while :; do
       # deadline expired: kill the hung child, skip this frame (the
       # cache keeps serving the previous good frame; the next spool
       # retries with a fresh payload)
+      # ESCALATE + BOUNDED REAP (round-8): a plain SIGTERM plus an
+      # unbounded `wait` was two assumptions too many. A child wedged
+      # in a Windows syscall (exactly the fork-exhaustion case this
+      # deadline exists for) ignores TERM, and the unbounded wait then
+      # froze this loop - and the heartbeat with it - re-creating the
+      # very "hung child welds the daemon shut" failure the deadline
+      # was added to remove. Now: TERM, one 0.3s grace tick, KILL, then
+      # a BOUNDED wait (~1s of ticks) and move on regardless - a
+      # never-reaped child costs one zombie slot, an unbounded wait
+      # costs every session's panel. Grandchildren (the renderer's own
+      # jq) are reaped by killing the whole process GROUP when the
+      # shell supports job control; otherwise they exit on their own
+      # once their pipe closes.
       kill "$r_pid" 2>/dev/null
-      wait "$r_pid" 2>/dev/null
+      kill -- "-$r_pid" 2>/dev/null
+      sleep 0.3 2>/dev/null
+      kill -9 "$r_pid" 2>/dev/null
+      kill -9 -- "-$r_pid" 2>/dev/null
+      r_reap=0
+      while kill -0 "$r_pid" 2>/dev/null && [ "$r_reap" -lt 4 ]; do
+        sleep 0.3 2>/dev/null || break
+        r_reap=$(( r_reap + 1 ))
+      done
       rm -f "$cache_tmp" "$raw_tmp" 2>/dev/null
       frame_bad=1
     elif wait "$r_pid" 2>/dev/null && [ -s "$raw_tmp" ]; then

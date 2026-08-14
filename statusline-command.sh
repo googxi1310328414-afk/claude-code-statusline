@@ -413,7 +413,13 @@ jq_main_out=$(jq -r '
   (.session_id? // "" | clean),
   (.model?.display_name? // "" | clean),
   (.effort?.level? // "" | clean),
-  (if (.thinking?.enabled?) == true then "think" else "" end),
+  # `// false` is load-bearing: `.thinking?.enabled?` yields EMPTY (not
+  # null) when .thinking is a scalar/array, and `if empty then` prints
+  # NO line at all - which shifts every later F[] index, knocks the
+  # sentinel off F[30] and collapses the whole bar into "degraded
+  # (fork)" every frame. Every field in this list must emit exactly one
+  # line, unconditionally.
+  (if ((.thinking?.enabled?) // false) == true then "think" else "" end),
   (.workspace?.current_dir? // "" | clean),
   (.workspace?.repo?.owner? // "" | clean),
   (.workspace?.repo?.name? // "" | clean),
@@ -763,6 +769,28 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
 # per BYTE on MSYS (~2.8-3.5us/B), i.e. a per-frame tax the tail-first
 # walk could not remove (it skips PARSING old rows, not SPLITTING
 # them). 90min keeps 30min of slack past the widest window.
+# Watermark-only step for a row that carries NO parseable cost (the
+# payload contract allows a missing total_cost_usd). Round-7 advanced
+# the watermark in MEMORY only, but the rollup file is written from the
+# du_peak keys that ONLY fold_daily_row creates - so such a session
+# never got a row, reloaded at watermark 0 next frame, its rows never
+# looked inert, the 3-in-a-row early stop never armed, and every
+# session sharing the file paid the full double walk forever (the very
+# regression round-7 claimed to fix). A zero-cents row persists the
+# watermark; it adds nothing to today/week and leaves the monotonic run
+# untouched (prev defaults to 0, so a later real cost row seeds the
+# peak exactly as a first observation would).
+mark_daily_seen() { # $1=epoch $2=sid
+  printf -v row_day '%(%Y%m%d)T' "$1"
+  dkey="${row_day}"$''"$2"
+  du_closed[$dkey]=${du_closed[$dkey]:-0}
+  du_peak[$dkey]=${du_peak[$dkey]:-0}
+  du_prev[$dkey]=${du_prev[$dkey]:-0}
+  du_epoch[$dkey]=$1
+  du_watermark[$2]=$1
+  daily_dirty=1
+}
+
 hist_time_cutoff=$(( now_epoch - 5400 ))
 hist_future_cutoff=$(( now_epoch + 3600 ))
 hist_trimmed=()
@@ -822,6 +850,7 @@ done
 # oldest VALID epoch, for the rewrite-due decision: probe forward from
 # the head - the first few rows suffice (a bounded 20-row cap keeps a
 # pathological all-garbage head from re-importing a full scan)
+hist_probe_failed=0
 for (( hi=0; hi<hist_count && hi<20; hi++ )); do
   h_epoch=${hist_all_lines[hi]%%[$'\x1f\t']*}
   h_epoch=${h_epoch//$'\r'/}
@@ -830,6 +859,13 @@ for (( hi=0; hi<hist_count && hi<20; hi++ )); do
     break
   fi
 done
+# probe found nothing usable in the head (all 20 rows garbage or
+# future-stamped - the natural end state of a clock jump forward
+# followed by an NTP correction): remember it explicitly, because the
+# append path below defaults hist_oldest_epoch to now_epoch, which
+# would otherwise read as "brand new file" and disable trimming for
+# good (only the 10000-row cap left).
+[ -z "$hist_oldest_epoch" ] && [ "$hist_count" -gt 0 ] && hist_probe_failed=1
 for (( hi=hist_tail_start; hi<hist_count; hi++ )); do
   hline=${hist_all_lines[hi]}
   hline=${hline//$'\r'/}
@@ -888,7 +924,7 @@ for (( hi=hist_tail_start; hi<hist_count; hi++ )); do
   if cost_to_cents "$h_cost"; then
     fold_daily_row "$h_epoch" "$h_sid" "$REPLY"
   else
-    [ "$h_epoch" -gt "${du_watermark[$h_sid]:-0}" ] && du_watermark[$h_sid]=$h_epoch
+    mark_daily_seen "$h_epoch" "$h_sid"
   fi
 done
 
@@ -1078,6 +1114,13 @@ fi
 if [ -n "$session_id" ] && [ "$should_append" -eq 1 ]; then
   hist_rewrite_due=0
   [ -n "$hist_oldest_epoch" ] && [ $(( now_epoch - hist_oldest_epoch )) -gt 7200 ] && hist_rewrite_due=1
+  # probe found NOTHING usable in the first 20 rows (e.g. a clock jump
+  # forward wrote future-stamped rows, then the clock was corrected -
+  # every head row now reads as future): force the rewrite instead of
+  # falling back to "oldest = now", which pinned the age test at 0 and
+  # disabled trimming forever, leaving only the 10000-row cap. The
+  # rewrite itself discards future rows, so one frame self-heals.
+  [ "$hist_probe_failed" -eq 1 ] && hist_rewrite_due=1
   [ "$hist_count" -gt 10000 ] && hist_rewrite_due=1
   if [ "$hist_rewrite_due" -eq 1 ]; then
     # ON-DEMAND TRIM WALK (round-4): the every-frame loop no longer

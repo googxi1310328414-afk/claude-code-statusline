@@ -246,7 +246,16 @@ if [ "$1" = "--assert" ]; then
   # 30s sampling throttle (this render still appends a fresh row)
   printf "%s\x1fabc\x1f70000\x1f0.50\n" "$((now+7200))" > "$STATUSLINE_HISTORY_FILE"
   bash ./statusline-command.sh < fixtures/full.json >/dev/null
-  [ "$(grep -c . "$STATUSLINE_HISTORY_FILE")" -ge 2 ] && ok "future-epoch row does not freeze sampling" || bad "clock rollback froze sampling"
+  # round-8: a future-stamped row is now PURGED by the forced rewrite
+  # (the head probe can find no usable epoch), so the check is "a fresh
+  # sample exists", not "the old row is still there"
+  fresh_ok=0
+  while IFS= read -r _hl; do
+    _he=${_hl%%$''*}
+    [[ "$_he" =~ ^[0-9]+$ ]] || continue
+    [ "$_he" -le "$((now+60))" ] && [ "$_he" -ge "$((now-60))" ] && fresh_ok=1
+  done < "$STATUSLINE_HISTORY_FILE"
+  [ "$fresh_ok" -eq 1 ] && ok "future-epoch row does not freeze sampling" || bad "clock rollback froze sampling"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   # R8: transcript tail cost is O(matches) via the awk pre-filter, not
   # O(bytes) via mapfile: a ~500KiB filler transcript renders fast and
@@ -452,7 +461,22 @@ if [ "$1" = "--assert" ]; then
     printf "%snc1200
 " "$((now-300))"; } > "$STATUSLINE_HISTORY_FILE"
   jq -n --arg s nc1 '{session_id:$s,model:{display_name:"M"},workspace:{current_dir:"/x"}}' | bash ./statusline-command.sh >/dev/null 2>&1
-  grep -q 'nc1' "$STATUSLINE_DAILY_FILE" 2>/dev/null && bad "cost-less row folded into rollup" || ok "cost-less rows skip the rollup"
+  # round-8: a cost-less row must now PERSIST a zero-cents watermark
+  # row (memory-only advancement died with the frame, so the tail-scan
+  # early stop could never arm again), while adding nothing to spend
+  if grep -q 'nc1' "$STATUSLINE_DAILY_FILE" 2>/dev/null; then
+    nc_line=$(grep 'nc1' "$STATUSLINE_DAILY_FILE" | head -1)
+    nc_closed=$(printf '%s' "$nc_line" | cut -d$'' -f3)
+    nc_peak=$(printf '%s' "$nc_line" | cut -d$'' -f4)
+    nc_ep=$(printf '%s' "$nc_line" | cut -d$'' -f6)
+    if [ "$nc_closed" = "0" ] && [ "$nc_peak" = "0" ] && [ "$nc_ep" != "0" ]; then
+      ok "cost-less row persists a zero-cents watermark"
+    else
+      bad "cost-less watermark row malformed ($nc_line)"
+    fi
+  else
+    bad "cost-less row left no watermark row (early stop stays disarmed)"
+  fi
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   : > "$STATUSLINE_DAILY_FILE"
   # R32: settled days (older than yesterday) merge to one _agg row per
@@ -468,6 +492,39 @@ if [ "$1" = "--assert" ]; then
   mgout=$(bash ./statusline-command.sh < fixtures/full.json | strip)
   printf '%s' "$mgout" | grep -q 'week \$68' && ok "settled-day merge preserves week total" || bad "settled-day merge changed week total"
   [ "$(grep -c '_agg' "$STATUSLINE_DAILY_FILE")" -eq 3 ] && ok "settled days merged to one row each" || bad "settled-day merge row count wrong"
+  # ---- adversarial-review round-8 regression asserts (2026-08-14) ----
+  # R33: .thinking as a scalar/array must not collapse the bar (the
+  # `if` field must still emit exactly one line)
+  think_ok=1
+  for _t in '.thinking=true' '.thinking="on"' '.thinking=1' '.thinking=[]'; do
+    jq -c "$_t" fixtures/full.json | bash ./statusline-command.sh 2>/dev/null | strip | grep -q 'degraded' && think_ok=0
+  done
+  [ "$think_ok" -eq 1 ] && ok "scalar .thinking never degrades the bar" || bad "scalar .thinking degrades whole bar"
+  # R34: an all-future-stamped head must still trigger the trim rewrite
+  # (probe failure used to pin "oldest = now" and disable trimming)
+  : > "$STATUSLINE_DAILY_FILE"
+  {
+    for _i in $(seq 1 25); do printf '%sfut1000.10
+' "$((now+7200+_i))"; done
+    for _i in $(seq 1 30); do printf '%sabc1000.10
+' "$((now-18000+_i))"; done
+  } > "$STATUSLINE_HISTORY_FILE"
+  bash ./statusline-command.sh < fixtures/full.json >/dev/null 2>&1
+  fut_left=$(grep -c . "$STATUSLINE_HISTORY_FILE")
+  [ "$fut_left" -lt 30 ] && ok "future-stamped head still triggers trim" || bad "trim disabled by future head ($fut_left rows)"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  : > "$STATUSLINE_DAILY_FILE"
+  # R35: a render child that IGNORES SIGTERM must not wedge the daemon
+  printf '#!/bin/bash
+trap "" TERM
+sleep 60
+' > "$tmpd/hangterm.sh"
+  printf '{"columns":120,"tasks":[{"id":"ht1","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.ht1.new"
+  ht_t0=$SECONDS
+  STATUSLINE_PANEL_RENDERER="$tmpd/hangterm.sh" STATUSLINE_PANEL_RENDER_TIMEOUT=2 bash ./statusline-panel-daemon.sh --once
+  ht_el=$(( SECONDS - ht_t0 ))
+  [ "$ht_el" -lt 12 ] && ok "TERM-immune render child does not wedge daemon (${ht_el}s)" || bad "daemon wedged by TERM-immune child (${ht_el}s)"
+  rm -f "$STATUSLINE_PANEL_DIR"/render.ht1 "$STATUSLINE_PANEL_DIR"/cache.ht1* 2>/dev/null
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   : > "$STATUSLINE_DAILY_FILE"
