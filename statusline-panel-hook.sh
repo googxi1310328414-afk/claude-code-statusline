@@ -31,11 +31,31 @@ input+="$slurp_chunk"
 # adjacent (compact or one-space pretty form, the only shapes the host
 # emits); anything else yields no key = serve nothing, which fails SAFE
 # (default rows) instead of cross-serving another session's cache.
+# BOUNDED EXTRACTION (round-11): `${input#*"id":"}` is bash's shortest-
+# prefix GLOB search - it rescans from every position, so the cost is
+# QUADRATIC in the bytes it must skip. The payload shape that triggers
+# it is explicitly allowed (a first task with no id, or a non-string
+# id - test.sh covers exactly that), because the scan then has to cross
+# that whole task's tokenSamples: measured 13.8s on an 80KB payload,
+# i.e. the hook - whose entire reason for existing is to return within
+# milliseconds - blocks for ~14s and the panel sits on the host's
+# default rows, one extra 14s bash per ~5s tick. The prefix strip now
+# runs over a bounded 4KiB slice; the rare payload whose first string
+# id sits beyond that falls back to ONE awk pass (linear, ~ms) rather
+# than the quadratic expansion.
 key=""
-case "$input" in
-  *'"id":"'*)  key=${input#*\"id\":\"};  key=${key%%\"*} ;;
-  *'"id": "'*) key=${input#*\"id\": \"}; key=${key%%\"*} ;;
+key_head=${input:0:4096}
+case "$key_head" in
+  *'"id":"'*)  key=${key_head#*\"id\":\"};  key=${key%%\"*} ;;
+  *'"id": "'*) key=${key_head#*\"id\": \"}; key=${key%%\"*} ;;
 esac
+if [ -z "$key" ] && command -v awk >/dev/null 2>&1; then
+  case "$input" in
+    *'"id"'*)
+      key=$(printf '%s' "$input" | awk 'match($0, /"id"[ ]*:[ ]*"[^"]*"/) { s = substr($0, RSTART, RLENGTH); sub(/^"id"[ ]*:[ ]*"/, "", s); sub(/"$/, "", s); print s; exit }' 2>/dev/null)
+      ;;
+  esac
+fi
 if [ -n "$key" ]; then
   key=${key//[!A-Za-z0-9_-]/}
   key=${key:0:24}

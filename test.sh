@@ -586,6 +586,42 @@ sleep 120
   # daemon filename (the 2026-08-13 mis-kill class)
   grep -q 'CommandLine -match' ./statusline-watchdog.ps1 && ok "watchdog uses an argv-position match" || bad "watchdog still uses a mention match"
   grep -q 'ProcessId=' ./statusline-watchdog.ps1 && ok "watchdog targets the registered Windows pid" || bad "watchdog does not use the registered winpid"
+  # ---- adversarial-review round-11 regression asserts (2026-08-15) ----
+  # R43: the hook must stay fast when the first task has no string id -
+  # the old shortest-prefix strip was QUADRATIC (13.8s measured on an
+  # 80KB payload, i.e. the panel froze on default rows)
+  python - <<'PY' > "$tmpd/bigpayload.json" 2>/dev/null || jq -n '{columns:120,tasks:[{id:123,tokenCount:5},{id:"t2",tokenCount:6}]}' > "$tmpd/bigpayload.json"
+import json
+samples=[{"tokens":i*10} for i in range(2500)]
+print(json.dumps({"columns":120,"tasks":[{"id":123,"label":"a","status":"running","tokenCount":5,"tokenSamples":samples},{"id":"t2","label":"b","status":"running","tokenCount":6}]}))
+PY
+  hk_t0=$EPOCHREALTIME
+  STATUSLINE_PANEL_DAEMON=/dev/null bash ./statusline-panel-hook.sh < "$tmpd/bigpayload.json" >/dev/null 2>&1
+  hk_t1=$EPOCHREALTIME
+  awk -v a="$hk_t0" -v b="$hk_t1" 'BEGIN{exit (b-a < 3.0) ? 0 : 1}' && ok "hook key extraction stays bounded on a late id" || bad "hook key extraction is quadratic again"
+  rm -f "$STATUSLINE_PANEL_DIR"/spool.t2.new 2>/dev/null
+  # R44: the daily overflow merge must be idempotent - an existing _agg
+  # row for the same day must be folded IN, never duplicated (a second
+  # row with the same key silently overwrote the first on reload)
+  : > "$STATUSLINE_DAILY_FILE"
+  ag_today=$(date +%Y%m%d)
+  {
+    printf '%s_agg50000000
+' "$ag_today"
+    for _i in $(seq 1 401); do printf '%ss%03d0100100%s
+' "$ag_today" "$_i" "$((now-11000))"; done
+  } > "$STATUSLINE_DAILY_FILE"
+  printf '%sagx1000.05
+' "$((now-10))" > "$STATUSLINE_HISTORY_FILE"
+  ag1=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'week \$[0-9.]*' | head -1)
+  ag2=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'week \$[0-9.]*' | head -1)
+  [ -n "$ag1" ] && [ "$ag1" = "$ag2" ] && ok "overflow merge is idempotent ($ag1)" || bad "overflow merge lost money ($ag1 -> $ag2)"
+  [ "$(grep -c '_agg' "$STATUSLINE_DAILY_FILE")" -eq 1 ] && ok "one _agg row per day after overflow" || bad "duplicate _agg rows written"
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R45: install must confirm process identity before signalling (a
+  # recycled pid in a stale pid file otherwise gets TERM+KILL)
+  grep -q 'old_cmd' ./install.sh && ok "installer confirms daemon identity before kill" || bad "installer still kills by bare pid"
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   : > "$STATUSLINE_DAILY_FILE"

@@ -1109,7 +1109,18 @@ if [ "$daily_persist_due" -eq 1 ]; then
       dl_rest=${dl#*$SEP1}
       dl_sid=${dl_rest%%$SEP1*}
       dl_ep=${dl##*$SEP1}
-      if [ "$dl_sid" != "_agg" ] && [[ "$dl_ep" =~ ^[0-9]+$ ]] && [ "$dl_ep" -lt "$(( now_epoch - 7200 ))" ]; then
+      # _agg rows JOIN the bucket instead of being passed through
+      # (round-11): passing them through while also appending a fresh
+      # _agg for the same day wrote TWO rows with the same key, and the
+      # loader's plain assignment made the later one overwrite the
+      # earlier - the first row's money vanished for good (the fine
+      # rows behind it are long past the 90min window). The threshold
+      # is also 3h, not 90min+: the fine file's trim only runs on an
+      # APPENDING frame, so rows can physically linger past 7200s -
+      # merging a session that still has fine rows on disk zeroed its
+      # watermark and let those rows re-fold FROM SCRATCH, inflating
+      # today/week (the forbidden direction).
+      if { [ "$dl_sid" = "_agg" ] || [ "$dl_ep" -lt "$(( now_epoch - 10800 ))" ]; } && [[ "$dl_ep" =~ ^[0-9]+$ ]]; then
         dl_r2=${dl_rest#*$SEP1}
         dl_closed=${dl_r2%%$SEP1*}
         dl_r3=${dl_r2#*$SEP1}
