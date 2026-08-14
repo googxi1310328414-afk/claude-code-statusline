@@ -202,11 +202,13 @@ MAGENTA_BRIGHT=$'\e[95m'
 BLUE_BRIGHT=$'\e[94m'
 CYAN_BRIGHT=$'\e[96m'
 MAGENTA=$'\e[35m'
+BLUE=$'\e[34m'
+WHITE_BRIGHT=$'\e[97m'
 # running-agent hue palette (see the identity block): deliberately
 # excludes green/yellow/bright-red, which are reserved for the
 # completed/pending/failed states - a hue can never lie about what an
 # agent is doing.
-RUN_HUES=("$MAGENTA_BRIGHT" "$CYAN_BRIGHT" "$BLUE_BRIGHT" "$MAGENTA" "$CYAN")
+RUN_HUES=("$CYAN_BRIGHT" "$BLUE_BRIGHT" "$MAGENTA_BRIGHT" "$CYAN" "$BLUE" "$WHITE_BRIGHT")
 # N6: alignment padding and the grid separator's surrounding spaces use
 # NBSP (U+00A0), not a plain space, so VSCode-style terminals can't trim
 # them and break column alignment; semantic single spaces inside a
@@ -519,12 +521,13 @@ for ((ti=0; ti<task_count_total; ti++)); do
     completed|done|finished)        ident_color="$GREEN" ;;
     failed|error|cancelled|killed)  ident_color="$RED_BRIGHT" ;;
     *)
+      # multiply-accumulate over the WHOLE id: a plain byte SUM over a
+      # truncated prefix clustered badly (two live agents landed on the
+      # same hue), so ids that differ only late still separate here.
       ident_hash=0
-      ident_hn=${#id}
-      [ "$ident_hn" -gt 8 ] && ident_hn=8
-      for (( ihx=0; ihx<ident_hn; ihx++ )); do
+      for (( ihx=0; ihx<${#id}; ihx++ )); do
         printf -v ident_ch '%d' "'${id:ihx:1}" 2>/dev/null || ident_ch=0
-        ident_hash=$(( ident_hash + ident_ch ))
+        ident_hash=$(( (ident_hash * 31 + ident_ch) % 100003 ))
       done
       ident_color="${RUN_HUES[$(( ident_hash % ${#RUN_HUES[@]} ))]}"
       ;;
