@@ -15,6 +15,16 @@ export STATUSLINE_PANEL_DAEMON=/dev/null
 export STATUSLINE_PANEL_RENDERER="$PWD/subagent-statusline.sh"
 mkdir -p "$STATUSLINE_PANEL_DIR"
 export STATUSLINE_DAILY_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-daily.tsv"
+# round-3 isolation: CI/usage caches and the OAuth credential path were
+# the LAST state files hardcoded to the real ~/.claude - running this
+# suite used to write real CI cache rows, spawn real `gh pr checks`, and
+# hit the usage endpoint with the user's real token. The nonexistent
+# cred path makes every usage refresh park itself in the isolated
+# backoff file with zero network and zero credential reads.
+export STATUSLINE_CI_CACHE_PREFIX="$(dirname "$STATUSLINE_HISTORY_FILE")/test-ci-cache"
+export STATUSLINE_USAGE_CACHE_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-usage-cache"
+export STATUSLINE_USAGE_BACKOFF_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-usage-backoff"
+export STATUSLINE_CRED_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/no-such-credentials.json"
 trap 'rm -rf "$(dirname "$STATUSLINE_HISTORY_FILE")"' EXIT
 
 strip() { perl -pe 's/\e\[[0-9;]*m//g; s/\e\]8;;[^\e]*\e\\//g'; }
@@ -293,6 +303,59 @@ if [ "$1" = "--assert" ]; then
   printf '{"columns":120,"tasks":[{"id":"tmo2","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.tmo2.new"
   STATUSLINE_PANEL_RENDERER="$tmpd/emptyrender.sh" bash ./statusline-panel-daemon.sh --once
   grep -q GOOD_FRAME "$STATUSLINE_PANEL_DIR/cache.tmo2" 2>/dev/null && ok "empty render keeps last good frame" || bad "empty render clobbered cache"
+
+  # ---- adversarial-review round-3 regression asserts (2026-08-14) ----
+  # R16: usage refresh must converge on failure - with an unreadable
+  # credential path (exported at the top), one render writes a negative-
+  # cache row into the ISOLATED backoff file, and the real ~/.claude
+  # backoff is never created/touched
+  real_bo="$HOME/.claude/statusline-usage-backoff"
+  real_bo_sig="absent"
+  [ -f "$real_bo" ] && real_bo_sig=$(date -r "$real_bo" +%s 2>/dev/null || echo present)
+  rm -f "$STATUSLINE_USAGE_BACKOFF_FILE"
+  jq -n --argjson n "$now" '{session_id:"ub1",model:{display_name:"M"},workspace:{current_dir:"/x"},rate_limits:{five_hour:{used_percentage:10,resets_at:($n+7200)}}}' | bash ./statusline-command.sh >/dev/null
+  ub_ok=0
+  for _w in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$STATUSLINE_USAGE_BACKOFF_FILE" ] && { ub_ok=1; break; }
+    sleep 0.3
+  done
+  [ "$ub_ok" -eq 1 ] && ok "usage failure writes isolated negative cache" || bad "usage backoff not written"
+  real_bo_sig2="absent"
+  [ -f "$real_bo" ] && real_bo_sig2=$(date -r "$real_bo" +%s 2>/dev/null || echo present)
+  [ "$real_bo_sig" = "$real_bo_sig2" ] && ok "real ~/.claude usage state untouched by tests" || bad "test leaked into real ~/.claude usage state"
+  # R17: three consecutive bad frames make the daemon EMPTY the cache
+  # (honest degradation instead of serving stale numbers forever) -
+  # needs the RESIDENT daemon since the streak lives in its memory
+  printf '%s\n' '{"id":"st1","content":"STALE_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.st1"
+  STATUSLINE_PANEL_RENDERER="$tmpd/emptyrender.sh" STATUSLINE_PANEL_DIR="$STATUSLINE_PANEL_DIR" bash ./statusline-panel-daemon.sh &
+  st_dpid=$!
+  for _i in 1 2 3; do
+    printf '{"columns":120,"tasks":[{"id":"st1","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.st1.new"
+    sleep 0.8
+  done
+  st_ok=0
+  for _w in 1 2 3 4 5; do
+    if [ -f "$STATUSLINE_PANEL_DIR/cache.st1" ] && [ ! -s "$STATUSLINE_PANEL_DIR/cache.st1" ]; then st_ok=1; break; fi
+    sleep 0.4
+  done
+  kill "$st_dpid" 2>/dev/null; wait "$st_dpid" 2>/dev/null
+  [ "$st_ok" -eq 1 ] && ok "bad-frame streak empties stale cache" || bad "stale cache survived persistent failure"
+  # R18: a live-but-recycled pid (fresh process, STALE heartbeat) must
+  # be evicted by a starting daemon's takeover, not deferred to
+  printf '%s\n%s\n' "$$" "$((now-999))" > "$STATUSLINE_PANEL_DIR/daemon.pid"
+  bash ./statusline-panel-daemon.sh &
+  hb_dpid=$!
+  sleep 1
+  hb_owner=""
+  read -r hb_owner < "$STATUSLINE_PANEL_DIR/daemon.pid" 2>/dev/null
+  kill "$hb_dpid" 2>/dev/null; wait "$hb_dpid" 2>/dev/null
+  rm -f "$STATUSLINE_PANEL_DIR/daemon.pid"
+  [ -n "$hb_owner" ] && [ "$hb_owner" != "$$" ] && ok "stale-heartbeat claim evicted by takeover" || bad "recycled pid claim survived takeover"
+  # R19: millisecond-unit resets_at must not fabricate a red pace alarm
+  # or a bogus clock - the reset half-segments silently disappear
+  msout=$(jq -n '{session_id:"ms1",model:{display_name:"M"},workspace:{current_dir:"/x"},rate_limits:{five_hour:{used_percentage:37.4,resets_at:1770000000000}}}' | bash ./statusline-command.sh | strip)
+  printf '%s' "$msout" | grep -q '5h 37%' && ok "ms resets_at keeps percent" || bad "ms resets_at broke percent"
+  printf '%s' "$msout" | grep -qE '·t|→' && bad "ms resets_at fabricated pace/clock" || ok "ms resets_at drops reset half-segments"
 
   # panel daemon architecture: the hook must spool the payload, stay
   # silent on a cold cache, serve the cached frame instantly, and the

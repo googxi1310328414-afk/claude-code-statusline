@@ -71,25 +71,41 @@ if [ -f "$err_log" ]; then
 fi
 exec 2>>"$err_log"
 
+# pid file format (round-3): TWO lines - "pid\nheartbeat_epoch". The
+# heartbeat (rewritten by the ~9s ownership self-check below) is what
+# lets the hook and the takeover path tell a LIVE daemon from a stale
+# pid recycled onto some unrelated cygwin process - bare `kill -0` alone
+# deadlocked forever in that case: hook thought the daemon was alive and
+# never respawned, spools piled up, the panel froze with no recovery.
+# A liveness verdict is kill -0 AND a numeric heartbeat younger than 60s
+# (missing/old-format heartbeat counts as stale -> smooth migration).
 if [ "$once" -eq 0 ]; then
-  if ! ( set -C; printf '%s\n' "$$" > "$panel_dir/daemon.pid" ) 2>/dev/null; then
+  printf -v hb_now '%(%s)T' -1
+  if ! ( set -C; printf '%s\n%s\n' "$$" "$hb_now" > "$panel_dir/daemon.pid" ) 2>/dev/null; then
     holder=""
-    [ -r "$panel_dir/daemon.pid" ] && read -r holder < "$panel_dir/daemon.pid"
-    if [ -n "$holder" ] && [ "$holder" != "$$" ] && kill -0 "$holder" 2>/dev/null; then
+    holder_hb=""
+    [ -r "$panel_dir/daemon.pid" ] && { read -r holder; read -r holder_hb; } < "$panel_dir/daemon.pid"
+    holder_fresh=0
+    if [[ "$holder_hb" =~ ^[0-9]+$ ]]; then
+      hb_age=$(( hb_now - holder_hb ))
+      [ "$hb_age" -ge -60 ] && [ "$hb_age" -le 60 ] && holder_fresh=1
+    fi
+    if [ -n "$holder" ] && [ "$holder" != "$$" ] && [ "$holder_fresh" -eq 1 ] && kill -0 "$holder" 2>/dev/null; then
       exit 0
     fi
-    # stale/empty claim: remove it and retry the EXCLUSIVE create once -
-    # of two concurrent takeover attempts exactly one wins the noclobber
-    # race, the loser exits and the next hook tick re-probes the winner
+    # stale/empty/recycled claim: remove it and retry the EXCLUSIVE
+    # create once - of two concurrent takeover attempts exactly one wins
+    # the noclobber race, the loser exits and the next hook tick
+    # re-probes the winner
     rm -f "$panel_dir/daemon.pid" 2>/dev/null
-    ( set -C; printf '%s\n' "$$" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
+    ( set -C; printf '%s\n%s\n' "$$" "$hb_now" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
   fi
   # startup housekeeping: orphaned in-flight claims from a crashed
   # predecessor, caches nothing has touched for a day, and orphaned
   # per-PID tmp files a killed hook/daemon left behind (age-gated so a
   # LIVE instance's in-flight tmp, seconds old, is never swept)
   rm -f "$panel_dir"/render.* 2>/dev/null
-  find "$panel_dir" \( -name 'cache.*' -mmin +1440 -o -name 'spool.*.tmp.*' -mmin +10 \) -delete 2>/dev/null
+  find "$panel_dir" \( -name 'cache.*' -mmin +1440 -o -name 'spool.*.tmp.*' -mmin +10 -o -name 'daemon.pid.tmp.*' -mmin +10 \) -delete 2>/dev/null
 fi
 
 tick_fifo="$panel_dir/.tick.fifo"
@@ -99,6 +115,17 @@ shopt -s nullglob
 idle=0
 render_seq=0
 own_check=0
+# per-key consecutive bad-frame counter (round-3 fix): the -s keep-frame
+# gate protects the cache from TRANSIENT blank renders, but a PERSISTENT
+# failure (jq gone from PATH, renderer deleted, permanent hang) then
+# froze every session's panel on its last good frame indefinitely -
+# stale numbers dressed up as live ones, with no signal and no recovery
+# on a default install. After 3 consecutive bad frames (~15s) the cache
+# is explicitly EMPTIED: the hook then serves nothing, the host falls
+# back to its default rows - an honest degradation (the main bar prints
+# "jq missing" in the same scenario; the panel now stops lying too). A
+# later successful render simply repopulates the cache.
+declare -A bad_streak
 while :; do
   worked=0
   # OWNERSHIP SELF-CHECK (~9s cadence, zero spawns): the rm+exclusive-
@@ -109,13 +136,21 @@ while :; do
   # a DIFFERENT live pid registered concedes and exits instead of
   # coasting to the 2-minute idle death.
   own_check=$(( own_check + 1 ))
-  if [ "$once" -eq 0 ] && [ "$own_check" -ge 30 ]; then
+  if [ "$once" -eq 0 ] && [ "$own_check" -ge 15 ]; then
     own_check=0
     cur_owner=""
     [ -r "$panel_dir/daemon.pid" ] && read -r cur_owner < "$panel_dir/daemon.pid"
     if [ -n "$cur_owner" ] && [ "$cur_owner" != "$$" ] && kill -0 "$cur_owner" 2>/dev/null; then
       exit 0
     fi
+    # HEARTBEAT: refresh the pid file's second line (~9s cadence, well
+    # inside the hook's 30s freshness verdict) - this is what proves to
+    # the hook that this pid is really THIS daemon, not a recycled pid
+    # on some unrelated process. Atomic tmp+mv (one fork per ~9s, far
+    # off any hot path): a bare `>` rewrite would open a truncation
+    # window in the very file every liveness verdict reads.
+    printf -v hb_now '%(%s)T' -1
+    printf '%s\n%s\n' "$$" "$hb_now" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
   fi
   for sp in "$panel_dir"/spool.*.new; do
     key=${sp##*/spool.}
@@ -139,6 +174,7 @@ while :; do
       fi
       r_waited=$(( r_waited + 1 ))
     done
+    frame_bad=0
     if kill -0 "$r_pid" 2>/dev/null; then
       # deadline expired: kill the hung child, skip this frame (the
       # cache keeps serving the previous good frame; the next spool
@@ -146,6 +182,7 @@ while :; do
       kill "$r_pid" 2>/dev/null
       wait "$r_pid" 2>/dev/null
       rm -f "$cache_tmp" 2>/dev/null
+      frame_bad=1
     elif wait "$r_pid" 2>/dev/null && [ -s "$cache_tmp" ]; then
       # -s gate: a renderer that exits 0 with EMPTY output (fork
       # exhaustion makes its jq capture come back blank and the script
@@ -154,8 +191,19 @@ while :; do
       # every session's panel would blank precisely during the storms
       # this cache exists to ride out. Skip the frame instead.
       mv -f "$cache_tmp" "$panel_dir/cache.$key" 2>/dev/null
+      bad_streak[$key]=0
     else
       rm -f "$cache_tmp" 2>/dev/null
+      frame_bad=1
+    fi
+    if [ "$frame_bad" -eq 1 ]; then
+      bad_streak[$key]=$(( ${bad_streak[$key]:-0} + 1 ))
+      if [ "${bad_streak[$key]}" -ge 3 ]; then
+        # persistent failure: stop serving the stale frame (see the
+        # bad_streak comment above the loop)
+        : > "$panel_dir/cache.$key" 2>/dev/null
+        bad_streak[$key]=0
+      fi
     fi
     rm -f "$panel_dir/render.$key" 2>/dev/null
     worked=1

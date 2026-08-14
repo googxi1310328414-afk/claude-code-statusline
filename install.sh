@@ -74,6 +74,10 @@ if [ "$daemon_updated" -eq 1 ]; then
     kill "$old_dp" 2>/dev/null
     say "✓ 旧面板 daemon(pid $old_dp) 已回收——下一拍面板钩子自动以新版拉起"
   fi
+  # 被 SIGTERM 杀掉的 daemon 走不到退出清理——顺手删掉 pid 文件，
+  # 免得残留 pid 被系统回收给无关进程后欺骗钩子的探活（心跳机制
+  # 是主防线，这里是零成本的辅助卫生）
+  rm -f "$daemon_pid_file" 2>/dev/null
 fi
 
 # ---------- settings.json 合并（保留既有键；失败不落地） ----------

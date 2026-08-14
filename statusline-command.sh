@@ -299,7 +299,7 @@ exec 2>>"$statusline_err_log"
 #   $0.42 $0.6/h | +156/-23
 #   5h 37%·t56%→09:00 7d 12%·t23%→08-15 | wk Fab45% Son67% | » my-session
 # Low-context example (line 2 only, illustrating the "!" warning bar):
-#   ctx !█░░░░ 12% 176k/200k
+#   ctx !█░░░│ 12% 176k/200k
 # Minimal example (fresh session: line 1 + a bare line 4, no lines 2/3):
 #   14:32:07 | Fable 5 | ~
 #   » my-session
@@ -1334,7 +1334,9 @@ if [ -n "$pr_number" ]; then
   if [ -n "$repo_owner" ] && [ -n "$repo_name" ] && command -v gh >/dev/null 2>&1; then
     ci_key="${repo_owner}-${repo_name}-${pr_number}"
     ci_key=${ci_key//[!A-Za-z0-9._-]/_}
-    ci_cache_file="$HOME/.claude/statusline-ci-cache.${ci_key}"
+    # prefix env-overridable (round-3 fix): tests were writing real CI
+    # cache rows into ~/.claude and spawning real gh for the fixture PR
+    ci_cache_file="${STATUSLINE_CI_CACHE_PREFIX:-$HOME/.claude/statusline-ci-cache}.${ci_key}"
     ci_repo_pr="${repo_owner}/${repo_name}"
     ci_state=""
     if [ -f "$ci_cache_file" ]; then
@@ -1396,7 +1398,8 @@ if [ -n "$pr_number" ]; then
         # housekeeping, riding the already-detached refresh (never the
         # render path): per-key rows for PRs nobody has rendered in a day
         # + the pre-per-key shared file a previous version left behind
-        find "$HOME/.claude" -maxdepth 1 \( -name 'statusline-ci-cache.*' -o -name 'statusline-ci-cache' \) -mmin +1440 -delete 2>/dev/null
+        ci_cache_dir="${ci_cache_file%/*}"
+        find "$ci_cache_dir" -maxdepth 1 \( -name 'statusline-ci-cache.*' -o -name 'statusline-ci-cache' \) -mmin +1440 -delete 2>/dev/null
         rm -f "$ci_inflight" 2>/dev/null
       ) >/dev/null 2>&1 &
       disown
@@ -2062,6 +2065,24 @@ if [[ "$five" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]]; then
     five_color="$YELLOW"
   fi
   printf -v five_pct '%.0f' "$five"
+  # resets_at NORMALIZATION (round-3 fix, the 4th same-shape site after
+  # cost/five/week got their guards): digits-only was not enough - a
+  # millisecond-unit value (upstream unit mixing is an acknowledged risk
+  # here: startTime already gets the >1e12 treatment) clamped the time
+  # cursor to t0% and FORCE-RED a healthy percent, 0 rendered a 1970
+  # clock, and a 20-digit value overflowed printf into the blackbox
+  # while still showing a fabricated time. 13-digit cap keeps arithmetic
+  # in range; >1e12 converts ms->s; then a sanity window (yesterday ..
+  # window-end + a day) - out of range means the reset half-segments
+  # silently disappear instead of lying.
+  if [[ "$five_reset" =~ ^[0-9]{1,13}$ ]]; then
+    [ "$five_reset" -gt 1000000000000 ] && five_reset=$(( five_reset / 1000 ))
+    if [ "$five_reset" -lt $(( now_epoch - 86400 )) ] || [ "$five_reset" -gt $(( now_epoch + 18000 + 86400 )) ]; then
+      five_reset=""
+    fi
+  else
+    five_reset=""
+  fi
   # REVERTED (N1 micro-bar rejected on visual review: two meanings in one
   # glyph row, and the cursor landing inside the filled zone when time
   # lags usage read as a rendering glitch, not a pace indicator). Back to
@@ -2108,6 +2129,16 @@ if [[ "$week" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]]; then
     week_color="$YELLOW"
   fi
   printf -v week_pct '%.0f' "$week"
+  # resets_at normalization - see the 5h window's comment above (window
+  # here is 7 days)
+  if [[ "$week_reset" =~ ^[0-9]{1,13}$ ]]; then
+    [ "$week_reset" -gt 1000000000000 ] && week_reset=$(( week_reset / 1000 ))
+    if [ "$week_reset" -lt $(( now_epoch - 86400 )) ] || [ "$week_reset" -gt $(( now_epoch + 604800 + 86400 )) ]; then
+      week_reset=""
+    fi
+  else
+    week_reset=""
+  fi
   # REVERTED (N1 micro-bar rejected - see the 5h window's comment above).
   # Back to the textual pace cursor "·tNN%".
   week_pace_seg=""
@@ -2187,8 +2218,13 @@ wk_label_for() {
 # from before this change parses as harmless nonsense (fails the numeric
 # guards below) rather than garbage output, and self-heals on the next
 # background refresh (<=180s).
-usage_cache_file="$HOME/.claude/statusline-usage-cache"
-usage_backoff_file="$HOME/.claude/statusline-usage-backoff"
+# env overrides (round-3 fix): these were the LAST state files hardcoded
+# to the real $HOME/.claude - `bash test.sh --assert` was writing real CI
+# cache rows, spawning real `gh pr checks` for the fixture's PR, and even
+# taking the user's OAuth token from .credentials.json to hit the usage
+# endpoint. Same isolation contract as STATUSLINE_HISTORY_FILE etc.
+usage_cache_file="${STATUSLINE_USAGE_CACHE_FILE:-$HOME/.claude/statusline-usage-cache}"
+usage_backoff_file="${STATUSLINE_USAGE_BACKOFF_FILE:-$HOME/.claude/statusline-usage-backoff}"
 wk_seg=""
 wk_plain=""
 usage_needs_refresh=1
@@ -2342,9 +2378,33 @@ if [ "$usage_needs_refresh" -eq 1 ] && command -v curl >/dev/null 2>&1; then
     usage_bo_line=${usage_bo_line//$'\r'/}
     [[ "$usage_bo_line" =~ ^[0-9]+$ ]] && usage_backoff_until="$usage_bo_line"
   fi
-  if [ "$now_epoch" -ge "$usage_backoff_until" ]; then
+  # IN-FLIGHT DEDUP (round-3 fix, same pattern as the CI badge): the 5s
+  # curl timeout overlaps the 10s frame cadence, and NOTHING was written
+  # on non-200/non-429 outcomes - once the (unofficial, "may vanish any
+  # day" per README) endpoint failed, every frame respawned a fresh
+  # subshell+jq+curl chain forever. The marker suppresses respawns for
+  # 120s; every terminal outcome below now also writes a backoff row so
+  # the next frames don't even fork the subshell.
+  usage_inflight="${usage_backoff_file}.tmp.inflight"
+  usage_spawn=1
+  if [ -f "$usage_inflight" ]; then
+    usage_if_epoch=""
+    read -r usage_if_epoch < "$usage_inflight" 2>/dev/null
+    if [[ "$usage_if_epoch" =~ ^[0-9]+$ ]]; then
+      usage_if_age=$(( now_epoch - usage_if_epoch ))
+      [ "$usage_if_age" -ge 0 ] && [ "$usage_if_age" -lt 120 ] && usage_spawn=0
+    fi
+  fi
+  if [ "$now_epoch" -ge "$usage_backoff_until" ] && [ "$usage_spawn" -eq 1 ]; then
+    printf '%s\n' "$now_epoch" > "$usage_inflight" 2>/dev/null
     (
-      cred_file="$HOME/.claude/.credentials.json"
+      # negative-cache helper: ANY terminal outcome that is not a 200
+      # write parks the next retry, converging the respawn loop
+      u_backoff() {
+        printf -v u_bo_now '%(%s)T' -1
+        printf '%s\n' "$(( u_bo_now + $1 ))" > "${usage_backoff_file}.tmp.$$" 2>/dev/null && mv -f "${usage_backoff_file}.tmp.$$" "$usage_backoff_file" 2>/dev/null
+      }
+      cred_file="${STATUSLINE_CRED_FILE:-$HOME/.claude/.credentials.json}"
       if [ -f "$cred_file" ] && command -v jq >/dev/null 2>&1; then
         oauth_token=$(jq -r '.claudeAiOauth.accessToken // empty' "$cred_file" 2>/dev/null)
         if [ -n "$oauth_token" ]; then
@@ -2400,11 +2460,26 @@ if [ "$usage_needs_refresh" -eq 1 ] && command -v curl >/dev/null 2>&1; then
             if [ -n "$usage_parsed" ]; then
               printf -v usage_write_epoch '%(%s)T' -1
               printf '%s\t%s\n' "$usage_write_epoch" "$usage_parsed" > "${usage_cache_file}.tmp.$$" 2>/dev/null && mv -f "${usage_cache_file}.tmp.$$" "$usage_cache_file" 2>/dev/null
+            else
+              # 200 but unparseable body: park retries briefly
+              u_backoff 120
             fi
+          else
+            # non-200/non-429 terminal outcome (timeout, DNS/offline,
+            # 401/403/404, endpoint gone): short negative cache
+            u_backoff 120
           fi
           rm -f "$usage_hdr_tmp" "$usage_body_tmp" 2>/dev/null
+        else
+          # credentials present but no usable token - won't heal fast
+          u_backoff 600
         fi
+      else
+        # no credentials file / no jq: nothing to refresh with - park
+        # long so the render path stops even forking this subshell
+        u_backoff 600
       fi
+      rm -f "$usage_inflight" 2>/dev/null
     ) >/dev/null 2>&1 &
     disown
   fi

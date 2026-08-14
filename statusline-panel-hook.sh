@@ -43,11 +43,16 @@ fi
 [ -n "$key" ] || exit 0
 [ -d "$panel_dir" ] || exit 0
 
-# newest-wins spool handoff: an unconsumed spool overwritten here is a
-# deliberately skipped frame (the daemon always renders the freshest
-# payload it can get)
-printf '%s' "$input" > "$panel_dir/spool.$key.tmp.$$" 2>/dev/null &&
-  mv -f "$panel_dir/spool.$key.tmp.$$" "$panel_dir/spool.$key.new" 2>/dev/null
+# newest-wins spool handoff, ONE builtin direct write (round-3 fix): the
+# old tmp+mv pair spent a real fork+exec on mv (~50ms measured) inside
+# the very latency window this whole architecture exists to shrink, and
+# contradicted the "steady state spawns NOTHING" contract. Atomicity is
+# deliberately traded away: the spool is newest-wins and lossy by design
+# - a torn read (daemon mv'ing mid-write) just fails jq, the -s gate
+# keeps the previous good frame, and the next ~5s tick delivers a fresh
+# payload; three CONSECUTIVE tears would be needed to blank the cache
+# (bad_streak), which a transient race cannot produce.
+printf '%s' "$input" > "$panel_dir/spool.$key.new" 2>/dev/null
 
 # serve the latest rendered frame for this key - one tick behind live,
 # which for cumulative token counts/elapsed times is imperceptible
@@ -56,11 +61,27 @@ if [ -r "$panel_dir/cache.$key" ]; then
   [ "${#panel_cached[@]}" -gt 0 ] && printf '%s\n' "${panel_cached[@]}"
 fi
 
-# ensure the daemon is alive (builtin kill -0 liveness probe; fully
-# detached spawn so this hook never waits on it)
+# ensure the daemon is alive - kill -0 AND a fresh heartbeat (round-3
+# fix): the pid file's 2nd line is an epoch the daemon rewrites every
+# ~5s (and at most once per busy loop iteration). Bare kill -0 alone deadlocked when a stale pid got RECYCLED onto
+# some unrelated live process (cygwin pids recycle fast on this box):
+# the hook then believed the daemon alive forever, spools piled up, the
+# panel froze with no recovery path. A stale/missing heartbeat (>60s,
+# or old one-line format) now counts as dead; the spawned daemon's own
+# takeover logic applies the same freshness verdict, so it correctly
+# evicts the recycled-pid claim instead of deferring to it. The 60s
+# threshold leaves headroom for slow busy-render iterations. All
+# builtins; fully detached spawn so this hook never waits on it.
 daemon_pid=""
-[ -r "$panel_dir/daemon.pid" ] && read -r daemon_pid < "$panel_dir/daemon.pid" 2>/dev/null
-if ! { [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; }; then
+daemon_hb=""
+[ -r "$panel_dir/daemon.pid" ] && { read -r daemon_pid; read -r daemon_hb; } < "$panel_dir/daemon.pid" 2>/dev/null
+daemon_alive=0
+if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null && [[ "$daemon_hb" =~ ^[0-9]+$ ]]; then
+  printf -v hook_now '%(%s)T' -1
+  hb_age=$(( hook_now - daemon_hb ))
+  [ "$hb_age" -ge -60 ] && [ "$hb_age" -le 60 ] && daemon_alive=1
+fi
+if [ "$daemon_alive" -eq 0 ]; then
   ( bash "$panel_daemon" </dev/null >/dev/null 2>&1 & )
 fi
 exit 0
