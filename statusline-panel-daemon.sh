@@ -84,7 +84,15 @@ if [ -f "$err_log" ]; then
 fi
 exec 2>>"$err_log"
 
-# pid file format (round-3): TWO lines - "pid\nheartbeat_epoch". The
+# pid file format: FOUR lines - cygwin_pid / heartbeat_epoch /
+# windows_pid / in-flight render child pid (empty when idle). Lines 3
+# and 4 exist for the two reapers that cannot see this process tree:
+# the PowerShell watchdog needs a NATIVE pid (cygwin pids mean nothing
+# to it), and the hook needs the render child's pid because it CANNOT
+# derive it - this daemon is spawned as `( bash ... & )` from a script
+# with no job control, so it is not a process-group leader and killing
+# "its group" reaches nothing (round-13; the renderer, started under
+# `set -m` below, is a group leader and IS group-killable).
 # heartbeat (rewritten on a wall-clock 5s cadence by hb_beat below) is what
 # lets the hook and the takeover path tell a LIVE daemon from a stale
 # pid recycled onto some unrelated cygwin process - bare `kill -0` alone
@@ -94,7 +102,7 @@ exec 2>>"$err_log"
 # (missing/old-format heartbeat counts as stale -> smooth migration).
 if [ "$once" -eq 0 ]; then
   printf -v hb_now '%(%s)T' -1
-  if ! ( set -C; printf '%s\n%s\n%s\n' "$$" "$hb_now" "$daemon_winpid" > "$panel_dir/daemon.pid" ) 2>/dev/null; then
+  if ! ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_now" "$daemon_winpid" "" > "$panel_dir/daemon.pid" ) 2>/dev/null; then
     holder=""
     holder_hb=""
     [ -r "$panel_dir/daemon.pid" ] && { read -r holder; read -r holder_hb; } < "$panel_dir/daemon.pid"
@@ -111,7 +119,7 @@ if [ "$once" -eq 0 ]; then
     # the noclobber race, the loser exits and the next hook tick
     # re-probes the winner
     rm -f "$panel_dir/daemon.pid" 2>/dev/null
-    ( set -C; printf '%s\n%s\n%s\n' "$$" "$hb_now" "$daemon_winpid" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
+    ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_now" "$daemon_winpid" "" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
   fi
   # startup housekeeping: orphaned in-flight claims from a crashed
   # predecessor, caches nothing has touched for a day, and orphaned
@@ -136,6 +144,9 @@ daemon_max_life="${STATUSLINE_PANEL_DAEMON_MAX_LIFE:-3600}"
 shopt -s nullglob
 idle=0
 render_seq=0
+# pid of the render child while one is in flight, published on line 4
+# of the pid file by the next beat so an external reaper can reach it
+r_pid_pub=""
 last_hb=0
 [ "$once" -eq 0 ] && last_hb=$hb_now
 # WALL-CLOCK heartbeat (round-4 fix for a round-3 regression): the first
@@ -161,6 +172,28 @@ last_hb=0
 # someone ELSE registered and alive -> concede (exit) on the spot;
 # dead/missing claim -> take over via the exclusive-create discipline.
 # This also folds the old separate ownership self-check into the beat.
+# never exit while a render child is still running (round-13): the
+# concede / lost-the-takeover paths below can fire from INSIDE the
+# render wait loop, and a bare `exit` left that child orphaned - still
+# running, still holding its tmp name, with no parent to reap it. That
+# is the same leak the hook's REAP exists to stop, just minted from
+# the other side. The child IS a process-group leader (`set -m`), so
+# the group kill here is real, unlike the one on the daemon itself.
+quit_with_child() {
+  if [ -n "$r_pid_pub" ] && kill -0 "$r_pid_pub" 2>/dev/null; then
+    kill -- "-$r_pid_pub" 2>/dev/null
+    kill "$r_pid_pub" 2>/dev/null
+    # no grace period: we are conceding this instant and will not be here
+    # to reap, and a TERM-immune child (they exist - see the render
+    # deadline's escalation, and test R35) would otherwise walk away
+    kill -9 -- "-$r_pid_pub" 2>/dev/null
+    kill -9 "$r_pid_pub" 2>/dev/null
+    # the aborted render's tmp pair has no other sweeper on this path
+    # (cache.* is only age-swept after a day)
+    [ -n "${cache_tmp:-}" ] && rm -f "$cache_tmp" "${raw_tmp:-}" 2>/dev/null
+  fi
+  exit 0
+}
 hb_beat() {
   [ "$once" -eq 1 ] && return 0
   printf -v hb_t '%(%s)T' -1
@@ -180,12 +213,12 @@ hb_beat() {
   hb_cur=""
   [ -r "$panel_dir/daemon.pid" ] && read -r hb_cur < "$panel_dir/daemon.pid"
   if [ "$hb_cur" = "$$" ]; then
-    printf '%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
+    printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "$r_pid_pub" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
   elif [ -n "$hb_cur" ] && kill -0 "$hb_cur" 2>/dev/null; then
-    exit 0
+    quit_with_child
   else
     rm -f "$panel_dir/daemon.pid" 2>/dev/null
-    ( set -C; printf '%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
+    ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "$r_pid_pub" > "$panel_dir/daemon.pid" ) 2>/dev/null || quit_with_child
   fi
 }
 # per-key consecutive bad-frame counter (round-3 fix): the -s keep-frame
@@ -229,6 +262,10 @@ while :; do
     bash "$renderer" < "$panel_dir/render.$key" > "$raw_tmp" 2>>"$err_log" &
     r_pid=$!
     set +m 2>/dev/null
+    # publish for external reapers; the next beat (<=5s, and beats run
+    # on every wait tick) writes it to line 4 of the pid file, so any
+    # render long enough to wedge this daemon is always reachable
+    r_pid_pub=$r_pid
     r_waited=0
     while kill -0 "$r_pid" 2>/dev/null; do
       [ "$r_waited" -ge "$render_ticks" ] && break
@@ -309,6 +346,7 @@ while :; do
         bad_streak[$key]=0
       fi
     fi
+    r_pid_pub=""
     rm -f "$panel_dir/render.$key" 2>/dev/null
     worked=1
   done

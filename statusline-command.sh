@@ -702,7 +702,6 @@ if [ -f "$daily_file" ]; then
     # d_epoch, which reads as base 0 (exactly the old behaviour).
     d_base=${d_rest2#*$''}
     [ "$d_base" = "$d_epoch" ] && d_base=0
-    [ "$d_base" = "$d_epoch" ] && d_base=0
     # whole-row shape check, 6 exact columns (5 separators, none left in
     # the last field), every numeric field guarded - malformed/foreign
     # rows dropped whole, same discipline as the fine file's reader below
@@ -1028,13 +1027,20 @@ fi
 #
 # ROLLUP FILE (statusline-daily.tsv, override: $STATUSLINE_DAILY_FILE):
 # one row per (local day, session):
-#   day<0x1F>sid<0x1F>closed_cents<0x1F>peak_cents<0x1F>prev_cents<0x1F>last_epoch
+#   day<0x1F>sid<0x1F>closed_cents<0x1F>peak_cents<0x1F>prev_cents<0x1F>last_epoch<0x1F>base_cents
 # = the MONOTONIC-RUN state machine for that day+session, carried across
 # renders: a session's cost column is a running total that /clear resets
 # mid-session, so a plain max would undercount - a value LOWER than prev
 # closes the open run (its peak folds into closed_cents) and starts a new
-# run at the lower value; display total = closed + peak. Same algorithm
-# the old in-loop scan used, now incremental instead of recomputed.
+# run at the lower value; a day's CONTRIBUTION is closed + peak - base
+# (see the midnight-baseline note in fold_daily_row: the cost column is
+# per-SESSION cumulative and does not reset at midnight, so the day
+# records what it inherited as its base and owns only what was spent
+# during it). Every consumer uses that formula - the week sum, the
+# settled-day _agg fold and the row-cap overflow merge alike, and the
+# _agg rows they write carry base=0 because their value is already net.
+# Same algorithm the old in-loop scan used, now incremental instead of
+# recomputed. Legacy 6-column rows (pre-round-12) read as base 0.
 #
 # last_epoch is the WATERMARK that makes this replay-safe and concurrency-
 # self-healing: each render folds ONLY fine rows newer than the sid's
@@ -1052,9 +1058,13 @@ fi
 # including today (day granularity replaces the old rolling 604800s
 # window - an edge day is now wholly in or wholly out). A session's first
 # observation of a day seeds that day's run at the full cumulative value
-# (same straddle behavior as the old per-day scan). TODAY only shows when
-# its sum exceeds THIS session's own cost by >= 1 cent (avoids redundancy
-# with the cost segment right before it); WEEK has no such comparison.
+# AND records it as that day's base, so a session that straddles midnight
+# contributes to each day only what it actually spent during that day.
+# TODAY only shows when it exceeds THIS session's OWN today contribution
+# by >= 1 cent (avoids redundancy with the cost segment right before it -
+# and both sides must come from the rollup: comparing against the raw
+# .cost cumulative hid the segment all day for cross-midnight sessions);
+# WEEK has no such comparison.
 # Caveat (unchanged): only sessions that actually rendered within a scope
 # are counted - today and week are independent sums, not halves.
 
@@ -1070,6 +1080,21 @@ for dkey in "${!du_peak[@]}"; do
   [ "$d_day" = "$today_str" ] && today_total_cents=$(( today_total_cents + d_total ))
   [ "$d_day" -ge "$week_first_str" ] && week_total_cents=$(( week_total_cents + d_total ))
 done
+# THIS session's share of today, on the SAME footing as today_total
+# (round-13): the today segment is hidden when it would merely restate
+# the cost segment beside it, and that test used to subtract
+# .cost.total_cost_usd - a per-session CUMULATIVE that does not reset at
+# midnight. Once round-12 made today_total net of the midnight baseline
+# the two sides stopped being comparable, and any session that had spent
+# anything before midnight hid the today segment for the whole rest of
+# the day (measured: real today $3.00 rendered as no segment at all).
+# Both sides now come from the rollup, so the comparison is exact.
+today_self_cents=0
+if [ -n "$session_id" ]; then
+  self_dkey="${today_str}"$'\x1f'"${session_id}"
+  today_self_cents=$(( ${du_closed[$self_dkey]:-0} + ${du_peak[$self_dkey]:-0} - ${du_base[$self_dkey]:-0} ))
+  [ "$today_self_cents" -lt 0 ] && today_self_cents=0
+fi
 
 # Rollup rewrite - only on renders that actually folded something new.
 # Retention: 9 local days (7-day week window + margin); the row count is
@@ -1114,13 +1139,27 @@ if [ "$daily_persist_due" -eq 1 ]; then
     d_sid="${dkey#*$''}"
     [ "$d_day" -ge "$daily_keep_str" ] || continue
     if [ "$d_day" -lt "$daily_settled_str" ]; then
-      daily_agg[$d_day]=$(( ${daily_agg[$d_day]:-0} + ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} ))
+      # NET OF THE MIDNIGHT BASELINE (round-13): an _agg row carries a
+      # day's CONTRIBUTION, so it has to be folded with the very formula
+      # the display uses (closed+peak-base, see the week loop above).
+      # Summing the GROSS value here and writing a base-less _agg row
+      # resurrected the round-12 cross-midnight double count two days
+      # later, when the day settles - and permanently, because the fine
+      # rows behind it are 90 minutes gone and nothing can rebuild it
+      # (measured: week $2.42 -> $10.42 on the frame that folded).
+      d_contrib=$(( ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} - ${du_base[$dkey]:-0} ))
+      [ "$d_contrib" -lt 0 ] && d_contrib=0
+      daily_agg[$d_day]=$(( ${daily_agg[$d_day]:-0} + d_contrib ))
       continue
     fi
     daily_out_lines+=("${d_day}"$''"${d_sid}"$''"${du_closed[$dkey]:-0}"$''"${du_peak[$dkey]:-0}"$''"${du_prev[$dkey]:-0}"$''"${du_epoch[$dkey]:-0}"$''"${du_base[$dkey]:-0}")
   done
   for d_day in "${!daily_agg[@]}"; do
-    daily_out_lines+=("${d_day}"$''"_agg"$''"${daily_agg[$d_day]}"$''"0"$''"0"$''"0")
+    # 7 columns like every other row (round-13): the aggregate is
+    # already net, so its own base column is 0 - written EXPLICITLY
+    # rather than relying on the loader's legacy-6-column fallback,
+    # so the overflow merge below can parse every row positionally.
+    daily_out_lines+=("${d_day}${SEP1}_agg${SEP1}${daily_agg[$d_day]}${SEP1}0${SEP1}0${SEP1}0${SEP1}0")
   done
   # NO BLIND TAIL SLICE (round-10): the old cap kept the LAST 500 entries
   # of a bash associative-array walk, i.e. HASH order - it silently
@@ -1135,10 +1174,30 @@ if [ "$daily_persist_due" -eq 1 ]; then
     declare -A daily_agg2
     daily_keep_lines=()
     for dl in "${daily_out_lines[@]}"; do
+      # POSITIONAL, NOT "last field" (round-13): dl_ep used to be
+      # ${dl##*$SEP1}, which was the last_epoch only while rows had 6
+      # columns. Round-12 appended the base column, so the age test read
+      # a CENTS value (0 for almost every row) and "older than 3h" became
+      # unconditionally true: every row - including the live session's
+      # state row - collapsed into _agg, its watermark went to zero, and
+      # the fine rows still on disk re-folded FROM SCRATCH next frame,
+      # inflating today/week permanently (the forbidden direction, and
+      # exactly what the 3h threshold below exists to prevent).
       dl_day=${dl%%$SEP1*}
       dl_rest=${dl#*$SEP1}
       dl_sid=${dl_rest%%$SEP1*}
-      dl_ep=${dl##*$SEP1}
+      dl_r2=${dl_rest#*$SEP1}
+      dl_closed=${dl_r2%%$SEP1*}
+      dl_r3=${dl_r2#*$SEP1}
+      dl_peak=${dl_r3%%$SEP1*}
+      dl_r4=${dl_r3#*$SEP1}
+      dl_r5=${dl_r4#*$SEP1}
+      dl_ep=${dl_r5%%$SEP1*}
+      dl_r6=${dl_r5#*$SEP1}
+      dl_base=${dl_r6%%$SEP1*}
+      # a 6-column row (hand-edited/legacy file) leaves r6 == the epoch
+      [ "$dl_base" = "$dl_ep" ] && dl_base=0
+      [[ "$dl_base" =~ ^[0-9]{1,12}$ ]] || dl_base=0
       # _agg rows JOIN the bucket instead of being passed through
       # (round-11): passing them through while also appending a fresh
       # _agg for the same day wrote TWO rows with the same key, and the
@@ -1150,18 +1209,17 @@ if [ "$daily_persist_due" -eq 1 ]; then
       # merging a session that still has fine rows on disk zeroed its
       # watermark and let those rows re-fold FROM SCRATCH, inflating
       # today/week (the forbidden direction).
-      if { [ "$dl_sid" = "_agg" ] || [ "$dl_ep" -lt "$(( now_epoch - 10800 ))" ]; } && [[ "$dl_ep" =~ ^[0-9]+$ ]]; then
-        dl_r2=${dl_rest#*$SEP1}
-        dl_closed=${dl_r2%%$SEP1*}
-        dl_r3=${dl_r2#*$SEP1}
-        dl_peak=${dl_r3%%$SEP1*}
-        daily_agg2[$dl_day]=$(( ${daily_agg2[$dl_day]:-0} + ${dl_closed:-0} + ${dl_peak:-0} ))
+      if [[ "$dl_ep" =~ ^[0-9]+$ ]] && { [ "$dl_sid" = "_agg" ] || [ "$dl_ep" -lt "$(( now_epoch - 10800 ))" ]; }; then
+        # same net-of-base arithmetic as the settled fold above
+        dl_contrib=$(( ${dl_closed:-0} + ${dl_peak:-0} - dl_base ))
+        [ "$dl_contrib" -lt 0 ] && dl_contrib=0
+        daily_agg2[$dl_day]=$(( ${daily_agg2[$dl_day]:-0} + dl_contrib ))
       else
         daily_keep_lines+=("$dl")
       fi
     done
     for dl_day in "${!daily_agg2[@]}"; do
-      daily_keep_lines+=("${dl_day}${SEP1}_agg${SEP1}${daily_agg2[$dl_day]}${SEP1}0${SEP1}0${SEP1}0")
+      daily_keep_lines+=("${dl_day}${SEP1}_agg${SEP1}${daily_agg2[$dl_day]}${SEP1}0${SEP1}0${SEP1}0${SEP1}0")
     done
     daily_out_lines=("${daily_keep_lines[@]}")
   fi
@@ -1254,7 +1312,7 @@ if [ -n "$cost" ] && cost_to_cents "$cost"; then
 fi
 today_seg=""
 today_plain=""
-if [ "$today_total_cents" -gt 0 ] && [ "$(( today_total_cents - current_cost_cents ))" -ge 1 ]; then
+if [ "$today_total_cents" -gt 0 ] && [ "$(( today_total_cents - today_self_cents ))" -ge 1 ]; then
   printf -v today_fmt '%d.%02d' "$(( today_total_cents / 100 ))" "$(( today_total_cents % 100 ))"
   today_seg="${GRAY}today${RESET} ${WHITE}\$${today_fmt}${RESET}"
   today_plain="today \$${today_fmt}"

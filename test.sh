@@ -670,8 +670,146 @@ ELJSON
   elrows=$(bash ./subagent-statusline.sh < "$tmpd/eltier.json" | jq -r .content | sed 's/\[/CODE/g')
   el_ok=1
   printf '%s' "$elrows" | grep -q 'CODE91m40m' || el_ok=0
-  printf '%s' "$elrows" | grep -q 'CODE90m30s' || el_ok=0
+  # RANGE, not an exact second (round-13): the fixture is stamped with a
+  # live clock and the render (bash+jq) takes 0.15-0.45s, so ~40% of runs
+  # crossed into 31s and failed an assertion about COLOR, not arithmetic
+  printf '%s' "$elrows" | grep -qE 'CODE90m3[0-9]s' || el_ok=0
   [ "$el_ok" -eq 1 ] && ok "elapsed color follows duration tier" || bad "elapsed tiering wrong"
+  # ---- adversarial-review round-13 regression asserts (2026-08-15) ----
+  S13=''
+  # R48: a settled day folds into _agg NET of its midnight baseline. The
+  # base column only lived in per-session rows, so the day that carried
+  # it resurrected round-12's cross-midnight double count the moment it
+  # settled - two days late, and permanently (the fine rows are gone).
+  : > "$STATUSLINE_DAILY_FILE"
+  d3=$(date -d "-3 days" +%Y%m%d 2>/dev/null || date -v-3d +%Y%m%d)
+  printf '%s%sbs1%s0%s1000%s1000%s%s%s600
+' "$d3" "$S13" "$S13" "$S13" "$S13" "$S13" "$((now-259200))" "$S13" > "$STATUSLINE_DAILY_FILE"
+  printf '%s%sbsx%s1000%s0.50
+' "$((now-100))" "$S13" "$S13" "$S13" > "$STATUSLINE_HISTORY_FILE"
+  b1=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'week \$[0-9.]*' | head -1)
+  b_agg=$(grep '_agg' "$STATUSLINE_DAILY_FILE" | head -1 | cut -d"$S13" -f3)
+  b2=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'week \$[0-9.]*' | head -1)
+  b_d=$(awk -v a="${b1#week $}" -v b="${b2#week $}" 'BEGIN{d=b-a; if(d<0)d=-d; printf "%d", d}' 2>/dev/null)
+  [ "${b_agg:-0}" = "400" ] && ok "settled _agg row is net of the midnight baseline" || bad "settled _agg row kept the baseline (${b_agg:-none} != 400)"
+  [ -n "$b1" ] && [ "${b_d:-999}" -le 5 ] && ok "week survives the settle fold ($b1)" || bad "week jumped when the day settled ($b1 -> $b2)"
+  # R48b: _agg rows are written with all 7 columns (a 6-column _agg row
+  # made the overflow merge below read a cents value as an epoch)
+  [ "$(grep '_agg' "$STATUSLINE_DAILY_FILE" | head -1 | tr -cd "$S13" | wc -c)" -eq 6 ] && ok "_agg row carries all 7 columns" || bad "_agg row column count wrong"
+  # R49: the overflow merge must read last_epoch POSITIONALLY. Taking the
+  # LAST field got the base column instead, so "older than 3h" was true
+  # for every row and the live session's state row was merged away - its
+  # watermark zeroed, its fine rows re-folded from scratch, today/week
+  # inflating permanently.
+  : > "$STATUSLINE_DAILY_FILE"
+  {
+    for _i in $(seq 1 401); do printf '%s%sv%03d%s0%s100%s100%s%s%s50
+' "$(date +%Y%m%d)" "$S13" "$_i" "$S13" "$S13" "$S13" "$S13" "$((now-600))" "$S13"; done
+  } > "$STATUSLINE_DAILY_FILE"
+  printf '%s%sovx%s1000%s0.50
+' "$((now-100))" "$S13" "$S13" "$S13" > "$STATUSLINE_HISTORY_FILE"
+  o1=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'today \$[0-9.]*' | head -1)
+  o_rows=$(grep -c . "$STATUSLINE_DAILY_FILE")
+  o_agg=$(grep -c '_agg' "$STATUSLINE_DAILY_FILE")
+  o2=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'today \$[0-9.]*' | head -1)
+  o_d=$(awk -v a="${o1#today $}" -v b="${o2#today $}" 'BEGIN{d=b-a; if(d<0)d=-d; printf "%d", d}' 2>/dev/null)
+  [ "$o_agg" -eq 0 ] && [ "$o_rows" -ge 400 ] && ok "overflow merge spares rows inside the 3h window ($o_rows rows)" || bad "overflow merge collapsed live rows ($o_rows rows, $o_agg agg)"
+  [ -n "$o1" ] && [ "${o_d:-999}" -le 5 ] && ok "overflow merge keeps today stable ($o1)" || bad "overflow merge inflated today ($o1 -> $o2)"
+  # R50: the today segment is hidden only when it would RESTATE the cost
+  # segment. That test compared today (net of the baseline since round-12)
+  # against the session's raw cumulative, so any session with spend before
+  # midnight lost the segment for the whole rest of the day.
+  : > "$STATUSLINE_DAILY_FILE"
+  ymd1=$(date -d "-1 days" +%Y%m%d 2>/dev/null || date -v-1d +%Y%m%d)
+  {
+    printf '%s%sabc%s0%s3000%s3000%s%s%s0
+' "$ymd1" "$S13" "$S13" "$S13" "$S13" "$S13" "$((now-86400))" "$S13"
+    printf '%s%sS2%s0%s100%s100%s%s%s0
+' "$(date +%Y%m%d)" "$S13" "$S13" "$S13" "$S13" "$S13" "$((now-400))" "$S13"
+  } > "$STATUSLINE_DAILY_FILE"
+  printf '%s%sabc%s5000%s32.00
+' "$((now-40))" "$S13" "$S13" "$S13" > "$STATUSLINE_HISTORY_FILE"
+  mn_out=$(jq '.cost.total_cost_usd=32.00' fixtures/full.json | bash ./statusline-command.sh | strip)
+  printf '%s' "$mn_out" | grep -q 'today \$3\.' && ok "cross-midnight session still shows today" || bad "today segment vanished for a cross-midnight session"
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R51: a wedged daemon's IN-FLIGHT RENDER CHILD must be reaped. Round-12
+  # aimed a process-group kill at the daemon, but the daemon is spawned as
+  # `( bash ... & )` with no job control - it is not a group leader, the
+  # signal hit nothing (ESRCH), and the child was orphaned exactly as
+  # before. It is reachable only because the daemon now publishes it on
+  # line 4 of the pid file.
+  rc_dir="$tmpd/reap13"
+  mkdir -p "$rc_dir/bin"
+  printf '#!/bin/bash
+sleep 300
+' > "$rc_dir/bin/subagent-statusline.sh"
+  ( STATUSLINE_PANEL_DIR="$rc_dir" STATUSLINE_PANEL_RENDERER="$rc_dir/bin/subagent-statusline.sh" STATUSLINE_PANEL_RENDER_TIMEOUT=600 bash ./statusline-panel-daemon.sh </dev/null >/dev/null 2>&1 & )
+  sleep 1
+  printf '{"columns":120,"tasks":[{"id":"rk1","status":"running","tokenCount":5}]}' > "$rc_dir/spool.rk1.new"
+  rc_child=""
+  for _i in $(seq 1 30); do
+    sleep 0.5
+    rc_child=$(sed -n '4p' "$rc_dir/daemon.pid" 2>/dev/null)
+    [ -n "$rc_child" ] && break
+  done
+  rc_daemon=$(sed -n '1p' "$rc_dir/daemon.pid" 2>/dev/null)
+  if [ -n "$rc_child" ] && kill -0 "$rc_child" 2>/dev/null; then
+    ok "daemon publishes its in-flight render child (pid $rc_child)"
+  else
+    bad "daemon did not publish its render child on line 4"
+  fi
+  kill -STOP "$rc_daemon" 2>/dev/null
+  printf '%s
+%s
+%s
+%s
+' "$rc_daemon" "$((now-600))" "0" "$rc_child" > "$rc_dir/daemon.pid"
+  printf '{"columns":120,"tasks":[{"id":"rk1","status":"running","tokenCount":5}]}' | STATUSLINE_PANEL_DIR="$rc_dir" STATUSLINE_PANEL_DAEMON=/dev/null bash ./statusline-panel-hook.sh >/dev/null 2>&1
+  sleep 1
+  kill -CONT "$rc_daemon" 2>/dev/null
+  sleep 0.3
+  if [ -n "$rc_child" ] && kill -0 "$rc_child" 2>/dev/null; then
+    bad "hook orphaned the wedged daemon's render child"
+  else
+    ok "hook reaps the wedged daemon's render child"
+  fi
+  kill -9 "$rc_child" 2>/dev/null
+  kill -9 "$rc_daemon" 2>/dev/null
+  rm -rf "$rc_dir" 2>/dev/null
+  # R52: the daemon kill itself must stay a PID kill - a group kill on a
+  # recycled pid would take an unrelated live group down (the 2026-08-13/14
+  # mis-kill shape), and it never reached the child anyway
+  grep -vE '^[[:space:]]*#' ./statusline-panel-hook.sh | grep -qF 'kill -- "-$daemon_pid"' && bad "hook still group-kills a non-leader daemon" || ok "hook kills the daemon by pid, the child by group"
+  grep -q 'old_rp' ./install.sh && ok "installer reaps the in-flight render child too" || bad "installer leaves the render child orphaned"
+  # ---- round-13 LIVE-INCIDENT asserts (2026-08-15, dev machine) ----
+  # R53: identity confirmation must never FORK. The reap path exists for
+  # exactly one scenario - fork exhaustion - and it confirmed identity
+  # with `$(tr ... < /proc/<pid>/cmdline)`, a command substitution: under
+  # fork pressure the capture came back empty, the pattern never matched,
+  # nothing was killed, and the hook spawned a replacement anyway. That
+  # is the 78-orphan amplifier restored by its own fix; 38 orphan daemons
+  # burning 3.03 CPU-hours were measured before it was found.
+  if grep -n 'cmdline' ./statusline-panel-hook.sh ./install.sh | grep -vE '^[^:]+:[0-9]+: *#' | grep -q '\$('; then
+    bad "identity confirmation still forks (command substitution on cmdline)"
+  else
+    ok "identity confirmation reads cmdline with zero forks"
+  fi
+  # and it must exclude a -c shell by the ARGUMENT, not by where the
+  # filename lands: the old space-joined capture made
+  # `bash -c '... # statusline-panel-daemon.sh'` match the tail pattern
+  grep -q '"$_ai_arg" = "-c"' ./statusline-panel-hook.sh && ok "identity read excludes -c mention shells" || bad "identity read can match a -c mention shell"
+  # R54: unregistered wedged daemons have NO other reaper - the hook only
+  # knows the registered pid, install only reclaims that one, and the
+  # absolute lifetime cap needs the loop to still be cycling
+  if grep -q 'orphanCutoff' ./statusline-watchdog.ps1 && grep -q 'ProcessId -ne $regWpid' ./statusline-watchdog.ps1; then
+    ok "watchdog backstops unregistered orphan daemons"
+  else
+    bad "watchdog has no orphan-daemon backstop"
+  fi
+  # R55: PowerShell 5.1 decodes a BOM-less .ps1 with the system ANSI code
+  # page - the same trap that broke the .vbs under GBK
+  [ "$(head -c 3 ./statusline-watchdog.ps1 | od -An -tx1 | tr -d ' \n')" = "efbbbf" ] && ok "watchdog ps1 carries a UTF-8 BOM" || bad "watchdog ps1 has no BOM (PS 5.1 decodes it as ANSI)"
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   : > "$STATUSLINE_DAILY_FILE"

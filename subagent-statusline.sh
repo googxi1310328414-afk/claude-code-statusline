@@ -87,10 +87,11 @@ export LC_ALL=C.UTF-8
 # is configured for East-Asian ambiguous-wide instead.
 #
 #   1  identity segment: "▸ " (gray) + identity text (STATE-COLORED:
-#      running bright magenta / pending yellow / completed green /
-#      failed bright red / unknown bright blue - the name is the widest
-#      and left-most thing on the row, so it carries the state itself
-#      instead of being uniformly magenta; first non-empty of
+#      pending yellow / completed green / failed bright red, and
+#      anything still in flight gets a PER-AGENT hue hashed from its
+#      task id (see RUN_HUES) - the name is the widest and left-most
+#      thing on the row, so it carries the state itself instead of
+#      being uniformly magenta; first non-empty of
 #      name/label/type; identity absent -> the WHOLE segment is empty
 #      for this row, i.e. a padded blank column here unless it's also
 #      this row's trailing-absent point) + "(type)" in gray when
@@ -497,12 +498,19 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # the cell. The name is the widest, left-most, most-read thing on the
   # row, so it now carries the state itself - one glance across the
   # left edge tells you what every agent is doing:
-  #   running/in_progress  bright magenta (the panel's signature color,
-  #                        kept for the common in-flight case)
   #   pending/queued/etc   yellow      (waiting, nothing burning yet)
   #   completed/done       green       (finished cleanly)
   #   failed/cancelled     bright red  (needs attention)
-  #   unknown/absent       bright blue (state not reported)
+  #   everything else      PER-AGENT hue from RUN_HUES, picked by a
+  #                        stable hash of the task id (running,
+  #                        in_progress, unknown, absent). A fixed color
+  #                        here was the same as no color at all:
+  #                        running is where agents spend nearly all
+  #                        their time, so the panel read as one solid
+  #                        magenta block. Hashing the id keeps an
+  #                        agent the same color for its whole life,
+  #                        across frames and sessions, while making
+  #                        concurrent agents distinguishable.
   # The glyph keeps its own color scale, so shape AND color agree; the
   # arrow, type, effort, model, spend, trend, share and elapsed columns
   # each keep their own distinct hue, so no two adjacent fields read as

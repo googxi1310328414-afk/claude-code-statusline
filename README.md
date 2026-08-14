@@ -38,7 +38,7 @@ $0.42 $4.8/h                        | today $55.97      | week $89.20           
 ## 工程规格（为什么它又快又稳）
 
 - **每次渲染进程数 ≈ 2**（jq×1 + git×1；可选 tail/date×1）：所有辅助函数走 REPLY 无 fork 调用、`printf -v` 替代一切 `$(date)`、纯 bash 解析历史文件——从最初 35+ 进程/3 秒优化到 **<1 秒**，支撑秒级 `refreshInterval` 常驻刷新（取消规则要求渲染远快于间隔——见"自动刷新机制"）
-- **状态文件双层**：细粒度 `statusline-history.tsv`（0x1F，TAB 旧格式自动兼容，**90 分钟**窗）只养走势/速率/$每小时；today/week 走 `statusline-daily.tsv` 日聚合（单调段状态机 + 水位线增量：重放不双计、并发丢写自愈、首跑自动播种）——每帧不再重走几万行历史；写入**追加优先**（最老行超窗 30 分钟/行帽/脏行才全量重写，稳态磁盘 churn −95%）；`/clear` 重置按单调段分别计峰，不少算
+- **状态文件双层**：细粒度 `statusline-history.tsv`（0x1F，TAB 旧格式自动兼容，**90 分钟**窗）只养走势/速率/$每小时；today/week 走 `statusline-daily.tsv` 日聚合（单调段状态机 + 水位线增量：重放不双计、并发丢写自愈、首跑自动播种；**跨午夜按日初基线扣减**——会话累计不在午夜清零，不减基线会让 week 把午夜前的钱记两遍）——每帧不再重走几万行历史；写入**追加优先**（最老行超窗 30 分钟/行帽/脏行才全量重写，稳态磁盘 churn −95%）；`/clear` 重置按单调段分别计峰，不少算
 - **防御体系**：全部字段 `// empty`+数值正则守卫、历史行整行形状校验、Windows jq 的 CRLF 剥离、`LC_ALL=C.UTF-8` 字符计宽、NBSP 对齐垫充（防 VSCode 终端吞空格）、行首 `\e[0m` 防宿主样式渗染、非零退出=白屏的红线
 - **外部数据全部缓存+后台脱离刷新**：PR CI 状态（gh，60s，**按 repo+PR 分键**的缓存文件——多会话停在不同 PR 不再互相驱逐；gh 无结果也写**负缓存**，未登录/断网时按 TTL 重试而非每帧重派生）、周配额/溢出（OAuth `/api/oauth/usage`，180s+429 退避——**非官方端点**，随时可能失效，失效即整段静默消失）
 
@@ -63,7 +63,7 @@ curl -fsSL https://raw.githubusercontent.com/googxi1310328414-afk/claude-code-st
 ```bash
 bash test.sh            # 渲染演示（终端看真色彩）
 bash test.sh --codes    # ANSI 码可视化
-bash test.sh --assert   # 104 项断言（CI 用，含性能门槛与十一轮对抗审查回归组+配色断言）
+bash test.sh --assert   # 119 项断言（CI 用，含性能门槛与十三轮对抗审查回归组+配色断言）
 ```
 
 GitHub Actions 在每次 push 自动跑断言套件。
@@ -78,7 +78,7 @@ GitHub Actions 在每次 push 自动跑断言套件。
 4. **配置热重载**：宿主对 settings.json 做**内容**监听——改任意值保存，渲染循环 1 秒内重建（仅 touch mtime **无效**）。渲染循环因挂死彻底卡住时，这也是唯一免重启的复活手段。
 5. **忙碌回合**：主栏**画面**冻结在回合开始帧，但**调用照常**（状态文件持续新鲜，回合结束瞬间回正）；子代理面板不受此限、全程实时。
 6. **采样与刷新的配比**：主栏 10s 刷新 × 30s 采样节流 = 每三帧记一次历史（走势每格≈30s，整图窗口 ~4.5 分钟）；面板宿主 ~5s 节拍 × 10s 采样 = 每两帧一样（每格≈10s）。刷新间隔管"画面多新"，采样节流管"走势每格多长"——两个旋钮独立调。
-7. **自愈层（可选，Windows）**：`statusline-watchdog.ps1` 由计划任务每 2 分钟清理挂死 >90s 的渲染 bash（阈值从 30s 提高：后台脱离的 usage/CI 刷新子壳继承同一命令行，curl -m 5 / gh 可能合法跑过 30s）（fork 枯竭下的兜底）；**必须经 `statusline-watchdog.vbs`（wscript）拉起**——计划任务直接跑 powershell 会在 `-WindowStyle Hidden` 生效前闪一下控制台窗口。两文件复制到 `~/.claude/`（vbs 经 `%USERPROFILE%` 运行时解析路径，任意用户开箱即用、无需改内容；**vbs 必须保持纯 ASCII**——wscript 按系统 ANSI 码页解析，UTF-8 中文注释会在 GBK 下吞换行、把真代码吞进注释，实锤过每 2 分钟弹错误框，test.sh 有断言防复发）后：`schtasks /Create /SC MINUTE /MO 2 /TN claude-statusline-watchdog /TR "wscript.exe C:\Users\<你>\.claude\statusline-watchdog.vbs"`。
+7. **自愈层（可选，Windows）**：`statusline-watchdog.ps1` 由计划任务每 2 分钟清理挂死 >90s 的渲染 bash，并兜底回收「不在注册中且活过 2 小时」的面板 daemon（未注册的卡死实例是其余回收路径够不着的唯一盲区）（阈值从 30s 提高：后台脱离的 usage/CI 刷新子壳继承同一命令行，curl -m 5 / gh 可能合法跑过 30s）（fork 枯竭下的兜底）；**必须经 `statusline-watchdog.vbs`（wscript）拉起**——计划任务直接跑 powershell 会在 `-WindowStyle Hidden` 生效前闪一下控制台窗口。两文件复制到 `~/.claude/`（vbs 经 `%USERPROFILE%` 运行时解析路径，任意用户开箱即用、无需改内容；**ps1 必须带 UTF-8 BOM、vbs 必须保持纯 ASCII**——wscript 按系统 ANSI 码页解析，UTF-8 中文注释会在 GBK 下吞换行、把真代码吞进注释，实锤过每 2 分钟弹错误框，test.sh 有断言防复发）后：`schtasks /Create /SC MINUTE /MO 2 /TN claude-statusline-watchdog /TR "wscript.exe C:\Users\<你>\.claude\statusline-watchdog.vbs"`。
 8. **面板常驻 daemon**：subagentStatusLine 命令指向 `statusline-panel-hook.sh`——钩子只做"倒载荷 + 秒回上一帧缓存"（纯内建，稳态零派生，延迟≈bash 启动的毫秒级），真正的渲染由 `statusline-panel-daemon.sh` 异步完成（内容滞后一拍 ~5s，对累计 token/用时无感知）。宿主重画面板是"先默认行、钩子返回才替换"，钩子延迟=默认行闪烁窗口——daemon 化把它从整段渲染耗时（~300ms）压到毫秒级。缓存键=载荷首任务 id（并发会话任务集不相交，天然各用各的缓存）；面板缓存首行为渲染纪元、钩子拒供 >60s 陈旧帧（daemon 起不来时诚实降级为默认行而非永久回放冻结帧）；daemon 单实例（noclobber 抢占；pid 文件**三行**协议 pid+心跳+Windows pid（第 3 行取自 /proc/self/winpid，供 PowerShell 看门狗精确识别），daemon 墙钟 5s 原子刷新心跳、钩子/接管/install 三处判活统一"kill -0 + 心跳 60s 内"——残留 pid 被系统回收给无关进程时不再死锁或误杀；陈旧 pid 接管走"删除+独占重建"而非裸覆写，退出删除先验证 pid 归属——并发接管不再互踩）、无活 2 分钟自灭、死了由下一拍钩子拉起；**挂死的渲染子进程由 daemon 自身硬超时截杀跳帧**（默认 15s，`STATUSLINE_PANEL_RENDER_TIMEOUT` 可调，约为正常渲染的 50 倍——此前无超时，子进程一挂 daemon 即永久卡死、探活却始终"存活"，全部会话面板冻结在旧帧且默认安装无任何恢复路径；第 7 条看门狗现按**心跳陈旧**判据纳入 daemon 回收，钩子发现「pid 活着但心跳冻结」会先杀后拉，daemon 另有绝对寿命闸 1 小时（`STATUSLINE_PANEL_DAEMON_MAX_LIFE`）——2026-08-14 实测过一次事故：一个卡死实例使钩子每 ~65 秒拉起一个新 daemon，累计 **78 个孤儿常驻烧掉 22 CPU 小时**，当时无任何组件负责回收；另注意 **cygwin 的 `ps` 看不到全部实例**，回收必须走 Windows 进程表）——全链路自愈，无需手工管理。状态目录 `~/.claude/statusline-panel.d/`。
 
 ## 已知边界

@@ -1,4 +1,4 @@
-# statusline-watchdog.ps1 — 清理挂死的状态栏 bash（cygwin fork 竞争偶发挂起的自愈层）
+﻿# statusline-watchdog.ps1 — 清理挂死的状态栏 bash（cygwin fork 竞争偶发挂起的自愈层）
 # 计划任务每 2 分钟经 statusline-watchdog.vbs（wscript，GUI 子系统）零窗口拉起——
 # 直接由计划任务跑 powershell 会在 -WindowStyle Hidden 生效前闪一下控制台窗口。
 #
@@ -38,9 +38,11 @@ Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
 
 # ---- 面板 daemon：仅在「注册者心跳陈旧」时，按记录的 Windows pid 精确回收 ----
 $pidFile = Join-Path $env:USERPROFILE '.claude\statusline-panel.d\daemon.pid'
+$regWpid = -1
 if (Test-Path $pidFile) {
   $lines = @(Get-Content $pidFile -ErrorAction SilentlyContinue)
   if ($lines.Count -ge 3 -and $lines[1] -match '^\d+$' -and $lines[2] -match '^\d+$') {
+    $regWpid = [int]$lines[2]
     $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$lines[1]
     if ($age -gt 180) {
       $wpid = [int]$lines[2]
@@ -55,3 +57,26 @@ if (Test-Path $pidFile) {
     }
   }
 }
+
+# ---- 未注册的孤儿 daemon：唯一没有回收人的那一类 ----
+# 2026-08-15 第 13 轮现场实锤：本机同时跑着 **38 个** 面板 daemon，累计烧掉
+# **3.03 CPU 小时**（每个都在空转节拍上转，合计吃掉 8 核里的 4.5 核）。放大器
+# 是钩子那条「先回收再拉起」的身份确认用了 `$(tr ... < cmdline)`——命令替换要
+# fork，而它恰恰只在 fork 枯竭时才被走到：捕获为空、模式不匹配、于是什么都不
+# 杀却照样拉新，每 ~65 秒净增一个永不退出的实例（与 2026-08-14 的 78 孤儿事故
+# 同型，由它自己的修复重新引入）。钩子侧已改为纯内建读 cmdline，这里是**兜底**：
+# 一个既不在注册中、又活过绝对寿命闸两倍的 daemon，必然是卡在了它自己的检查点
+# 之外（寿命闸要求循环还在转），四条回收路径没有一条够得着它。
+# 判据仍是 argv 位置匹配 + 排除 `-c` 外壳（round-10 起在渲染脚本那条分支上验证
+# 过的同一套纪律），绝不用「命令行提及脚本名」那种会误杀诊断/测试外壳的模糊匹配。
+# 2 小时 = 默认寿命闸 1h 的两倍留足余量；若把 STATUSLINE_PANEL_DAEMON_MAX_LIFE
+# 调到 2h 以上，这里的阈值必须一起改大，否则会误杀健康的长寿实例。
+$orphanCutoff = (Get-Date).AddSeconds(-7200)
+Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
+  Where-Object {
+    $_.CommandLine -notmatch '\s-c\s' -and
+    $_.CommandLine -match 'statusline-panel-daemon\.sh"?\s*$' -and
+    $_.ProcessId -ne $regWpid -and
+    $_.CreationDate -lt $orphanCutoff
+  } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

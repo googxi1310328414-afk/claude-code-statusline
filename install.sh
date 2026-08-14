@@ -82,9 +82,9 @@ if [ "$daemon_updated" -eq 1 ]; then
   # 不到全部实例）。未注册的孤儿由看门狗按心跳陈旧回收，或随其 1 小时
   # 寿命闸自然退出——两条路都不需要模糊匹配。
   recycled=0
-  old_dp=""; old_hb=""; old_wp=""
+  old_dp=""; old_hb=""; old_wp=""; old_rp=""
   if [ -r "$daemon_pid_file" ]; then
-    { read -r old_dp; read -r old_hb; read -r old_wp; } < "$daemon_pid_file" 2>/dev/null
+    { read -r old_dp; read -r old_hb; read -r old_wp; read -r old_rp; } < "$daemon_pid_file" 2>/dev/null
   fi
   # 身份确认后才发信号（round-11）：只凭「数字 pid + kill -0」就杀，等于
   # 相信一个可能早已被系统回收给别人的 pid——daemon 没有 trap，任何强杀
@@ -93,18 +93,50 @@ if [ "$daemon_updated" -eq 1 ]; then
   # 就可能对用户自己的交互 Git Bash、宿主 bash、甚至正在跑 install 的
   # 这棵进程树连发 TERM+KILL（与 2026-08-13/14 两次误杀事故同型）。
   # 判据与钩子完全一致：cmdline 尾部必须就是 daemon 脚本；读不到就不杀。
+  # 身份读取零派生（round-13 现场事故）：原先用 `$(tr ... < cmdline)`，
+  # 而命令替换要 fork——恰恰在 fork 枯竭这条路径上失败，捕获为空、模式不
+  # 匹配、于是**什么都不杀却照样拉新**，等于把 78 孤儿事故的放大器原样装
+  # 回来。cmdline 是 NUL 分隔的，`read -d ''` 纯内建即可读，且判据收窄为
+  # 「最后一个 argv 元素」并排除任何带裸 `-c` 的外壳。
+  old_cmd=""
   old_ok=0
-  if [[ "$old_dp" =~ ^[0-9]+$ ]] && kill -0 "$old_dp" 2>/dev/null; then
-    old_cmd=""
-    [ -r "/proc/$old_dp/cmdline" ] && old_cmd=$(tr '\0' ' ' < "/proc/$old_dp/cmdline" 2>/dev/null)
+  if [[ "$old_dp" =~ ^[0-9]+$ ]] && kill -0 "$old_dp" 2>/dev/null && [ -r "/proc/$old_dp/cmdline" ]; then
+    old_arg=""; old_isc=0
+    while IFS= read -r -d '' old_arg; do
+      [ "$old_arg" = "-c" ] && old_isc=1
+      old_cmd=$old_arg
+      old_arg=""
+    done < "/proc/$old_dp/cmdline" 2>/dev/null
+    [ -n "$old_arg" ] && old_cmd=$old_arg
+    [ "$old_isc" -eq 1 ] && old_cmd=""
     case "$old_cmd" in
-      *statusline-panel-daemon.sh|*"statusline-panel-daemon.sh ") old_ok=1 ;;
+      *statusline-panel-daemon.sh) old_ok=1 ;;
     esac
   fi
   if [ "$old_ok" -eq 1 ]; then
     kill "$old_dp" 2>/dev/null && recycled=1
     sleep 1
     kill -9 "$old_dp" 2>/dev/null
+  fi
+  # 第 4 行是它在途的渲染子进程（round-13）：daemon 被杀后它会变成孤儿
+  # 继续跑并占着 tmp 名，而它的 pid 从外部无从推导——daemon 自己不是进程
+  # 组长（`( bash ... & )` 无作业控制派生），杀「它的组」什么也够不着。
+  # 渲染子进程则是在 `set -m` 下起的、自成一组，可以连它的 jq 一起收掉。
+  if [[ "$old_rp" =~ ^[0-9]+$ ]] && kill -0 "$old_rp" 2>/dev/null; then
+    old_rcmd=""; old_rarg=""; old_risc=0
+    while IFS= read -r -d '' old_rarg; do
+      [ "$old_rarg" = "-c" ] && old_risc=1
+      old_rcmd=$old_rarg
+      old_rarg=""
+    done < "/proc/$old_rp/cmdline" 2>/dev/null
+    [ -n "$old_rarg" ] && old_rcmd=$old_rarg
+    [ "$old_risc" -eq 1 ] && old_rcmd=""
+    case "$old_rcmd" in
+      *subagent-statusline.sh)
+        kill -- "-$old_rp" 2>/dev/null
+        kill "$old_rp" 2>/dev/null
+        kill -9 -- "-$old_rp" 2>/dev/null ;;
+    esac
   fi
   if [[ "$old_wp" =~ ^[0-9]+$ ]] && command -v powershell.exe >/dev/null 2>&1; then
     powershell.exe -NoProfile -NonInteractive -Command "\$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$old_wp\" -ErrorAction SilentlyContinue; if (\$p -and \$p.Name -eq 'bash.exe' -and \$p.CommandLine -match 'statusline-panel-daemon') { Stop-Process -Id $old_wp -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1

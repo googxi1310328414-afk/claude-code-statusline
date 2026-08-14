@@ -24,7 +24,7 @@ The subagent panel row (via `subagentStatusLine`) renders every agent as an alig
 ▸ 0.2.79 收尾与发布(local_agent) ● | fable-5 | 295k tok | ▆▄▁ 14.9k/m | Σ78% | 19m44s@08:11:18 | description…
 ```
 
-with a STATE-COLORED identity (running bright magenta / pending yellow / completed green / failed bright red / unknown bright blue - the name itself carries the state, so one glance down the left edge reads the whole fleet; the main line stays bright cyan), a standalone always-on short-model column, status glyphs (● ○ ✓ ✗), cumulative token spend (deliberately **not** a fake "context battery" — `tokenCount` is cumulative), sparkline + rate, Σ fleet-share, seconds-precision elapsed time, and a width-budgeted description. Columns align using true display-width measurement (CJK = 2 cells).
+with a STATE-COLORED identity (pending yellow / completed green / failed bright red; everything still in flight gets a PER-AGENT hue picked by a stable hash of its task id, rotating through bright cyan / bright blue / bright magenta / cyan / blue / bright white - running is the state agents spend nearly all their time in, so a fixed color for it made the whole panel read as one solid block, while a per-agent hue keeps concurrent agents apart at a glance and stays the same color for that agent forever, across frames and sessions; the name itself carries the state, so one glance down the left edge reads the whole fleet; the main line stays bright cyan), a standalone always-on short-model column, status glyphs (● ○ ✓ ✗), cumulative token spend (deliberately **not** a fake "context battery" — `tokenCount` is cumulative), sparkline + rate, Σ fleet-share, seconds-precision elapsed time, and a width-budgeted description. Columns align using true display-width measurement (CJK = 2 cells).
 
 ## Install
 
@@ -50,7 +50,7 @@ It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES s
 ```bash
 bash test.sh          # render all fixtures (see real colors in your terminal)
 bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
-bash test.sh --assert # 104 assertions (CI mode; perf gates + eleven adversarial-review regression groups + color asserts)
+bash test.sh --assert # 119 assertions (CI mode; perf gates + thirteen adversarial-review regression groups + color asserts)
 ```
 
 ## Notable engineering notes
@@ -58,7 +58,7 @@ bash test.sh --assert # 104 assertions (CI mode; perf gates + eleven adversarial
 - Auto-refresh = event-driven repaints (~300 ms debounce) + a `refreshInterval` timer (main 10s here; the subagent panel runs on the host's own fixed ~5s tick — a refreshInterval under subagentStatusLine is ignored, measured on 2.1.229) that re-runs the whole script with fresh stdin JSON even when idle. A new trigger CANCELS the in-flight render, so the interval must comfortably exceed worst-case render time (0.4–1.3 s measured) — undershooting it blanks the bar entirely. settings.json changes hot-reload by CONTENT (touching mtime does nothing), which is also the no-restart recovery path if the render loop ever wedges.
 - Windows `jq` emits CRLF: every line-wise read must pass through `tr -d '\r'` (MSYS bash strips trailing CRs in `$(...)` substitutions, `mapfile` does not).
 - Scripts export `LC_ALL=C.UTF-8` — column alignment depends on character-based (not byte-based) string measurement, plus a `disp_width()` that counts East-Asian wide characters as 2 terminal cells.
-- Two-tier spend store: fine-grained history is kept for only 90 minutes (it only feeds sparkline/rate/$-per-hour); today/week read a tiny per-day rollup file maintained incrementally with a watermark (replay-safe, self-healing under concurrent sessions) — renders never re-walk days of rows.
+- Two-tier spend store: fine-grained history is kept for only 90 minutes (it only feeds sparkline/rate/$-per-hour); today/week read a tiny per-day rollup file maintained incrementally with a watermark (replay-safe, self-healing under concurrent sessions, and net of each day's midnight baseline - the per-session cost counter does not reset at midnight, so a day owns only what was spent during it) — renders never re-walk days of rows.
 - The panel daemon kills a hung render child at a hard deadline (default 15 s, `STATUSLINE_PANEL_RENDER_TIMEOUT`) and skips the frame — a wedged child can no longer freeze every session's panel behind an "alive" pid probe.
 - The transcript tail window (512 KiB) is pre-filtered by one `tail | awk` pipe: bash splits only the few matched lines, so the frame cost follows match count, not window bytes (`mapfile <<<` measures ~3.5 µs/byte on MSYS — splitting IS O(bytes)).
 - The PR CI badge cache is one file PER (repo, PR) with negative caching — concurrent sessions on different PRs stopped evicting each other every frame.

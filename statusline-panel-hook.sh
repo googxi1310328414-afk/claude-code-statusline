@@ -118,9 +118,43 @@ fi
 # evicts the recycled-pid claim instead of deferring to it. The 60s
 # threshold leaves headroom for slow busy-render iterations. All
 # builtins; fully detached spawn so this hook never waits on it.
+# ZERO-FORK IDENTITY READ (round-13, live incident: 38 orphaned daemons
+# burning 3.03 CPU-hours were found on the dev machine WITH the round-9
+# reap already in place). The reap confirmed identity with
+# `$(tr \0 ' ' < /proc/<pid>/cmdline)` - a COMMAND SUBSTITUTION, i.e. a
+# fork, on the one code path whose entire reason for existing is fork
+# exhaustion. When the fork fails the capture is empty, the pattern never
+# matches, nothing is killed - and the hook spawns a replacement anyway.
+# That is precisely the "only spawn, never reap" amplifier from the 78-
+# orphan incident, restored by its own fix: one wedged daemon per ~65s,
+# forever, each one spinning on the idle tick. /proc/<pid>/cmdline is
+# NUL-separated, so bash reads it with `read -d ''` and no process at all.
+# argv-POSITION discipline (same as the watchdog): the verdict is the LAST
+# argv element, and any process with a bare `-c` element is excluded
+# outright - a shell that merely TALKS about the script (a diagnostic, a
+# test, an agent's own bash) carries the whole command as one -c argument
+# and must never enter a kill set.
+argv_identity() { # $1=pid -> REPLY_CMD ("" = unknown/not confirmable)
+  REPLY_CMD=""
+  [ -r "/proc/$1/cmdline" ] || return 0
+  _ai_arg=""
+  _ai_isc=0
+  while IFS= read -r -d '' _ai_arg; do
+    [ "$_ai_arg" = "-c" ] && _ai_isc=1
+    REPLY_CMD=$_ai_arg
+    _ai_arg=""
+  done < "/proc/$1/cmdline" 2>/dev/null
+  # a cmdline whose tail lacks the trailing NUL leaves the last element
+  # in the loop variable instead of REPLY_CMD
+  [ -n "$_ai_arg" ] && REPLY_CMD=$_ai_arg
+  [ "$_ai_isc" -eq 1 ] && REPLY_CMD=""
+  return 0
+}
 daemon_pid=""
 daemon_hb=""
-[ -r "$panel_dir/daemon.pid" ] && { read -r daemon_pid; read -r daemon_hb; } < "$panel_dir/daemon.pid" 2>/dev/null
+daemon_wpid=""
+daemon_rpid=""
+[ -r "$panel_dir/daemon.pid" ] && { read -r daemon_pid; read -r daemon_hb; read -r daemon_wpid; read -r daemon_rpid; } < "$panel_dir/daemon.pid" 2>/dev/null
 daemon_alive=0
 if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null && [[ "$daemon_hb" =~ ^[0-9]+$ ]]; then
   hb_age=$(( hook_now - daemon_hb ))
@@ -144,19 +178,38 @@ if [ "$daemon_alive" -eq 0 ]; then
     # matching the tail (not "mentions anywhere") keeps a shell that
     # merely TALKS about the file (a diagnostic, a test, an agent's
     # own bash) out of the kill set.
-    _cmd=""
-    [ -r "/proc/$daemon_pid/cmdline" ] && _cmd=$(tr '\0' ' ' < "/proc/$daemon_pid/cmdline" 2>/dev/null)
-    case "$_cmd" in
-      *statusline-panel-daemon.sh|*"statusline-panel-daemon.sh ")
-        # kill the whole process GROUP (round-12): a wedged daemon is
-        # usually wedged BECAUSE its render child is stuck, and killing
-        # only the daemon orphaned that child - it kept running (and
-        # holding its tmp file) with no parent to reap it, so the very
-        # leak this reap exists to stop was replaced by a slower one.
-        kill -- "-$daemon_pid" 2>/dev/null
+    argv_identity "$daemon_pid"
+    case "$REPLY_CMD" in
+      *statusline-panel-daemon.sh)
+        # NO GROUP KILL ON THE DAEMON (round-13): round-12 added
+        # `kill -- "-$daemon_pid"` to take the stuck render child down
+        # with it, but the daemon is spawned as `( bash ... & )` from a
+        # script with NO job control - it inherits THIS hook's process
+        # group and is not a group leader, so that signal went to a
+        # group that does not exist (ESRCH, measured: the daemon
+        # survived both group kills and died only to the bare pid kill).
+        # It was not merely useless: cygwin recycles pids fast, and a
+        # recycled pid matching some unrelated live PGID would have
+        # taken that whole group down - the shape of the 2026-08-13/14
+        # mis-kill incidents. The child is reaped by pid instead, below.
         kill "$daemon_pid" 2>/dev/null
-        kill -9 -- "-$daemon_pid" 2>/dev/null
         kill -9 "$daemon_pid" 2>/dev/null ;;
+    esac
+  fi
+  # THE IN-FLIGHT RENDER CHILD (round-13): a wedged daemon is usually
+  # wedged BECAUSE its child is stuck, and that child is NOT derivable
+  # from here - hence line 4 of the pid file, which the daemon rewrites
+  # on its 5s beat (empty while idle). This one IS group-killable: the
+  # daemon starts it under `set -m`, so it leads its own group and the
+  # renderer's own jq goes down with it. Same cmdline-tail identity
+  # check as the daemon, so a recycled pid is never signalled.
+  if [[ "$daemon_rpid" =~ ^[0-9]+$ ]] && kill -0 "$daemon_rpid" 2>/dev/null; then
+    argv_identity "$daemon_rpid"
+    case "$REPLY_CMD" in
+      *subagent-statusline.sh)
+        kill -- "-$daemon_rpid" 2>/dev/null
+        kill "$daemon_rpid" 2>/dev/null
+        kill -9 -- "-$daemon_rpid" 2>/dev/null ;;
     esac
   fi
   ( bash "$panel_daemon" </dev/null >/dev/null 2>&1 & )
