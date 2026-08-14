@@ -86,10 +86,14 @@ export LC_ALL=C.UTF-8
 # Terminal's default profile - see disp_width()'s comment if your terminal
 # is configured for East-Asian ambiguous-wide instead.
 #
-#   1  identity segment: "▸ " (gray) + identity text (bright magenta, first
-#      non-empty of name/label/type; identity absent -> the WHOLE segment
-#      is empty for this row, i.e. a padded blank column here unless it's
-#      also this row's trailing-absent point) + "(type)" in gray when
+#   1  identity segment: "▸ " (gray) + identity text (STATE-COLORED:
+#      running bright magenta / pending yellow / completed green /
+#      failed bright red / unknown bright blue - the name is the widest
+#      and left-most thing on the row, so it carries the state itself
+#      instead of being uniformly magenta; first non-empty of
+#      name/label/type; identity absent -> the WHOLE segment is empty
+#      for this row, i.e. a padded blank column here unless it's also
+#      this row's trailing-absent point) + "(type)" in gray when
 #      .type is non-empty and differs from the chosen identity text + "·" +
 #      effort (heat-colored: low
 #      gray / medium green / high yellow / xhigh bright magenta / max
@@ -145,7 +149,8 @@ export LC_ALL=C.UTF-8
 #      tokenCount and the payload total are both positive: "Σ" gray, "N%"
 #      dynamic (<50 gray, 50-74 yellow, >=75 bright red - token-hog
 #      highlighting)
-#   5  elapsed since startTime - white; values > 1e12 are treated as
+#   5  elapsed since startTime (DURATION-TIERED: <2min gray / <10min
+#      white / <30min yellow / >=30min bright red) - white; values > 1e12 are treated as
 #      milliseconds; "<N>s" under 1 minute, "<N>m<N>s" under 1 hour, else
 #      "<N>h<N>m<N>s"; when shown, immediately (no space) followed by
 #      "@HH:MM:SS" in gray - the local clock time startTime normalizes to
@@ -194,6 +199,7 @@ CYAN=$'\e[36m'
 WHITE=$'\e[37m'
 RED_BRIGHT=$'\e[91m'
 MAGENTA_BRIGHT=$'\e[95m'
+BLUE_BRIGHT=$'\e[94m'
 # N6: alignment padding and the grid separator's surrounding spaces use
 # NBSP (U+00A0), not a plain space, so VSCode-style terminals can't trim
 # them and break column alignment; semantic single spaces inside a
@@ -472,15 +478,39 @@ for ((ti=0; ti<task_count_total; ti++)); do
   task_type=${task_type//"$BSL2"/"$BSL1"}
   description=${description//"$BSL2"/"$BSL1"}
 
-  # column 1: identity segment: "▸ " + identity (bright magenta) + "(type)"
-  # (gray) + "·"+short-model (cyan, always when present) + "·"+effort
-  # (heat-colored) + " "+status glyph
-  # (identity_plain/task_type/model/effort/status split from task_rows above)
+  # column 1: identity segment: "▸ " + identity (STATE-COLORED, see
+  # below) + "(type)" (gray) + "·"+effort (heat-colored) + " "+status
+  # glyph. (identity_plain/task_type/model/effort/status split above.)
+  #
+  # STATE COLORING (user request): the name used to be bright magenta
+  # unconditionally, so a panel of six agents was six identical magenta
+  # names and the only state signal was the small glyph at the end of
+  # the cell. The name is the widest, left-most, most-read thing on the
+  # row, so it now carries the state itself - one glance across the
+  # left edge tells you what every agent is doing:
+  #   running/in_progress  bright magenta (the panel's signature color,
+  #                        kept for the common in-flight case)
+  #   pending/queued/etc   yellow      (waiting, nothing burning yet)
+  #   completed/done       green       (finished cleanly)
+  #   failed/cancelled     bright red  (needs attention)
+  #   unknown/absent       bright blue (state not reported)
+  # The glyph keeps its own color scale, so shape AND color agree; the
+  # arrow, type, effort, model, spend, trend, share and elapsed columns
+  # each keep their own distinct hue, so no two adjacent fields read as
+  # the same "kind" of value.
   seg1_plain=""
   seg1=""
+  case "$status" in
+    running|in_progress)            ident_color="$MAGENTA_BRIGHT" ;;
+    pending|queued|starting)        ident_color="$YELLOW" ;;
+    completed|done|finished)        ident_color="$GREEN" ;;
+    failed|error|cancelled|killed)  ident_color="$RED_BRIGHT" ;;
+    "")                             ident_color="$BLUE_BRIGHT" ;;
+    *)                              ident_color="$BLUE_BRIGHT" ;;
+  esac
   if [ -n "$identity_plain" ]; then
     seg1_plain="▸ ${identity_plain}"
-    seg1="${GRAY}▸ ${RESET}${MAGENTA_BRIGHT}${identity_plain}${RESET}"
+    seg1="${GRAY}▸ ${RESET}${ident_color}${identity_plain}${RESET}"
 
     if [ -n "$task_type" ] && [ "$task_type" != "$identity_plain" ]; then
       seg1_plain="${seg1_plain}(${task_type})"
@@ -549,7 +579,20 @@ for ((ti=0; ti<task_count_total; ti++)); do
       elapsed_text="$(( elapsed_s / 3600 ))h$(( (elapsed_s % 3600) / 60 ))m$(( elapsed_s % 60 ))s"
     fi
     printf -v start_clock '%(%H:%M:%S)T' "$start_s" 2>/dev/null
-    elapsed_seg="${WHITE}${elapsed_text}${RESET}"
+    # DURATION TIERS (user request: distinct colors per field/state):
+    # a long-running agent is a thing worth noticing, so elapsed is no
+    # longer flat white - <2min gray (just started), <10min white
+    # (normal), <30min yellow (long), >=30min bright red (very long).
+    if [ "$elapsed_s" -lt 120 ]; then
+      elapsed_color="$GRAY"
+    elif [ "$elapsed_s" -lt 600 ]; then
+      elapsed_color="$WHITE"
+    elif [ "$elapsed_s" -lt 1800 ]; then
+      elapsed_color="$YELLOW"
+    else
+      elapsed_color="$RED_BRIGHT"
+    fi
+    elapsed_seg="${elapsed_color}${elapsed_text}${RESET}"
     elapsed_plain="$elapsed_text"
     if [ -n "$start_clock" ]; then
       elapsed_seg="${elapsed_seg}${GRAY}@${start_clock}${RESET}"

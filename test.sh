@@ -622,6 +622,30 @@ PY
   # R45: install must confirm process identity before signalling (a
   # recycled pid in a stale pid file otherwise gets TERM+KILL)
   grep -q 'old_cmd' ./install.sh && ok "installer confirms daemon identity before kill" || bad "installer still kills by bare pid"
+  # ---- panel state-coloring (user request, 2026-08-15) ----
+  # R46: the identity is no longer a flat magenta - each state gets its
+  # own hue so one glance down the left edge reads the whole fleet
+  colorrows=$(jq -n --argjson n "$(date +%s)" '{columns:170,tasks:[
+    {id:"cr1",name:"runner",status:"running",tokenCount:5000,startTime:(($n-2400)*1000),description:"d"},
+    {id:"cr2",name:"doner",status:"completed",tokenCount:5000,startTime:(($n-700)*1000),description:"d"},
+    {id:"cr3",name:"failer",status:"failed",tokenCount:5000,startTime:(($n-90)*1000),description:"d"},
+    {id:"cr4",name:"waiter",status:"pending",tokenCount:5000,startTime:(($n-30)*1000),description:"d"},
+    {id:"cr5",name:"weirdo",status:"zzz",tokenCount:5000,startTime:(($n-1200)*1000),description:"d"}]}' | bash ./subagent-statusline.sh | jq -r .content)
+  # compare on an ESC-transliterated copy: $'[' inside a quoted
+  # grep pattern is brittle, and the raw ESC byte cannot be typed here
+  colorcodes=$(printf '%s' "$colorrows" | sed 's/\[/CODE/g')
+  col_ok=1
+  for _pair in '95m:runner' '32m:doner' '91m:failer' '33m:waiter' '94m:weirdo'; do
+    _c=${_pair%%:*}; _n=${_pair#*:}
+    printf '%s' "$colorcodes" | grep -q "CODE${_c}${_n}" || col_ok=0
+  done
+  [ "$col_ok" -eq 1 ] && ok "identity color follows task state" || bad "identity state coloring wrong"
+  # R47: elapsed is duration-tiered (the 40min row bright red, the 30s
+  # row gray) instead of flat white
+  el_ok=1
+  printf '%s' "$colorcodes" | grep -q 'CODE91m40m0s' || el_ok=0
+  printf '%s' "$colorcodes" | grep -q 'CODE90m30s' || el_ok=0
+  [ "$el_ok" -eq 1 ] && ok "elapsed color follows duration tier" || bad "elapsed tiering wrong"
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   : > "$STATUSLINE_DAILY_FILE"

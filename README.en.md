@@ -24,7 +24,7 @@ The subagent panel row (via `subagentStatusLine`) renders every agent as an alig
 ▸ 0.2.79 收尾与发布(local_agent) ● | fable-5 | 295k tok | ▆▄▁ 14.9k/m | Σ78% | 19m44s@08:11:18 | description…
 ```
 
-with bright-magenta identity (vs. the main line's bright cyan), a standalone always-on short-model column, status glyphs (● ○ ✓ ✗), cumulative token spend (deliberately **not** a fake "context battery" — `tokenCount` is cumulative), sparkline + rate, Σ fleet-share, seconds-precision elapsed time, and a width-budgeted description. Columns align using true display-width measurement (CJK = 2 cells).
+with a STATE-COLORED identity (running bright magenta / pending yellow / completed green / failed bright red / unknown bright blue - the name itself carries the state, so one glance down the left edge reads the whole fleet; the main line stays bright cyan), a standalone always-on short-model column, status glyphs (● ○ ✓ ✗), cumulative token spend (deliberately **not** a fake "context battery" — `tokenCount` is cumulative), sparkline + rate, Σ fleet-share, seconds-precision elapsed time, and a width-budgeted description. Columns align using true display-width measurement (CJK = 2 cells).
 
 ## Install
 
@@ -50,7 +50,7 @@ It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES s
 ```bash
 bash test.sh          # render all fixtures (see real colors in your terminal)
 bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
-bash test.sh --assert # 102 assertions (CI mode; perf gates + eleven adversarial-review regression groups)
+bash test.sh --assert # 104 assertions (CI mode; perf gates + eleven adversarial-review regression groups + color asserts)
 ```
 
 ## Notable engineering notes
