@@ -77,6 +77,8 @@
 
 ### 1.3 状态文件（走势/速率/花费速率的数据源）
 
+**env 覆盖契约（测试隔离命脉——按本规格复刻必须原样实现，否则 `bash test.sh --assert` 会写真实 ~/.claude、真拿用户 OAuth token 发网络请求）**：`STATUSLINE_HISTORY_FILE`（细粒度历史）、`STATUSLINE_DAILY_FILE`（日聚合）、`STATUSLINE_SUBAGENT_TREND_FILE`（面板趋势）、`STATUSLINE_CI_CACHE_PREFIX`（CI 徽记缓存前缀，`.{owner}-{repo}-{pr}` 拼在其后）、`STATUSLINE_USAGE_CACHE_FILE` / `STATUSLINE_USAGE_BACKOFF_FILE`（wk/extra 缓存与退避）、`STATUSLINE_CRED_FILE`（OAuth 凭据路径）、`STATUSLINE_PANEL_DIR` / `STATUSLINE_PANEL_RENDERER` / `STATUSLINE_PANEL_DAEMON`（面板三件）、`STATUSLINE_TRANSCRIPT_TAIL_BYTES` / `STATUSLINE_CACHE_TTL_SECONDS` / `STATUSLINE_PANEL_RENDER_TIMEOUT`（行为旋钮）。全部形如 `${VAR:-默认}`。
+
 `~/.claude/statusline-history.tsv`，TSV 行：`epoch<TAB>session_id<TAB>tokens<TAB>cost`（tokens 记**占用**=输入+输出，主路径不可用时记 input-only；缺值存空串）。每次调用：同会话最后一行不存在或 ≥30 秒旧才追加（采样步长，与 refreshInterval 配比：走势每格≈30 秒变化量，整图窗口 ~4.5 分钟）；追加后到**带 `$$` 的临时文件**再 `mv` 截断（固定 tmp 名会让多会话并发裁剪互撞丢行，已实锤）。所有读取按会话过滤、要求恰好 4 列 + 逐列数值校验，损坏/并发行静默跳过；全部文件操作 `2>/dev/null` 包裹，文件不可写绝不能影响其余段。细粒度行仅保 3 小时，today/week 由日聚合文件驱动（见硬性要求 0b）。
 
 ## 2. 硬性要求（两个脚本通用）
@@ -111,7 +113,8 @@
 
 ## 4. 子代理面板行（subagentStatusLine）
 
-**常驻 daemon 架构（必须）**：宿主重画面板时先出默认行、钩子返回才替换——钩子延迟即"闪回默认"窗口。因此 subagentStatusLine 命令指向轻钩子 `statusline-panel-hook.sh`（纯内建：分块读 stdin → 按**载荷首任务 id** 派生缓存键 → 原子 spool 交接 `spool.<key>.new` → mapfile 秒回 `cache.<key>` 上一帧 → `kill -0` 探测 daemon、死则游离拉起），渲染由 `statusline-panel-daemon.sh` 异步跑真渲染脚本完成（单实例 noclobber 抢占；**陈旧接管=删除+独占重建、绝不裸 `>` 覆写**（截断窗会让并发读者误判无主）；**退出删除 pid 文件前必须校验内容==$$**（否则先退的一方会删掉存活实例的注册、级联拉起第三实例）；0.3s fifo `read -t` 零派生轮询；无活 2 分钟自灭；`--once` 供测试）。**渲染子进程必须带硬超时**（后台启动+fifo 节拍计数等待，默认 15s，`STATUSLINE_PANEL_RENDER_TIMEOUT` 覆盖；超时杀子进程跳帧，缓存继续供上一好帧）——同步无超时等待曾是全会话面板永久冻结的单点（子进程挂死→daemon 阻塞→`kill -0` 探活恒真→永不重启，默认安装无恢复路径）；每次渲染的 cache tmp 名带自增序号（MSYS/NTFS 上被杀子进程的 tmp 名会短暂处于 delete-pending、不可复用）。并发会话任务集不相交→缓存键天然隔离；一切竞争丢失都由下一拍自愈。状态目录 `$STATUSLINE_PANEL_DIR`（默认 `~/.claude/statusline-panel.d/`），renderer/daemon 路径可用 `STATUSLINE_PANEL_RENDERER`/`STATUSLINE_PANEL_DAEMON` 覆盖（测试用）。
+**常驻 daemon 架构（必须）**：宿主重画面板时先出默认行、钩子返回才替换——钩子延迟即"闪回默认"窗口。因此 subagentStatusLine 命令指向轻钩子 `statusline-panel-hook.sh`（纯内建：分块读 stdin → 按**载荷首任务 id** 派生缓存键 → 原子 spool 交接 `spool.<key>.new` → mapfile 秒回 `cache.<key>` 上一帧 → `kill -0` 探测 daemon、死则游离拉起），渲染由 `statusline-panel-daemon.sh` 异步跑真渲染脚本完成（单实例 noclobber 抢占；**pid 文件为两行协议 `pid
+心跳epoch`**——daemon 以**墙钟 5 秒**节奏原子刷新第二行（主循环与渲染等待循环双检查点，任何路径都饿不死心跳；严禁按循环轮数计拍——轮长无上界，挂死渲染曾把拍距拉到 ~230s 致活 daemon 被误判死、替身叠加）；**判活=数字 pid + kill -0 + 心跳 60s 内**，钩子探活、接管判定、install 回收三处同一判据（裸 kill -0 会被系统回收给无关进程的残留 pid 永久欺骗——钩子永不拉起、面板死锁；install 裸 kill 更会误杀无辜进程）；缺/旧心跳一律判死；**陈旧接管=删除+独占重建、绝不裸 `>` 覆写**（截断窗会让并发读者误判无主）；**退出删除 pid 文件前必须校验内容==$$**（否则先退的一方会删掉存活实例的注册、级联拉起第三实例）；0.3s fifo `read -t` 零派生轮询；无活 2 分钟自灭；`--once` 供测试）。**渲染子进程必须带硬超时**（后台启动+fifo 节拍计数等待，默认 15s，`STATUSLINE_PANEL_RENDER_TIMEOUT` 覆盖；超时杀子进程跳帧，缓存继续供上一好帧）——同步无超时等待曾是全会话面板永久冻结的单点（子进程挂死→daemon 阻塞→`kill -0` 探活恒真→永不重启，默认安装无恢复路径）；每次渲染的 cache tmp 名带自增序号（MSYS/NTFS 上被杀子进程的 tmp 名会短暂处于 delete-pending、不可复用）。并发会话任务集不相交→缓存键天然隔离；一切竞争丢失都由下一拍自愈。状态目录 `$STATUSLINE_PANEL_DIR`（默认 `~/.claude/statusline-panel.d/`），renderer/daemon 路径可用 `STATUSLINE_PANEL_RENDERER`/`STATUSLINE_PANEL_DAEMON` 覆盖（测试用）。
 
 ### 4.1 契约（与主状态栏不同！）
 
@@ -129,7 +132,7 @@
 
 ## 5. 验证（必须实际执行）
 
-**首选**：仓库根目录 `bash test.sh --assert` —— 71 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、双层花费存储、追加优先裁剪触发、面板钩子 spool/缓存秒回/daemon 渲染、安装器本地模式/合并/幂等、**NBSP 分隔符列对齐（含断言活性自证——分隔符样式再变会红而不是断言静默失效）**、TSV 列序、空列裁剪、性能 <3s 门槛，及**对抗审查回归组**：@tsv 反斜杠单次反解码、C0 清洗不串位不坏 JSON、session_name 内嵌换行不降级、ctx 回退负值夹取/垃圾整段消失、主目录兄弟目录边界、daemon 挂死子进程超时截杀、时钟回拨不冻结采样、~500KiB transcript <2.5s 性能门、看门狗 vbs 纯 ASCII，及第 2/3 轮回归组：垃圾限额段消失、OSC 注入剥除、未来日 rollup 不虚增、空 dir 无 git 段、数字 id 无键、空渲染保帧、usage 失败负缓存且测试不碰真实 ~/.claude、坏帧连击清缓存诚实降级、陈旧心跳接管驱逐、毫秒 resets_at 半段消失），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
+**首选**：仓库根目录 `bash test.sh --assert` —— 73 项断言（四行结构、各新段存在性、stash 段显隐、子代理 10s 采样、双层花费存储、追加优先裁剪触发、面板钩子 spool/缓存秒回/daemon 渲染、安装器本地模式/合并/幂等、**NBSP 分隔符列对齐（含断言活性自证——分隔符样式再变会红而不是断言静默失效）**、TSV 列序、空列裁剪、性能 <3s 门槛，及**对抗审查回归组**：@tsv 反斜杠单次反解码、C0 清洗不串位不坏 JSON、session_name 内嵌换行不降级、ctx 回退负值夹取/垃圾整段消失、主目录兄弟目录边界、daemon 挂死子进程超时截杀、时钟回拨不冻结采样、~500KiB transcript <2.5s 性能门、看门狗 vbs 纯 ASCII，及第 2/3 轮回归组：垃圾限额段消失、OSC 注入剥除、未来日 rollup 不虚增、空 dir 无 git 段、数字 id 无键、空渲染保帧、usage 失败负缓存且测试不碰真实 ~/.claude、坏帧连击清缓存诚实降级、陈旧心跳接管驱逐、毫秒 resets_at 半段消失），全 PASS 即基本达标；以下手工清单用于断言未覆盖的细节。
 
 主状态栏（`fixtures/` 三份 + 状态文件人工历史；以下期望串均为隔离环境实测）：
 - **full.json**：**四行**齐全；电池 `ctx ███░│ 66% 70k/200k`（**末格恒为 80% 压缩线 `│`**，仅满电 5 格时才无标记；占用 69671=68471+1200→70k，非 68k！）；`cache 92.3%` 绿（一位小数）；第 4 行 `5h …·t…% 7d …` + `wk` + `» my-session`。

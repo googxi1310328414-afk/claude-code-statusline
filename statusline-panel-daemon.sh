@@ -12,8 +12,10 @@
 #
 # FILES (all under $STATUSLINE_PANEL_DIR, default
 # ~/.claude/statusline-panel.d):
-#   spool.<key>.new  newest un-rendered payload (atomic mv handoff from
-#                    the hook; overwriting an unconsumed spool = a
+#   spool.<key>.new  newest un-rendered payload (ONE direct builtin
+#                    write from the hook - deliberately NOT atomic, the
+#                    spool is newest-wins/lossy and a torn read only
+#                    skips a frame; overwriting an unconsumed spool = a
 #                    deliberately skipped frame, newest wins)
 #   render.<key>     this daemon's in-flight claim (mv-consumed spool)
 #   cache.<key>      latest rendered rows, served instantly by the hook
@@ -72,7 +74,7 @@ fi
 exec 2>>"$err_log"
 
 # pid file format (round-3): TWO lines - "pid\nheartbeat_epoch". The
-# heartbeat (rewritten by the ~9s ownership self-check below) is what
+# heartbeat (rewritten on a wall-clock 5s cadence by hb_beat below) is what
 # lets the hook and the takeover path tell a LIVE daemon from a stale
 # pid recycled onto some unrelated cygwin process - bare `kill -0` alone
 # deadlocked forever in that case: hook thought the daemon was alive and
@@ -114,7 +116,28 @@ tick_fifo="$panel_dir/.tick.fifo"
 shopt -s nullglob
 idle=0
 render_seq=0
-own_check=0
+last_own=0
+last_hb=0
+[ "$once" -eq 0 ] && last_hb=$hb_now
+# WALL-CLOCK heartbeat (round-4 fix for a round-3 regression): the first
+# heartbeat implementation counted LOOP ITERATIONS (every 15th), but an
+# iteration's duration is unbounded - each spool's render wait adds up
+# to render_timeout, so a hung renderer stretched the beat interval to
+# ~230s and even 4 busy sessions could pass 60s. The hook then judged a
+# perfectly alive daemon dead, spawned a rival that evicted the live pid
+# registration and trampled in-flight claims - measured stacking up to
+# 8 concurrent daemons, exactly the process amplification this project
+# treats as its survival line. Beats are now pure wall clock: at most
+# one write per 5s, checked every loop AND every 0.3s render-wait tick,
+# so no code path can starve the beat. Atomic tmp+mv (one fork per 5s
+# worst case, off the hot hook path).
+hb_beat() {
+  [ "$once" -eq 1 ] && return 0
+  printf -v hb_t '%(%s)T' -1
+  [ $(( hb_t - last_hb )) -lt 5 ] && return 0
+  last_hb=$hb_t
+  printf '%s\n%s\n' "$$" "$hb_t" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
+}
 # per-key consecutive bad-frame counter (round-3 fix): the -s keep-frame
 # gate protects the cache from TRANSIENT blank renders, but a PERSISTENT
 # failure (jq gone from PATH, renderer deleted, permanent hang) then
@@ -135,22 +158,17 @@ while :; do
   # CONVERGES the transient double-daemon fast - an instance that finds
   # a DIFFERENT live pid registered concedes and exits instead of
   # coasting to the 2-minute idle death.
-  own_check=$(( own_check + 1 ))
-  if [ "$once" -eq 0 ] && [ "$own_check" -ge 15 ]; then
-    own_check=0
-    cur_owner=""
-    [ -r "$panel_dir/daemon.pid" ] && read -r cur_owner < "$panel_dir/daemon.pid"
-    if [ -n "$cur_owner" ] && [ "$cur_owner" != "$$" ] && kill -0 "$cur_owner" 2>/dev/null; then
-      exit 0
+  if [ "$once" -eq 0 ]; then
+    printf -v own_t '%(%s)T' -1
+    if [ $(( own_t - last_own )) -ge 9 ]; then
+      last_own=$own_t
+      cur_owner=""
+      [ -r "$panel_dir/daemon.pid" ] && read -r cur_owner < "$panel_dir/daemon.pid"
+      if [ -n "$cur_owner" ] && [ "$cur_owner" != "$$" ] && kill -0 "$cur_owner" 2>/dev/null; then
+        exit 0
+      fi
     fi
-    # HEARTBEAT: refresh the pid file's second line (~9s cadence, well
-    # inside the hook's 30s freshness verdict) - this is what proves to
-    # the hook that this pid is really THIS daemon, not a recycled pid
-    # on some unrelated process. Atomic tmp+mv (one fork per ~9s, far
-    # off any hot path): a bare `>` rewrite would open a truncation
-    # window in the very file every liveness verdict reads.
-    printf -v hb_now '%(%s)T' -1
-    printf '%s\n%s\n' "$$" "$hb_now" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
+    hb_beat
   fi
   for sp in "$panel_dir"/spool.*.new; do
     key=${sp##*/spool.}
@@ -173,6 +191,10 @@ while :; do
         sleep 0.3 2>/dev/null || break
       fi
       r_waited=$(( r_waited + 1 ))
+      # keep the wall-clock heartbeat alive DURING renders too - a hung
+      # child otherwise starves the beat for up to render_timeout per
+      # spool and gets this live daemon judged dead (see hb_beat)
+      hb_beat
     done
     frame_bad=0
     if kill -0 "$r_pid" 2>/dev/null; then

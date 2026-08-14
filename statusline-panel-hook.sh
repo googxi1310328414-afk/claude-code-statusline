@@ -62,8 +62,9 @@ if [ -r "$panel_dir/cache.$key" ]; then
 fi
 
 # ensure the daemon is alive - kill -0 AND a fresh heartbeat (round-3
-# fix): the pid file's 2nd line is an epoch the daemon rewrites every
-# ~5s (and at most once per busy loop iteration). Bare kill -0 alone deadlocked when a stale pid got RECYCLED onto
+# fix): the pid file's 2nd line is an epoch the daemon rewrites on a
+# WALL-CLOCK 5s cadence (checked every loop and every render-wait tick,
+# so busy/hung renders cannot starve it). Bare kill -0 alone deadlocked when a stale pid got RECYCLED onto
 # some unrelated live process (cygwin pids recycle fast on this box):
 # the hook then believed the daemon alive forever, spools piled up, the
 # panel froze with no recovery path. A stale/missing heartbeat (>60s,

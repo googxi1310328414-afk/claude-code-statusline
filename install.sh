@@ -69,8 +69,18 @@ done
 if [ "$daemon_updated" -eq 1 ]; then
   daemon_pid_file="$CLAUDE_DIR/statusline-panel.d/daemon.pid"
   old_dp=""
-  [ -r "$daemon_pid_file" ] && read -r old_dp < "$daemon_pid_file" 2>/dev/null
-  if [ -n "$old_dp" ] && kill -0 "$old_dp" 2>/dev/null; then
+  old_hb=""
+  [ -r "$daemon_pid_file" ] && { read -r old_dp; read -r old_hb; } < "$daemon_pid_file" 2>/dev/null
+  # 与钩子/接管同一套判活（数字 pid + 心跳 60s 内 + kill -0）——残留 pid
+  # 被系统回收给无关进程时，裸 kill 会把 SIGTERM 发给无辜进程（另一
+  # 会话的 bash/git 都可能中招）；判不活就只删 pid 文件
+  old_alive=0
+  if [[ "$old_dp" =~ ^[0-9]+$ ]] && [[ "$old_hb" =~ ^[0-9]+$ ]]; then
+    now_i=$(date +%s)
+    hb_age=$(( now_i - old_hb ))
+    [ "$hb_age" -ge -60 ] && [ "$hb_age" -le 60 ] && kill -0 "$old_dp" 2>/dev/null && old_alive=1
+  fi
+  if [ "$old_alive" -eq 1 ]; then
     kill "$old_dp" 2>/dev/null
     say "✓ 旧面板 daemon(pid $old_dp) 已回收——下一拍面板钩子自动以新版拉起"
   fi

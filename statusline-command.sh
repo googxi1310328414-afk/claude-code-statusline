@@ -717,16 +717,57 @@ hist_future_cutoff=$(( now_epoch + 3600 ))
 hist_trimmed=()
 hist_oldest_epoch=""
 daily_dirty=0
-# HOT LOOP - THE single walk over the fine history file, feeding all four
-# consumers at once: this session's rate/sparkline arrays + throttle
-# epoch, the trim collection, and the daily-rollup fold. Rows are split
-# with parameter expansions, NOT `IFS read -a <<<` - a herestring
-# materializes a pipe/temp per use (~0.25ms each on MSYS), which across
-# hundreds of rows was several hundred ms of EVERY render. The expansion
-# chain + "no separator left in the last field" test is exactly the old
-# exactly-4-fields shape check. (Merged from two near-identical walks on
-# 2026-08-14 after the adversarial review measured the duplication.)
-for hline in "${hist_all_lines[@]}"; do
+# smallest watermark across every session the rollup knows: rows at or
+# below it AND older than every live consumer window are provably inert
+# (already folded, outside all display windows) - the tail scan below
+# stops there. No watermark at all (first run / fresh rollup) leaves it
+# 0 = full scan, which is exactly the seeding path.
+global_min_wm=0
+first_wm=1
+for _wms in "${!du_watermark[@]}"; do
+  if [ "$first_wm" -eq 1 ]; then global_min_wm=${du_watermark[$_wms]}; first_wm=0
+  elif [ "${du_watermark[$_wms]}" -lt "$global_min_wm" ]; then global_min_wm=${du_watermark[$_wms]}; fi
+done
+# HOT PATH, TAIL-FIRST (round-4 fix): every steady-state consumer of
+# this file lives in the TAIL - $/h needs 60min, the token rate 5min,
+# the sparkline the last 9 samples, the rollup only rows above the
+# watermarks. The old head-to-tail full walk therefore spent ~59% of a
+# realistic frame (measured: 1039 rows = ~555ms) fully parsing rows it
+# then discarded. Phase 1 walks BACKWARDS with a 4-statement epoch-only
+# probe per row and stops at the first row that is both older than the
+# 65min consumer horizon AND at-or-below every watermark; phase 2
+# replays just the surviving tail slice (~130 rows/session) FORWARDS
+# through the full parse + arrays + rollup fold (the fold state machine
+# is order-sensitive, hence the replay). Full-file work now happens only
+# on the ~30min rewrite path (see the write block below). Correctness
+# relies on the file being append-ordered, which O_APPEND writes give
+# us; the seeding run (no watermarks) still scans everything.
+hist_scan_horizon=$(( now_epoch - 3900 ))
+hist_count=${#hist_all_lines[@]}
+hist_tail_start=0
+for (( hi=hist_count-1; hi>=0; hi-- )); do
+  hline=${hist_all_lines[hi]}
+  h_epoch=${hline%%$'\x1f'*}
+  h_epoch=${h_epoch//$'\r'/}
+  [[ "$h_epoch" =~ ^[0-9]+$ ]] || continue
+  if [ "$h_epoch" -lt "$hist_scan_horizon" ] && [ "$h_epoch" -le "$global_min_wm" ]; then
+    hist_tail_start=$(( hi + 1 ))
+    break
+  fi
+done
+# oldest VALID epoch, for the rewrite-due decision: probe forward from
+# the head - the first few rows suffice (a bounded 20-row cap keeps a
+# pathological all-garbage head from re-importing a full scan)
+for (( hi=0; hi<hist_count && hi<20; hi++ )); do
+  h_epoch=${hist_all_lines[hi]%%$'\x1f'*}
+  h_epoch=${h_epoch//$'\r'/}
+  if [[ "$h_epoch" =~ ^[0-9]+$ ]] && [ "$h_epoch" -le "$hist_future_cutoff" ]; then
+    hist_oldest_epoch="$h_epoch"
+    break
+  fi
+done
+for (( hi=hist_tail_start; hi<hist_count; hi++ )); do
+  hline=${hist_all_lines[hi]}
   hline=${hline//$'\r'/}
   hline=${hline//$'\t'/$'\x1f'}
   h_epoch=${hline%%$'\x1f'*}
@@ -745,9 +786,6 @@ for hline in "${hist_all_lines[@]}"; do
   # them would book their spend onto a future day and re-poison the
   # watermark the guard above just reset.
   [ "$h_epoch" -gt "$hist_future_cutoff" ] && continue
-  [ -z "$hist_oldest_epoch" ] && hist_oldest_epoch="$h_epoch"
-
-  [ "$h_epoch" -ge "$hist_time_cutoff" ] && hist_trimmed+=("$hline")
 
   # this session's rate/sparkline arrays + the throttle's last epoch
   if [ -n "$session_id" ] && [ "$h_sid" = "$session_id" ]; then
@@ -820,11 +858,11 @@ if [ -n "$session_id" ]; then
     fi
     printf -v new_hist_line '%s\x1f%s\x1f%s\x1f%s' "$now_epoch" "$session_id" "$hist_tokens_now" "$hist_cost_now"
     # reflect the just-appended row in the in-memory rate/sparkline
-    # arrays, the trim collection AND the rollup fold - the old second
-    # walk saw it by re-walking hist_all_lines post-append; the merged
-    # walk above ran pre-append, so the new row steps in here instead
-    # (fold_daily_row is the same state-machine code path).
-    hist_trimmed+=("$new_hist_line")
+    # arrays AND the rollup fold - the old second walk saw it by
+    # re-walking hist_all_lines post-append; the tail walk above ran
+    # pre-append, so the new row steps in here instead (fold_daily_row
+    # is the same state-machine code path). The trim collection is built
+    # on demand inside the rare rewrite path below.
     [ -z "$hist_oldest_epoch" ] && hist_oldest_epoch="$now_epoch"
     if [[ "$hist_tokens_now" =~ ^[0-9]+$ ]]; then
       tok_epochs+=("$now_epoch")
@@ -928,8 +966,29 @@ fi
 if [ -n "$session_id" ] && [ "$should_append" -eq 1 ]; then
   hist_rewrite_due=0
   [ -n "$hist_oldest_epoch" ] && [ $(( now_epoch - hist_oldest_epoch )) -gt 12600 ] && hist_rewrite_due=1
-  [ "${#hist_trimmed[@]}" -gt 10000 ] && hist_rewrite_due=1
+  [ "$hist_count" -gt 10000 ] && hist_rewrite_due=1
   if [ "$hist_rewrite_due" -eq 1 ]; then
+    # ON-DEMAND TRIM WALK (round-4): the every-frame loop no longer
+    # collects the trim set (it stops at the consumer horizon - see the
+    # tail-first comment above); this full-file pass runs ONLY here, on
+    # the ~30min rewrite cadence, where its cost was always budgeted.
+    # Same normalization + whole-row shape checks as the tail walk.
+    for hline in "${hist_all_lines[@]}"; do
+      hline=${hline//$'\r'/}
+      hline=${hline//$'\t'/$'\x1f'}
+      h_epoch=${hline%%$'\x1f'*}
+      h_rest=${hline#*$'\x1f'}
+      h_rest2=${h_rest#*$'\x1f'}
+      h_cost=${h_rest2#*$'\x1f'}
+      [[ "$hline" != *$'\x1f'* ]] && continue
+      [[ "$h_rest" != *$'\x1f'* ]] && continue
+      [[ "$h_rest2" != *$'\x1f'* ]] && continue
+      [[ "$h_cost" == *$'\x1f'* ]] && continue
+      [[ "$h_epoch" =~ ^[0-9]+$ ]] || continue
+      [ "$h_epoch" -gt "$hist_future_cutoff" ] && continue
+      [ "$h_epoch" -ge "$hist_time_cutoff" ] && hist_trimmed+=("$hline")
+    done
+    hist_trimmed+=("$new_hist_line")
     hist_trimmed_count=${#hist_trimmed[@]}
     if [ "$hist_trimmed_count" -gt 10000 ]; then
       hist_trimmed=("${hist_trimmed[@]: -10000}")
@@ -1505,15 +1564,19 @@ if [[ "$in_tokens" =~ ^[0-9]+$ ]] && [ "$in_tokens" -gt 0 ] && [[ "$win_size" =~
   fmt_k_or_m "$win_size"; total_fmt="$REPLY"
   ctx_seg="${ctx_seg} ${WHITE}${occ_fmt}${RESET}${GRAY}/${total_fmt}${RESET}"
   ctx_plain="${ctx_plain} ${occ_fmt}/${total_fmt}"
-elif [[ "$remaining" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+elif [[ "$remaining" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]]; then
   # FALLBACK: token fields unavailable, drive everything off the
   # (input-only) remaining_percentage field instead, no token text.
   # DOUBLE GUARD (hard-rule 2): only a numeric remaining enters this arm
   # at all - a garbage string now drops the whole segment silently
-  # instead of feeding printf. The value is then CLAMPED to 0..100,
-  # mirroring the primary path's clamp: a negative reading (input-only
-  # arithmetic can go past the window) renders the same red "!...0%"
-  # alarm the primary path would - never an unguarded green "-7%".
+  # instead of feeding printf. The {1,3} digit cap (round-4, same as the
+  # five/week/cost caps) keeps the -gt comparisons inside bash integer
+  # range: an unbounded 24-digit value made every clamp test error out
+  # as false and rendered a full green battery + a 24-digit percent that
+  # blew up the whole grid's column widths. The value is then CLAMPED to
+  # 0..100, mirroring the primary path's clamp: a negative reading
+  # (input-only arithmetic can go past the window) renders the same red
+  # "!...0%" alarm the primary path would - never an unguarded green.
   if [ "${remaining:0:1}" = "-" ]; then
     remaining_int=0
     remaining_disp="0"

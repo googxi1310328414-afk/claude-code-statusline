@@ -357,6 +357,25 @@ if [ "$1" = "--assert" ]; then
   printf '%s' "$msout" | grep -q '5h 37%' && ok "ms resets_at keeps percent" || bad "ms resets_at broke percent"
   printf '%s' "$msout" | grep -qE '·t|→' && bad "ms resets_at fabricated pace/clock" || ok "ms resets_at drops reset half-segments"
 
+  # ---- adversarial-review round-4 regression asserts (2026-08-14) ----
+  # R20: the daemon heartbeat must be WALL-CLOCK, not loop-iteration -
+  # with a hung renderer (one iteration = the full render timeout) the
+  # pid file's 2nd line still refreshes within a few seconds
+  printf '{"columns":120,"tasks":[{"id":"hb1","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.hb1.new"
+  STATUSLINE_PANEL_RENDERER="$tmpd/hangrender.sh" STATUSLINE_PANEL_RENDER_TIMEOUT=8 bash ./statusline-panel-daemon.sh &
+  hb2_dpid=$!
+  sleep 7
+  hb_now2=$(date +%s)
+  hb_line2=""
+  { read -r _hbpid; read -r hb_line2; } < "$STATUSLINE_PANEL_DIR/daemon.pid" 2>/dev/null
+  kill "$hb2_dpid" 2>/dev/null; wait "$hb2_dpid" 2>/dev/null
+  rm -f "$STATUSLINE_PANEL_DIR/daemon.pid" "$STATUSLINE_PANEL_DIR"/spool.hb1.new "$STATUSLINE_PANEL_DIR"/render.hb1 2>/dev/null
+  if [[ "$hb_line2" =~ ^[0-9]+$ ]] && [ $(( hb_now2 - hb_line2 )) -le 6 ]; then ok "heartbeat stays fresh during hung render (wall-clock)"; else bad "heartbeat starved by hung render (age=$(( hb_now2 - ${hb_line2:-0} ))s)"; fi
+  # R21: giant remaining_percentage must not paint a full green battery
+  # with a 24-digit percent - digit cap drops the whole segment
+  bigctx=$(jq -n '{session_id:"bc1",model:{display_name:"M"},workspace:{current_dir:"/x"},context_window:{remaining_percentage:99999999999999999999999}}' | bash ./statusline-command.sh | strip)
+  printf '%s' "$bigctx" | grep -q 'ctx' && bad "giant remaining rendered fake battery" || ok "giant remaining drops ctx segment"
+
   # panel daemon architecture: the hook must spool the payload, stay
   # silent on a cold cache, serve the cached frame instantly, and the
   # daemon (--once) must render a spool into that cache
