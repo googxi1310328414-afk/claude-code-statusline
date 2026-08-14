@@ -56,9 +56,24 @@ printf '%s' "$input" > "$panel_dir/spool.$key.new" 2>/dev/null
 
 # serve the latest rendered frame for this key - one tick behind live,
 # which for cumulative token counts/elapsed times is imperceptible
+printf -v hook_now '%(%s)T' -1
 if [ -r "$panel_dir/cache.$key" ]; then
   mapfile -t panel_cached < "$panel_dir/cache.$key" 2>/dev/null
-  [ "${#panel_cached[@]}" -gt 0 ] && printf '%s\n' "${panel_cached[@]}"
+  # FRESHNESS GATE (round-6): line 1 of the cache is the daemon's render
+  # epoch. Serving is refused past 60s so a cache nobody can refresh -
+  # daemon spawn failing under fork exhaustion, renderer script deleted -
+  # degrades to the host's default rows instead of replaying a frozen
+  # frame forever (elapsed times and token counts stuck but looking
+  # live; the bad_streak guard only covers frames the daemon actually
+  # renders, so it cannot help when the DAEMON is the missing part).
+  # An unstamped (pre-round-6) cache reads as stale and self-heals on
+  # the daemon's next successful render.
+  if [ "${#panel_cached[@]}" -gt 1 ] && [[ "${panel_cached[0]}" =~ ^[0-9]+$ ]]; then
+    cache_age=$(( hook_now - panel_cached[0] ))
+    if [ "$cache_age" -ge -60 ] && [ "$cache_age" -le 60 ]; then
+      printf '%s\n' "${panel_cached[@]:1}"
+    fi
+  fi
 fi
 
 # ensure the daemon is alive - kill -0 AND a fresh heartbeat (round-3
@@ -78,7 +93,6 @@ daemon_hb=""
 [ -r "$panel_dir/daemon.pid" ] && { read -r daemon_pid; read -r daemon_hb; } < "$panel_dir/daemon.pid" 2>/dev/null
 daemon_alive=0
 if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null && [[ "$daemon_hb" =~ ^[0-9]+$ ]]; then
-  printf -v hook_now '%(%s)T' -1
   hb_age=$(( hook_now - daemon_hb ))
   [ "$hb_age" -ge -60 ] && [ "$hb_age" -le 60 ] && daemon_alive=1
 fi

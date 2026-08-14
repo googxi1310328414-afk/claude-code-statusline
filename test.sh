@@ -299,7 +299,9 @@ if [ "$1" = "--assert" ]; then
   # R15: a renderer that exits 0 with EMPTY output must not clobber the
   # last good cache frame (fork-exhaustion blank-frame guard)
   printf '#!/bin/bash\nexit 0\n' > "$tmpd/emptyrender.sh"
-  printf '%s\n' '{"id":"tmo2","content":"GOOD_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.tmo2"
+  printf '%s
+%s
+' "$now" '{"id":"tmo2","content":"GOOD_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.tmo2"
   printf '{"columns":120,"tasks":[{"id":"tmo2","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.tmo2.new"
   STATUSLINE_PANEL_RENDERER="$tmpd/emptyrender.sh" bash ./statusline-panel-daemon.sh --once
   grep -q GOOD_FRAME "$STATUSLINE_PANEL_DIR/cache.tmo2" 2>/dev/null && ok "empty render keeps last good frame" || bad "empty render clobbered cache"
@@ -326,7 +328,9 @@ if [ "$1" = "--assert" ]; then
   # R17: three consecutive bad frames make the daemon EMPTY the cache
   # (honest degradation instead of serving stale numbers forever) -
   # needs the RESIDENT daemon since the streak lives in its memory
-  printf '%s\n' '{"id":"st1","content":"STALE_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.st1"
+  printf '%s
+%s
+' "$now" '{"id":"st1","content":"STALE_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.st1"
   STATUSLINE_PANEL_RENDERER="$tmpd/emptyrender.sh" STATUSLINE_PANEL_DIR="$STATUSLINE_PANEL_DIR" bash ./statusline-panel-daemon.sh &
   st_dpid=$!
   for _i in 1 2 3; do
@@ -399,6 +403,29 @@ if [ "$1" = "--assert" ]; then
   printf '20260809\x1fsess-OLD\x1f0\x1f500\x1f500\x1f%s\n' "$((now-432000))" >> "$STATUSLINE_DAILY_FILE"
   staleout=$(bash ./statusline-command.sh < fixtures/full.json | strip)
   printf '%s' "$staleout" | grep -q 'week \$' && ok "week renders alongside stale rollup row" || bad "stale rollup row broke week"
+  # ---- adversarial-review round-6 regression asserts (2026-08-14) ----
+  # R25: numeric fields arriving as STRINGS with newlines must not
+  # collapse the whole bar (every jq field now goes through clean)
+  prnl=$(jq -n '{session_id:"pn",model:{display_name:"M"},workspace:{current_dir:"/x"},pr:{number:"4
+2"}}' | bash ./statusline-command.sh | strip)
+  printf '%s' "$prnl" | grep -q 'degraded' && bad "string pr.number degraded whole bar" || ok "string pr.number survives clean"
+  costnl=$(jq -n '{session_id:"cn",model:{display_name:"M"},workspace:{current_dir:"/x"},cost:{total_cost_usd:"1
+2"}}' | bash ./statusline-command.sh | strip)
+  printf '%s' "$costnl" | grep -q 'degraded' && bad "string cost degraded whole bar" || ok "string cost survives clean"
+  # R26: 17-digit token counts must not wrap int64 into a fake full
+  # green battery - the segment disappears instead
+  wrapctx=$(jq -n '{session_id:"wc",model:{display_name:"M"},workspace:{current_dir:"/x"},context_window:{total_input_tokens:130000000000000000,context_window_size:200000,total_output_tokens:0}}' | bash ./statusline-command.sh | strip)
+  printf '%s' "$wrapctx" | grep -q 'ctx' && bad "wrapping token count rendered fake battery" || ok "over-cap token count drops ctx"
+  # R27: an unrefreshable cache must stop being served past 60s
+  printf '%s
+%s
+' "$((now-300))" '{"id":"old1","content":"FROZEN"}' > "$STATUSLINE_PANEL_DIR/cache.old1"
+  staleserve=$(printf '{"columns":120,"tasks":[{"id":"old1","label":"x","status":"running","tokenCount":5}]}' | bash ./statusline-panel-hook.sh)
+  printf '%s' "$staleserve" | grep -q FROZEN && bad "stale cache still served" || ok "stale cache refused (age gate)"
+  rm -f "$STATUSLINE_PANEL_DIR"/cache.old1 "$STATUSLINE_PANEL_DIR"/spool.old1.new 2>/dev/null
+  # R28: the panel caps tokenCount too (no fabricated spend)
+  wrappanel=$(jq -n '{columns:150,tasks:[{id:"wp",label:"L",status:"running",tokenCount:9999999999999999999,description:"d"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  printf '%s' "$wrappanel" | grep -q 'tok' && bad "panel rendered wrapped spend" || ok "over-cap panel tokenCount drops spend cell"
   : > "$STATUSLINE_DAILY_FILE"
 
   # panel daemon architecture: the hook must spool the payload, stay
@@ -407,7 +434,10 @@ if [ "$1" = "--assert" ]; then
   hookout=$(subagent_payload "$now" | bash ./statusline-panel-hook.sh)
   [ -f "$STATUSLINE_PANEL_DIR/spool.ms.new" ] && ok "panel hook spools payload" || bad "hook spool missing"
   [ -n "$hookout" ] && bad "hook emitted on cold cache" || ok "hook silent on cold cache"
-  printf '%s\n' '{"id":"ms","content":"CACHED_MARKER"}' > "$STATUSLINE_PANEL_DIR/cache.ms"
+  # cache format (round-6): line 1 = render epoch, rows follow
+  printf '%s
+%s
+' "$now" '{"id":"ms","content":"CACHED_MARKER"}' > "$STATUSLINE_PANEL_DIR/cache.ms"
   subagent_payload "$now" | bash ./statusline-panel-hook.sh | grep -q CACHED_MARKER && ok "panel hook serves cache" || bad "hook cache serve failed"
   bash ./statusline-panel-daemon.sh --once
   grep -q '"id":"ms"' "$STATUSLINE_PANEL_DIR/cache.ms" && ! grep -q CACHED_MARKER "$STATUSLINE_PANEL_DIR/cache.ms" && ok "panel daemon renders spool to cache" || bad "daemon render failed"

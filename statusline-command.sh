@@ -25,16 +25,15 @@ export LC_ALL=C.UTF-8
 # cheap either way since the file is kept capped at ~500 lines by this
 # same mechanism.
 statusline_err_log="$HOME/.claude/statusline-err.log"
-if [ -f "$statusline_err_log" ]; then
-  # BOUNDED read (-n 501): only the rotation THRESHOLD matters, so 501
-  # lines answer it - an unbounded mapfile re-read the whole log every
-  # frame (a storm can leave megabytes of "fork: retry" spam in one
-  # burst, which then taxed every later frame ~0.13s and made the very
-  # first post-storm frame slurp it all at the worst possible moment).
-  statusline_err_lines=()
-  mapfile -t -n 501 statusline_err_lines < "$statusline_err_log" 2>/dev/null
-  [ "${#statusline_err_lines[@]}" -gt 500 ] && : > "$statusline_err_log" 2>/dev/null
-fi
+# ROTATION MOVED OFF THE PER-FRAME PATH (round-6): this used to read up
+# to 501 log lines on EVERY frame just to decide whether to truncate.
+# After a fork storm leaves ~450 lines (~30KB) the file never crosses
+# the 500-line trip point, so every later frame paid a measured
+# ~60-100ms re-read before rendering even started - a permanent tax
+# bought by a check that almost never fires. The truncation now rides
+# the rare (~30min) history-rewrite path further down, where a single
+# `find -size` test decides it; the blackbox stays bounded, at a
+# cadence appropriate for a debug log.
 exec 2>>"$statusline_err_log"
 # Claude Code status line (detailed layout, ANSI colors, FOUR printed
 # lines, column-aligned, narrow-terminal adaptive)
@@ -393,6 +392,16 @@ jq_main_out=$(jq -r '
   # injection was demonstrated), and a raw TAB rendered at tabstop
   # width while counting as 1 char in the plain twin, skewing that
   # whole column of col_widths. Same def as the panel renderer.
+  # EVERY field gets clean (round-6): "numeric fields cannot carry
+  # control chars" only holds if they REALLY are numbers. A host or
+  # upstream that ships pr.number (or any numeric field) as a STRING
+  # with an embedded newline printed across two lines here, shifted
+  # every later F[] index, knocked the __END__ sentinel off F[30] and
+  # false-tripped the whole-bar "degraded (fork)" line; pr.number was
+  # additionally rendered verbatim with no numeric guard, so raw
+  # ESC/BEL in it reached the terminal (the OSC-injection class fixed
+  # for session_name in round 2). clean does tostring first, so a real
+  # numeric 42 passes through untouched.
   def clean: tostring | gsub("[\t\n\r]"; " ") | gsub("[\u0001-\u001f]"; "");
   (.session_id // "" | clean),
   (.model.display_name // "" | clean),
@@ -404,23 +413,23 @@ jq_main_out=$(jq -r '
   (.workspace.repo.host // "github.com" | clean),
   (.worktree.name // "" | clean),
   (.worktree.branch // "" | clean),
-  (.pr.number // ""),
+  (.pr.number // "" | clean),
   (.pr.review_state // "" | clean),
   (.pr.url // "" | clean),
-  (.context_window.remaining_percentage // ""),
-  (.context_window.total_input_tokens // ""),
-  (.context_window.context_window_size // ""),
-  (.context_window.total_output_tokens // ""),
-  (.context_window.current_usage.cache_read_input_tokens // ""),
-  (.context_window.current_usage.cache_creation_input_tokens // ""),
-  (.context_window.current_usage.input_tokens // ""),
-  (.cost.total_cost_usd // ""),
-  (.cost.total_lines_added // ""),
-  (.cost.total_lines_removed // ""),
-  (.rate_limits.five_hour.used_percentage // ""),
-  (.rate_limits.five_hour.resets_at // ""),
-  (.rate_limits.seven_day.used_percentage // ""),
-  (.rate_limits.seven_day.resets_at // ""),
+  (.context_window.remaining_percentage // "" | clean),
+  (.context_window.total_input_tokens // "" | clean),
+  (.context_window.context_window_size // "" | clean),
+  (.context_window.total_output_tokens // "" | clean),
+  (.context_window.current_usage.cache_read_input_tokens // "" | clean),
+  (.context_window.current_usage.cache_creation_input_tokens // "" | clean),
+  (.context_window.current_usage.input_tokens // "" | clean),
+  (.cost.total_cost_usd // "" | clean),
+  (.cost.total_lines_added // "" | clean),
+  (.cost.total_lines_removed // "" | clean),
+  (.rate_limits.five_hour.used_percentage // "" | clean),
+  (.rate_limits.five_hour.resets_at // "" | clean),
+  (.rate_limits.seven_day.used_percentage // "" | clean),
+  (.rate_limits.seven_day.resets_at // "" | clean),
   (.session_name // "" | clean),
   (.transcript_path // "" | clean),
   (.model.id // "" | clean),
@@ -482,6 +491,23 @@ out_tokens_ctx="${F[16]}"; cache_r="${F[17]}"; cache_w="${F[18]}";  cache_i="${F
 cost="${F[20]}";         added="${F[21]}";     removed="${F[22]}"
 five="${F[23]}";         five_reset="${F[24]}"; week="${F[25]}";   week_reset="${F[26]}"
 session_name="${F[27]}"; transcript_path="${F[28]}"; model_id="${F[29]}"
+
+# NUMERIC MAGNITUDE NORMALIZATION (round-6): every numeric field is
+# capped at 12 digits AT THE SOURCE, once, instead of at each use site.
+# Bash arithmetic is int64: a 17-18 digit token count (each value still
+# inside int64, so `[ -gt ]` never errors) made `occupied*100` and
+# `cache_r*1000` WRAP AROUND silently - the wrap rendered a full green
+# "ctx █████ 100%" all-clear on a payload that was nothing of the sort,
+# or a fake "!░░░░│ 0%" alarm, plus 13-digit token text that blew the
+# whole 4-line grid's column widths apart. Over-cap values are blanked,
+# so the segment disappears (the project's "never render a fake
+# reading" line) instead of lying. Same discipline as the {1,3}/{1,9}/
+# {1,13} caps on remaining/cost/resets_at.
+for _numf in in_tokens win_size out_tokens_ctx cache_r cache_w cache_i added removed; do
+  if [ -n "${!_numf}" ] && [[ ! "${!_numf}" =~ ^[0-9]{1,12}$ ]]; then
+    printf -v "$_numf" '%s' ""
+  fi
+done
 
 # model display SYNCED with the panel's naming (user request): when
 # .model.id is present, the short id form replaces display_name - strip
@@ -1055,6 +1081,11 @@ if [ -n "$session_id" ] && [ "$should_append" -eq 1 ]; then
     hist_state_dir="${history_file%/*}"
     [ "$hist_state_dir" = "$history_file" ] && hist_state_dir="."
     find "$hist_state_dir" -maxdepth 1 -name 'statusline-*.tmp.*' -mmin +30 -delete 2>/dev/null
+    # blackbox rotation rides this same rare path (see the note at the
+    # top of the script): one size test, no per-frame cost
+    if [ -n "$(find "${statusline_err_log%/*}" -maxdepth 1 -name "${statusline_err_log##*/}" -size +64k -print -quit 2>/dev/null)" ]; then
+      : > "$statusline_err_log" 2>/dev/null
+    fi
   else
     printf '%s\n' "$new_hist_line" >> "$history_file" 2>/dev/null
   fi
@@ -2389,7 +2420,14 @@ if [ -f "$usage_cache_file" ]; then
         m_name="${usage_fields[$fi]}"
         m_pct="${usage_fields[$((fi+1))]}"
         [ -z "$m_name" ] && continue
-        [[ "$m_pct" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
+        # {1,3} cap + clamp (round-6): this comes from the UNOFFICIAL
+        # usage endpoint, and an out-of-int64 percent made BOTH -ge
+        # tier tests fail with status 2, silently falling through to
+        # the green default while printf happily rendered a 20-digit
+        # "wk Fab100000000000000000000%" - the exact opposite of this
+        # block's own "degrade to segment absent rather than show
+        # garbage" promise.
+        [[ "$m_pct" =~ ^[0-9]{1,3}(\.[0-9]+)?$ ]] || continue
         m_pct_int="${m_pct%%.*}"
         [ "$m_pct_int" -lt 50 ] && continue
         cand_names+=("$m_name")
@@ -2459,7 +2497,7 @@ if [ -f "$usage_cache_file" ]; then
         wk_plain="wk ${wk_model_parts_plain}"
       fi
       # extra usage (cents/100, 2dp): gray "extra " + white "$used/$limit"
-      if [ "$usage_extra_en" = "1" ] && [[ "$usage_extra_used" =~ ^[0-9]+$ ]] && [[ "$usage_extra_limit" =~ ^[0-9]+$ ]]; then
+      if [ "$usage_extra_en" = "1" ] && [[ "$usage_extra_used" =~ ^[0-9]{1,12}$ ]] && [[ "$usage_extra_limit" =~ ^[0-9]{1,12}$ ]]; then
         printf -v extra_used_fmt '%d.%02d' "$(( usage_extra_used / 100 ))" "$(( usage_extra_used % 100 ))"
         printf -v extra_limit_fmt '%d.%02d' "$(( usage_extra_limit / 100 ))" "$(( usage_extra_limit % 100 ))"
         extra_seg="${GRAY}extra${RESET} ${WHITE}\$${extra_used_fmt}/\$${extra_limit_fmt}${RESET}"
@@ -2693,23 +2731,31 @@ else
   [ "${#parts3[@]}" -gt "$max_cols" ] && max_cols=${#parts3[@]}
   [ "${#parts4[@]}" -gt "$max_cols" ] && max_cols=${#parts4[@]}
 
+  # WIDTH MEMO (round-6): every cell's width is measured ONCE here and
+  # kept in parallel parts{N}_w arrays; render_line looks them up
+  # instead of re-measuring. disp_width walks a string character by
+  # character, and ${s:i:1} on UTF-8 is an O(i) byte scan, so a cell
+  # holding the battery/sparkline/arrow glyphs costs real time - the
+  # second measurement pass was a measured ~13ms of pure duplicate work
+  # per frame.
   col_widths=()
+  parts1_w=(); parts2_w=(); parts3_w=(); parts4_w=()
   for ((ci=0; ci<max_cols; ci++)); do
     w=0
     if [ "$ci" -lt "${#parts1_plain[@]}" ]; then
-      disp_width "${parts1_plain[$ci]}"; l="$REPLY"
+      disp_width "${parts1_plain[$ci]}"; l="$REPLY"; parts1_w+=("$l")
       [ "$l" -gt "$w" ] && w=$l
     fi
     if [ "$ci" -lt "${#parts2_plain[@]}" ]; then
-      disp_width "${parts2_plain[$ci]}"; l="$REPLY"
+      disp_width "${parts2_plain[$ci]}"; l="$REPLY"; parts2_w+=("$l")
       [ "$l" -gt "$w" ] && w=$l
     fi
     if [ "$ci" -lt "${#parts3_plain[@]}" ]; then
-      disp_width "${parts3_plain[$ci]}"; l="$REPLY"
+      disp_width "${parts3_plain[$ci]}"; l="$REPLY"; parts3_w+=("$l")
       [ "$l" -gt "$w" ] && w=$l
     fi
     if [ "$ci" -lt "${#parts4_plain[@]}" ]; then
-      disp_width "${parts4_plain[$ci]}"; l="$REPLY"
+      disp_width "${parts4_plain[$ci]}"; l="$REPLY"; parts4_w+=("$l")
       [ "$l" -gt "$w" ] && w=$l
     fi
     col_widths+=("$w")
@@ -2725,12 +2771,13 @@ else
   render_line() {
     local -n cparts="$1"
     local -n pparts="$2"
+    local -n wparts="$3"
     local n=${#cparts[@]}
     local out="" ci cell plen w pad padding
     for ((ci=0; ci<n; ci++)); do
       cell="${cparts[$ci]}"
       if [ "$ci" -lt "$((n-1))" ]; then
-        disp_width "${pparts[$ci]}"; plen="$REPLY"
+        plen="${wparts[$ci]}"
         w="${col_widths[$ci]}"
         pad=$(( w - plen ))
         padding=""
@@ -2746,10 +2793,10 @@ else
     REPLY="$out"
   }
 
-  render_line parts1 parts1_plain; line1="$REPLY"
-  render_line parts2 parts2_plain; line2="$REPLY"
-  render_line parts3 parts3_plain; line3="$REPLY"
-  render_line parts4 parts4_plain; line4="$REPLY"
+  render_line parts1 parts1_plain parts1_w; line1="$REPLY"
+  render_line parts2 parts2_plain parts2_w; line2="$REPLY"
+  render_line parts3 parts3_plain parts3_w; line3="$REPLY"
+  render_line parts4 parts4_plain parts4_w; line4="$REPLY"
 
   printf '%s\n' "${RESET}${line1}${RESET}"
   [ -n "$line2" ] && printf '%s\n' "${RESET}${line2}${RESET}"

@@ -13,3 +13,5 @@ out*.txt
 run_repro.sh
 run_control.sh
 *.fifo
+test-home*/
+test-out.*

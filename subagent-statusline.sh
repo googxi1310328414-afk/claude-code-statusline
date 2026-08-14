@@ -436,6 +436,7 @@ col2_c=(); col2_p=()   # sparkline+rate
 col3_c=(); col3_p=()   # token share
 col4_c=(); col4_p=()   # elapsed
 col5_c=(); col5_p=()   # model (standalone cell; rendered 2nd, see active_cols)
+col0_w=(); col1_w=(); col2_w=(); col3_w=(); col4_w=(); col5_w=()  # width memo
 col_max=(0 0 0 0 0 0)
 
 jl_count=${#JL[@]}
@@ -459,6 +460,14 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # rendered as C:\\Users\\... and were width-budgeted at the inflated
   # length. Enum-shaped fields (status/effort/model id) can't carry
   # backslashes and skip the expansion.
+  # NUMERIC MAGNITUDE CAPS (round-6, same discipline as the main bar):
+  # bash arithmetic is int64, so an 18-19 digit tokenCount wrapped
+  # around inside (token_count+500)/1000 and rendered a FABRICATED
+  # spend figure; an over-long startTime produced an absurd elapsed
+  # time. Over-cap values are blanked here, once, so the cells simply
+  # disappear rather than showing invented numbers.
+  [[ "$token_count" =~ ^[0-9]{1,12}$ ]] || token_count=""
+  [[ "$start_time" =~ ^[0-9]{1,15}$ ]] || start_time=""
   identity_plain=${identity_plain//"$BSL2"/"$BSL1"}
   task_type=${task_type//"$BSL2"/"$BSL1"}
   description=${description//"$BSL2"/"$BSL1"}
@@ -742,17 +751,23 @@ for ((ti=0; ti<task_count_total; ti++)); do
   col3_c+=("$share_seg");     col3_p+=("$share_plain")
   col4_c+=("$elapsed_seg");   col4_p+=("$elapsed_plain")
 
-  disp_width "$seg1_plain"; dw0="$REPLY"
-  disp_width "$spend_plain"; dw1="$REPLY"
-  disp_width "$sparkburn_plain"; dw2="$REPLY"
-  disp_width "$share_plain"; dw3="$REPLY"
-  disp_width "$elapsed_plain"; dw4="$REPLY"
+  # WIDTH MEMO (round-6): PASS 1 already measures every cell; keep the
+  # per-row results in parallel col{N}_w arrays so PASS 2 can look them
+  # up instead of re-measuring. disp_width walks characters and
+  # ${s:i:1} is an O(i) byte scan on UTF-8, so a CJK identity cell cost
+  # a measured ~3ms EACH - a 6-row panel paid ~15-25ms of pure
+  # duplicate work inside the daemon's render child every tick.
+  disp_width "$seg1_plain"; dw0="$REPLY"; col0_w+=("$dw0")
+  disp_width "$spend_plain"; dw1="$REPLY"; col1_w+=("$dw1")
+  disp_width "$sparkburn_plain"; dw2="$REPLY"; col2_w+=("$dw2")
+  disp_width "$share_plain"; dw3="$REPLY"; col3_w+=("$dw3")
+  disp_width "$elapsed_plain"; dw4="$REPLY"; col4_w+=("$dw4")
   [ "$dw0" -gt "${col_max[0]}" ] && col_max[0]=$dw0
   [ "$dw1" -gt "${col_max[1]}" ] && col_max[1]=$dw1
   [ "$dw2" -gt "${col_max[2]}" ] && col_max[2]=$dw2
   [ "$dw3" -gt "${col_max[3]}" ] && col_max[3]=$dw3
   [ "$dw4" -gt "${col_max[4]}" ] && col_max[4]=$dw4
-  disp_width "$model_plain"; dw5="$REPLY"
+  disp_width "$model_plain"; dw5="$REPLY"; col5_w+=("$dw5")
   [ "$dw5" -gt "${col_max[5]}" ] && col_max[5]=$dw5
 done
 
@@ -891,23 +906,23 @@ for ((r=0; r<row_total; r++)); do
       if [ "$ai" -lt "$active_col_count" ]; then
         ci="${active_cols[$ai]}"
         case $ci in
-          0) cell_c="${col0_c[$r]}"; cell_p="${col0_p[$r]}" ;;
-          1) cell_c="${col1_c[$r]}"; cell_p="${col1_p[$r]}" ;;
-          2) cell_c="${col2_c[$r]}"; cell_p="${col2_p[$r]}" ;;
-          3) cell_c="${col3_c[$r]}"; cell_p="${col3_p[$r]}" ;;
-          4) cell_c="${col4_c[$r]}"; cell_p="${col4_p[$r]}" ;;
-          5) cell_c="${col5_c[$r]}"; cell_p="${col5_p[$r]}" ;;
+          0) cell_c="${col0_c[$r]}"; cell_w="${col0_w[$r]}" ;;
+          1) cell_c="${col1_c[$r]}"; cell_w="${col1_w[$r]}" ;;
+          2) cell_c="${col2_c[$r]}"; cell_w="${col2_w[$r]}" ;;
+          3) cell_c="${col3_c[$r]}"; cell_w="${col3_w[$r]}" ;;
+          4) cell_c="${col4_c[$r]}"; cell_w="${col4_w[$r]}" ;;
+          5) cell_c="${col5_c[$r]}"; cell_w="${col5_w[$r]}" ;;
         esac
         w="${col_max[$ci]}"
       else
         cell_c="$desc_seg"
-        cell_p=""
+        cell_w=0
         w=0
       fi
       if [ "$ai" -eq "$row_last_idx" ]; then
         row="${row}${cell_c}"
       else
-        disp_width "$cell_p"; plen="$REPLY"
+        plen="$cell_w"
         pad=$(( w - plen ))
         padding=""
         if [ "$pad" -gt 0 ]; then

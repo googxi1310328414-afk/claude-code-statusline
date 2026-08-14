@@ -191,7 +191,8 @@ while :; do
     # per render sidesteps that entirely
     render_seq=$(( render_seq + 1 ))
     cache_tmp="$panel_dir/cache.$key.tmp.$$.$render_seq"
-    bash "$renderer" < "$panel_dir/render.$key" > "$cache_tmp" 2>>"$err_log" &
+    raw_tmp="$cache_tmp.raw"
+    bash "$renderer" < "$panel_dir/render.$key" > "$raw_tmp" 2>>"$err_log" &
     r_pid=$!
     r_waited=0
     while kill -0 "$r_pid" 2>/dev/null; do
@@ -214,19 +215,33 @@ while :; do
       # retries with a fresh payload)
       kill "$r_pid" 2>/dev/null
       wait "$r_pid" 2>/dev/null
-      rm -f "$cache_tmp" 2>/dev/null
+      rm -f "$cache_tmp" "$raw_tmp" 2>/dev/null
       frame_bad=1
-    elif wait "$r_pid" 2>/dev/null && [ -s "$cache_tmp" ]; then
+    elif wait "$r_pid" 2>/dev/null && [ -s "$raw_tmp" ]; then
       # -s gate: a renderer that exits 0 with EMPTY output (fork
       # exhaustion makes its jq capture come back blank and the script
       # end cleanly with no rows) must NOT overwrite the last good frame
       # with a zero-byte cache - the hook would then serve nothing and
       # every session's panel would blank precisely during the storms
       # this cache exists to ride out. Skip the frame instead.
-      mv -f "$cache_tmp" "$panel_dir/cache.$key" 2>/dev/null
+      # STAMPED CACHE (round-6): line 1 is the render epoch, the rows
+      # follow. The hook refuses to serve a stamp older than 60s, which
+      # closes the last "panel lies" window: bad_streak only protects
+      # frames the daemon actually renders, so when the DAEMON ITSELF
+      # cannot run (spawn failing under fork exhaustion, script deleted)
+      # the hook used to replay the last good frame forever - running
+      # agents frozen at the same elapsed time, indistinguishable from
+      # live. All builtins (mapfile+printf), no extra fork.
+      mapfile -t _rows < "$raw_tmp" 2>/dev/null
+      rm -f "$raw_tmp" 2>/dev/null
+      printf -v _cache_ep '%(%s)T' -1
+      { printf '%s
+' "$_cache_ep"; printf '%s
+' "${_rows[@]}"; } > "$cache_tmp" 2>/dev/null &&
+        mv -f "$cache_tmp" "$panel_dir/cache.$key" 2>/dev/null
       bad_streak[$key]=0
     else
-      rm -f "$cache_tmp" 2>/dev/null
+      rm -f "$cache_tmp" "$raw_tmp" 2>/dev/null
       frame_bad=1
     fi
     if [ "$frame_bad" -eq 1 ]; then
