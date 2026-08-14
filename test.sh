@@ -525,6 +525,34 @@ sleep 60
   ht_el=$(( SECONDS - ht_t0 ))
   [ "$ht_el" -lt 12 ] && ok "TERM-immune render child does not wedge daemon (${ht_el}s)" || bad "daemon wedged by TERM-immune child (${ht_el}s)"
   rm -f "$STATUSLINE_PANEL_DIR"/render.ht1 "$STATUSLINE_PANEL_DIR"/cache.ht1* 2>/dev/null
+  # ---- adversarial-review round-9 regression asserts (2026-08-14) ----
+  # R36: the hook must REAP a wedged daemon (alive pid, frozen
+  # heartbeat) before spawning a replacement - not doing so minted a
+  # new permanent process every ~65s (78 orphans / 22 CPU-hours found
+  # on the real machine)
+  sleep 300 &
+  fake_wedged=$!
+  printf '%s
+%s
+' "$fake_wedged" "$((now-600))" > "$STATUSLINE_PANEL_DIR/daemon.pid"
+  printf '{"columns":120,"tasks":[{"id":"rp1","label":"x","status":"running","tokenCount":5}]}' | STATUSLINE_PANEL_DAEMON=/dev/null bash ./statusline-panel-hook.sh >/dev/null 2>&1
+  sleep 0.5
+  if kill -0 "$fake_wedged" 2>/dev/null; then
+    ok "hook spares a non-daemon pid (recycled-pid safety)"
+    kill "$fake_wedged" 2>/dev/null
+  else
+    bad "hook killed an unrelated process"
+  fi
+  rm -f "$STATUSLINE_PANEL_DIR/daemon.pid" "$STATUSLINE_PANEL_DIR"/spool.rp1.new 2>/dev/null
+  # R37: hb_beat must not freeze on a backwards clock step (negative
+  # delta is also "< 5", which froze the beat for the whole rollback)
+  grep -q 'hb_delta' ./statusline-panel-daemon.sh && ok "hb_beat has a negative-delta guard" || bad "hb_beat missing clock-rollback guard"
+  # R38: the daemon must carry an absolute lifetime cap so a wedge
+  # anywhere outside the beat checkpoints still terminates
+  grep -q 'daemon_max_life' ./statusline-panel-daemon.sh && ok "daemon has an absolute lifetime cap" || bad "daemon lifetime cap missing"
+  # R39: the installer must reclaim EVERY daemon instance, not just a
+  # freshly-registered one
+  grep -qE "pgrep -f 'statusline-panel-daemon|statusline-panel-daemon\\.sh'" ./install.sh && ok "installer reclaims all daemon instances" || bad "installer still reclaims only the registered pid"
   : > "$STATUSLINE_DAILY_FILE"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
   : > "$STATUSLINE_DAILY_FILE"

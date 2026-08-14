@@ -68,26 +68,41 @@ done
 # 脚本(subagent-statusline.sh)不用重启——daemon 每帧都是新的子进程读盘。
 if [ "$daemon_updated" -eq 1 ]; then
   daemon_pid_file="$CLAUDE_DIR/statusline-panel.d/daemon.pid"
-  old_dp=""
-  old_hb=""
-  [ -r "$daemon_pid_file" ] && { read -r old_dp; read -r old_hb; } < "$daemon_pid_file" 2>/dev/null
-  # 与钩子/接管同一套判活（数字 pid + 心跳 60s 内 + kill -0）——残留 pid
-  # 被系统回收给无关进程时，裸 kill 会把 SIGTERM 发给无辜进程（另一
-  # 会话的 bash/git 都可能中招）；判不活就只删 pid 文件
-  old_alive=0
-  if [[ "$old_dp" =~ ^[0-9]+$ ]] && [[ "$old_hb" =~ ^[0-9]+$ ]]; then
-    now_i=$(date +%s)
-    hb_age=$(( now_i - old_hb ))
-    [ "$hb_age" -ge -60 ] && [ "$hb_age" -le 60 ] && kill -0 "$old_dp" 2>/dev/null && old_alive=1
+  # 全量回收（round-9，事故驱动）：旧版只读 pid 文件里那一个、且只在
+  # 「心跳新鲜」时才杀——恰好把真正该回收的卡死实例排除在外（它心跳
+  # 必然陈旧），未注册的堆叠实例更是够不到。实测后果：本机曾累积 78 个
+  # 孤儿 daemon 常驻烧掉 22 CPU 小时，且全都在跑旧代码。现按命令行匹配
+  # 杀掉**所有**面板 daemon（它们是本项目自己的进程、名字唯一），下一拍
+  # 钩子会以新版拉起一个。
+  list_daemons() {
+    if command -v pgrep >/dev/null 2>&1; then
+      pgrep -f 'statusline-panel-daemon\.sh' 2>/dev/null
+    else
+      ps -ef 2>/dev/null | grep 'statusline-panel-daemon\.sh' | grep -v grep | awk '{print $2}'
+    fi
+  }
+  recycled=0
+  for dp in $(list_daemons); do
+    [ "$dp" = "$$" ] && continue
+    kill "$dp" 2>/dev/null && recycled=$(( recycled + 1 ))
+  done
+  # TERM 未必立刻生效（阻塞在 read/fifo 的实例可能拖一拍），补一轮 KILL：
+  # 回收不彻底就等于「新版装好了、旧代码还在跑」，正是本次事故的形态
+  sleep 1
+  for dp in $(list_daemons); do
+    [ "$dp" = "$$" ] && continue
+    kill -9 "$dp" 2>/dev/null
+  done
+  # Windows 侧兜底清扫（实测必需）：cygwin 的 ps 看不到全部实例——孤儿
+  # daemon 可以在 Windows 进程表里活着而 `ps -ef` 一行都不显示，正是 78
+  # 个孤儿能长期幸存、每个还在跑旧代码的直接原因。按命令行匹配（名字是
+  # 本项目独有）做一次 Windows 侧回收。
+  if command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \"Name='bash.exe'\" | Where-Object { \$_.CommandLine -match 'statusline-panel-daemon' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1
   fi
-  if [ "$old_alive" -eq 1 ]; then
-    kill "$old_dp" 2>/dev/null
-    say "✓ 旧面板 daemon(pid $old_dp) 已回收——下一拍面板钩子自动以新版拉起"
-  fi
-  # 被 SIGTERM 杀掉的 daemon 走不到退出清理——顺手删掉 pid 文件，
-  # 免得残留 pid 被系统回收给无关进程后欺骗钩子的探活（心跳机制
-  # 是主防线，这里是零成本的辅助卫生）
-  rm -f "$daemon_pid_file" 2>/dev/null
+  [ "$recycled" -gt 0 ] && say "✓ 已回收 $recycled 个旧面板 daemon——下一拍钩子自动以新版拉起"
+  # pid 文件与在途渲染残骸一并清掉，避免新实例读到陈旧注册
+  rm -f "$daemon_pid_file" "$CLAUDE_DIR/statusline-panel.d"/render.* "$CLAUDE_DIR/statusline-panel.d"/*.raw 2>/dev/null
 fi
 
 # ---------- settings.json 合并（保留既有键；失败不落地） ----------

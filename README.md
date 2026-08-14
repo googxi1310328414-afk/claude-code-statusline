@@ -63,7 +63,7 @@ curl -fsSL https://raw.githubusercontent.com/googxi1310328414-afk/claude-code-st
 ```bash
 bash test.sh            # 渲染演示（终端看真色彩）
 bash test.sh --codes    # ANSI 码可视化
-bash test.sh --assert   # 90 项断言（CI 用，含性能门槛与八轮对抗审查回归组）
+bash test.sh --assert   # 94 项断言（CI 用，含性能门槛与九轮对抗审查回归组）
 ```
 
 GitHub Actions 在每次 push 自动跑断言套件。
@@ -79,7 +79,7 @@ GitHub Actions 在每次 push 自动跑断言套件。
 5. **忙碌回合**：主栏**画面**冻结在回合开始帧，但**调用照常**（状态文件持续新鲜，回合结束瞬间回正）；子代理面板不受此限、全程实时。
 6. **采样与刷新的配比**：主栏 10s 刷新 × 30s 采样节流 = 每三帧记一次历史（走势每格≈30s，整图窗口 ~4.5 分钟）；面板宿主 ~5s 节拍 × 10s 采样 = 每两帧一样（每格≈10s）。刷新间隔管"画面多新"，采样节流管"走势每格多长"——两个旋钮独立调。
 7. **自愈层（可选，Windows）**：`statusline-watchdog.ps1` 由计划任务每 2 分钟清理挂死 >30s 的渲染 bash（fork 枯竭下的兜底）；**必须经 `statusline-watchdog.vbs`（wscript）拉起**——计划任务直接跑 powershell 会在 `-WindowStyle Hidden` 生效前闪一下控制台窗口。两文件复制到 `~/.claude/`（vbs 经 `%USERPROFILE%` 运行时解析路径，任意用户开箱即用、无需改内容；**vbs 必须保持纯 ASCII**——wscript 按系统 ANSI 码页解析，UTF-8 中文注释会在 GBK 下吞换行、把真代码吞进注释，实锤过每 2 分钟弹错误框，test.sh 有断言防复发）后：`schtasks /Create /SC MINUTE /MO 2 /TN claude-statusline-watchdog /TR "wscript.exe C:\Users\<你>\.claude\statusline-watchdog.vbs"`。
-8. **面板常驻 daemon**：subagentStatusLine 命令指向 `statusline-panel-hook.sh`——钩子只做"倒载荷 + 秒回上一帧缓存"（纯内建，稳态零派生，延迟≈bash 启动的毫秒级），真正的渲染由 `statusline-panel-daemon.sh` 异步完成（内容滞后一拍 ~5s，对累计 token/用时无感知）。宿主重画面板是"先默认行、钩子返回才替换"，钩子延迟=默认行闪烁窗口——daemon 化把它从整段渲染耗时（~300ms）压到毫秒级。缓存键=载荷首任务 id（并发会话任务集不相交，天然各用各的缓存）；面板缓存首行为渲染纪元、钩子拒供 >60s 陈旧帧（daemon 起不来时诚实降级为默认行而非永久回放冻结帧）；daemon 单实例（noclobber 抢占；pid 文件两行协议 pid+心跳，daemon 墙钟 5s 原子刷新心跳、钩子/接管/install 三处判活统一"kill -0 + 心跳 60s 内"——残留 pid 被系统回收给无关进程时不再死锁或误杀；陈旧 pid 接管走"删除+独占重建"而非裸覆写，退出删除先验证 pid 归属——并发接管不再互踩）、无活 2 分钟自灭、死了由下一拍钩子拉起；**挂死的渲染子进程由 daemon 自身硬超时截杀跳帧**（默认 15s，`STATUSLINE_PANEL_RENDER_TIMEOUT` 可调，约为正常渲染的 50 倍——此前无超时，子进程一挂 daemon 即永久卡死、探活却始终"存活"，全部会话面板冻结在旧帧且默认安装无任何恢复路径；第 7 条看门狗仍是外层保险）——全链路自愈，无需手工管理。状态目录 `~/.claude/statusline-panel.d/`。
+8. **面板常驻 daemon**：subagentStatusLine 命令指向 `statusline-panel-hook.sh`——钩子只做"倒载荷 + 秒回上一帧缓存"（纯内建，稳态零派生，延迟≈bash 启动的毫秒级），真正的渲染由 `statusline-panel-daemon.sh` 异步完成（内容滞后一拍 ~5s，对累计 token/用时无感知）。宿主重画面板是"先默认行、钩子返回才替换"，钩子延迟=默认行闪烁窗口——daemon 化把它从整段渲染耗时（~300ms）压到毫秒级。缓存键=载荷首任务 id（并发会话任务集不相交，天然各用各的缓存）；面板缓存首行为渲染纪元、钩子拒供 >60s 陈旧帧（daemon 起不来时诚实降级为默认行而非永久回放冻结帧）；daemon 单实例（noclobber 抢占；pid 文件两行协议 pid+心跳，daemon 墙钟 5s 原子刷新心跳、钩子/接管/install 三处判活统一"kill -0 + 心跳 60s 内"——残留 pid 被系统回收给无关进程时不再死锁或误杀；陈旧 pid 接管走"删除+独占重建"而非裸覆写，退出删除先验证 pid 归属——并发接管不再互踩）、无活 2 分钟自灭、死了由下一拍钩子拉起；**挂死的渲染子进程由 daemon 自身硬超时截杀跳帧**（默认 15s，`STATUSLINE_PANEL_RENDER_TIMEOUT` 可调，约为正常渲染的 50 倍——此前无超时，子进程一挂 daemon 即永久卡死、探活却始终"存活"，全部会话面板冻结在旧帧且默认安装无任何恢复路径；第 7 条看门狗现按**心跳陈旧**判据纳入 daemon 回收，钩子发现「pid 活着但心跳冻结」会先杀后拉，daemon 另有绝对寿命闸 1 小时（`STATUSLINE_PANEL_DAEMON_MAX_LIFE`）——2026-08-14 实测过一次事故：一个卡死实例使钩子每 ~65 秒拉起一个新 daemon，累计 **78 个孤儿常驻烧掉 22 CPU 小时**，当时无任何组件负责回收；另注意 **cygwin 的 `ps` 看不到全部实例**，回收必须走 Windows 进程表）——全链路自愈，无需手工管理。状态目录 `~/.claude/statusline-panel.d/`。
 
 ## 已知边界
 

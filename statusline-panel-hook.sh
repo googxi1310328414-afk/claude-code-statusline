@@ -97,6 +97,24 @@ if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null && [[ "$daemon_hb" 
   [ "$hb_age" -ge -60 ] && [ "$hb_age" -le 60 ] && daemon_alive=1
 fi
 if [ "$daemon_alive" -eq 0 ]; then
+  # REAP BEFORE RESPAWN (round-9, after a real incident: 78 orphaned
+  # daemons burning 22 CPU-hours were found on the dev machine). A
+  # registered pid that is ALIVE but whose heartbeat froze means the
+  # daemon wedged somewhere it can no longer beat from. The old code
+  # just spawned a replacement and walked away - nothing anywhere ever
+  # reaped the wedged one (the daemon's own takeover only rm's the pid
+  # file, install only kills a FRESH-heartbeat instance, and the
+  # watchdog deliberately skips daemons), so one wedge minted a new
+  # permanent process every ~65s forever. Killing is safe against pid
+  # recycling because the pid came from OUR pid file AND we verify the
+  # process is really a panel daemon before signalling.
+  if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+    _cmd=""
+    [ -r "/proc/$daemon_pid/cmdline" ] && read -r _cmd < "/proc/$daemon_pid/cmdline" 2>/dev/null
+    case "$_cmd" in
+      *statusline-panel-daemon*) kill "$daemon_pid" 2>/dev/null; kill -9 "$daemon_pid" 2>/dev/null ;;
+    esac
+  fi
   ( bash "$panel_daemon" </dev/null >/dev/null 2>&1 & )
 fi
 exit 0

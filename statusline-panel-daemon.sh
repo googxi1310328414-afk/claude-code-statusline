@@ -113,6 +113,15 @@ fi
 tick_fifo="$panel_dir/.tick.fifo"
 [ -p "$tick_fifo" ] || mkfifo "$tick_fifo" 2>/dev/null
 
+# ABSOLUTE LIFETIME CAP (round-9): a daemon that wedges ANYWHERE
+# outside the beat checkpoints can no longer be detected by its own
+# logic - and the 78-orphan incident proved nothing else reaps it
+# either. SECONDS is bash-internal (no clock dependency, no fork), so
+# even a fully wedged loop that still cycles will hit this ceiling and
+# exit; a live session simply gets a fresh instance from the next hook
+# tick (cold-missing one frame, the same cost as any respawn).
+daemon_max_life="${STATUSLINE_PANEL_DAEMON_MAX_LIFE:-3600}"
+[[ "$daemon_max_life" =~ ^[0-9]+$ ]] || daemon_max_life=3600
 shopt -s nullglob
 idle=0
 render_seq=0
@@ -144,7 +153,18 @@ last_hb=0
 hb_beat() {
   [ "$once" -eq 1 ] && return 0
   printf -v hb_t '%(%s)T' -1
-  [ $(( hb_t - last_hb )) -lt 5 ] && return 0
+  # CLOCK-ROLLBACK GUARD (round-9): a backwards clock step makes the
+  # delta NEGATIVE, which is also "< 5" - the beat then froze for the
+  # entire rollback span, the hook judged this healthy daemon dead and
+  # spawned a rival, and this instance could never reach the concede
+  # branch below because it kept returning on this very line. Every
+  # other clock comparison in this project already carries this guard.
+  hb_delta=$(( hb_t - last_hb ))
+  if [ "$hb_delta" -lt 0 ]; then
+    last_hb=$hb_t
+  elif [ "$hb_delta" -lt 5 ]; then
+    return 0
+  fi
   last_hb=$hb_t
   hb_cur=""
   [ -r "$panel_dir/daemon.pid" ] && read -r hb_cur < "$panel_dir/daemon.pid"
@@ -288,6 +308,7 @@ while :; do
     idle=$(( idle + 1 ))
   fi
   [ "$idle" -ge 400 ] && break
+  [ "$once" -eq 0 ] && [ "$SECONDS" -ge "$daemon_max_life" ] && break
   if [ -p "$tick_fifo" ]; then
     read -t 0.3 -r _tick <> "$tick_fifo" 2>/dev/null
   else
