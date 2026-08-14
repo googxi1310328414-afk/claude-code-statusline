@@ -17,3 +17,5 @@ test-home*/
 test-out.*
 innocent.txt
 mg.sh
+extracted_*.bin
+*.bin
