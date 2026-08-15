@@ -24,7 +24,12 @@ die() { printf '✗ %s\n' "$*" >&2; exit 1; }
 
 # ---------- 前置检查 ----------
 [ -n "${BASH_VERSINFO:-}" ] || die "需要 bash 运行本安装器"
-[ "${BASH_VERSINFO[0]}" -ge 4 ] || die "需要 bash >= 4（Git Bash 自带 5.x）"
+# 4.3，不是 4（round-15）：渲染用 `local -n` 名引用（4.3+），`printf
+# '%(fmt)T'` 需 4.2+。在 4.0-4.2（如 CentOS 7 自带的 4.2.46）上 `local -n`
+# 报 invalid option 后函数继续跑，四行全为空串——正是本项目自定的白屏红线，
+# 而下面的冒烟判据只看「输出非空」，纯转义码同样非空，于是照样报「通过」。
+[ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; } ||
+  die "需要 bash >= 4.3（渲染用 local -n 名引用；Git Bash 自带 5.x）"
 command -v jq >/dev/null 2>&1 || die "缺 jq（状态栏运行必需）：winget install jqlang.jq 或 pacman -S jq"
 command -v git >/dev/null 2>&1 || say "⚠ 未找到 git：分支/脏标/stash 段将不显示，其余功能不受影响"
 
@@ -208,6 +213,9 @@ smoke_out=$(printf '%s' "$smoke_payload" |   STATUSLINE_HISTORY_FILE="$smoke_tmp
 rm -rf "$smoke_tmp" 2>/dev/null
 [ -n "$smoke_out" ] || die "主状态栏冒烟渲染无输出"
 smoke_line1=$(printf '%s' "$smoke_out" | sed -n 1p | sed 's/\x1b\[[0-9;]*m//g; s/\x1b\]8;;[^\x1b]*\x1b\\\\//g')
+# 「非空」不够（round-15）：一行纯转义码同样非空。剥色后必须还剩可见内容，
+# 否则就是白屏——它长得跟成功一模一样，只有这一条判据能把它认出来。
+[ -n "$(printf '%s' "$smoke_line1" | tr -d ' \t')" ] || die "主状态栏冒烟渲染只有转义码（剥色后为空）"
 say "✓ 主状态栏冒烟通过：$smoke_line1"
 
 panel_tmp=$(mktemp -d) || die "mktemp 失败"

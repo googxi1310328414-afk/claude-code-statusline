@@ -736,6 +736,56 @@ ELJSON
 ' "$((now-40))" "$S13" "$S13" "$S13" > "$STATUSLINE_HISTORY_FILE"
   mn_out=$(jq '.cost.total_cost_usd=32.00' fixtures/full.json | bash ./statusline-command.sh | strip)
   printf '%s' "$mn_out" | grep -q 'today \$3\.' && ok "cross-midnight session still shows today" || bad "today segment vanished for a cross-midnight session"
+  # ---- adversarial-review round-15 regression asserts (2026-08-15) ----
+  S15=''
+  # R60: an over-long rollup row must be DROPPED WHOLE. The "no separator
+  # left in the last field" guard was still aimed at last_epoch, which a
+  # %% strip can never leave one in - dead code since the base column was
+  # appended. An 8-column row therefore survived with its base silently
+  # read as 0, i.e. that day lost its midnight baseline and counted
+  # closed+peak in full (the forbidden direction), while the fine file
+  # drops an over-long row exactly as it should.
+  : > "$STATUSLINE_DAILY_FILE"
+  printf '%s%sh1%s500%s200%s200%s%s%s300
+' "$(date +%Y%m%d)" "$S15" "$S15" "$S15" "$S15" "$S15" "$((now-4000))" "$S15" > "$STATUSLINE_DAILY_FILE"
+  printf '%s%szz9%s100%s1.00
+' "$((now-100))" "$S15" "$S15" "$S15" > "$STATUSLINE_HISTORY_FILE"
+  ov_ok=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'week \$[0-9]*' | head -1)
+  : > "$STATUSLINE_DAILY_FILE"
+  printf '%s%sh1%s500%s200%s200%s%s%s300%sJUNK
+' "$(date +%Y%m%d)" "$S15" "$S15" "$S15" "$S15" "$S15" "$((now-4000))" "$S15" "$S15" > "$STATUSLINE_DAILY_FILE"
+  printf '%s%szz9%s100%s1.00
+' "$((now-100))" "$S15" "$S15" "$S15" > "$STATUSLINE_HISTORY_FILE"
+  ov_bad=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'week \$[0-9]*' | head -1)
+  [ "$ov_ok" = 'week $4' ] && ok "7-column rollup row keeps its baseline ($ov_ok)" || bad "7-column row mis-parsed ($ov_ok, want week \$4)"
+  [ "$ov_bad" != 'week $7' ] && ok "over-long rollup row is dropped whole ($ov_bad)" || bad "over-long row survived with base swallowed ($ov_bad)"
+  # R61: dead per-session rows must collapse on every persist, not only
+  # past a 400-row cap - every frame re-splits and re-validates the whole
+  # file, so a machine that mints a session id per start paid a per-frame
+  # tax that grew with lifetime session count (+169ms measured at 200)
+  : > "$STATUSLINE_DAILY_FILE"
+  {
+    for _i in $(seq 1 60); do printf '%s%sdead%02d%s0%s100%s100%s%s%s0
+' "$(date +%Y%m%d)" "$S15" "$_i" "$S15" "$S15" "$S15" "$S15" "$((now-20000))" "$S15"; done
+  } > "$STATUSLINE_DAILY_FILE"
+  printf '%s%szz9%s100%s1.00
+' "$((now-100))" "$S15" "$S15" "$S15" > "$STATUSLINE_HISTORY_FILE"
+  dw1=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'week \$[0-9.]*' | head -1)
+  dead_rows=$(grep -c . "$STATUSLINE_DAILY_FILE")
+  dw2=$(bash ./statusline-command.sh < fixtures/full.json | strip | grep -o 'week \$[0-9.]*' | head -1)
+  dd=$(awk -v a="${dw1#week $}" -v b="${dw2#week $}" 'BEGIN{d=b-a; if(d<0)d=-d; printf "%d", d}' 2>/dev/null)
+  [ "$dead_rows" -lt 10 ] && ok "terminal rows collapse without a 400-row cap ($dead_rows rows)" || bad "terminal rows still waiting for the cap ($dead_rows rows)"
+  [ -n "$dw1" ] && [ "${dd:-999}" -le 5 ] && ok "collapsing terminal rows loses no money ($dw1)" || bad "collapse changed the total ($dw1 -> $dw2)"
+  # R62: "today and yesterday stay per-session" - 48h resolved to the day
+  # BEFORE yesterday, keeping a third day of rows nothing can ever fold
+  grep -q '172800 ))"' ./statusline-command.sh && bad "settled-day threshold still keeps three days" || ok "settled-day threshold matches the documented two days"
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R63: bash 4.0-4.2 has no `local -n`; the renderer's four lines come
+  # back EMPTY there and the old "output is non-empty" smoke test still
+  # reported success, because pure escape codes are non-empty
+  grep -q 'BASH_VERSINFO\[1\]' ./install.sh && ok "installer gates on bash 4.3, not 4" || bad "installer still accepts bash 4.0-4.2"
+  grep -q '剥色后为空' ./install.sh && ok "smoke test requires visible content, not just bytes" || bad "smoke test still passes on escape-only output"
   # R58: the installer's Windows-side reclaim must use the SAME strict
   # judgement as the watchdog. A bare "the command line mentions the
   # filename" match, aimed at a winpid that Windows has since recycled,

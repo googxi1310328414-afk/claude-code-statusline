@@ -710,7 +710,15 @@ if [ -f "$daily_file" ]; then
     # the last field), every numeric field guarded - malformed/foreign
     # rows dropped whole, same discipline as the fine file's reader below
     [ "$d_prev" = "$d_rest" ] && continue
-    [[ "$d_epoch" == *$''* ]] && continue
+    # the guard belongs on the LAST field (round-15): it was still
+    # aimed at d_epoch, which comes from a %% strip and therefore can
+    # never contain a separator - dead code ever since round-12 made
+    # base the last column. An 8-column row was then NOT dropped: its
+    # "base + junk" failed the digit test and silently became a KNOWN
+    # base of 0, so that day lost its midnight baseline and counted
+    # closed+peak in full - the forbidden direction, and the opposite
+    # of what the fine file does with an over-long row (drops it).
+    [[ "$d_base" == *$''* ]] && continue
     [[ "$d_day" =~ ^[0-9]{8}$ ]] || continue
     [ -n "$d_sid" ] || continue
     # digit caps (round-5): cents fields at 12 digits (multi-session
@@ -1187,7 +1195,12 @@ if [ "$daily_persist_due" -eq 1 ]; then
   # carrying the summed cents; today and yesterday stay per-session
   # for the live state machine. A 500-row cap backstops the rest.
   SEP1=$''
-  printf -v daily_settled_str '%(%Y%m%d)T' "$(( now_epoch - 172800 ))"
+  # 86400, not 172800 (round-15): the comment above - and the spec -
+  # promise "today and yesterday stay per-session", but 48h resolves to
+  # the day BEFORE yesterday, so that day's rows were kept too. They can
+  # never receive a fold (the fine window is 90min), so it was a pure
+  # per-frame parsing tax, ~50% more rows than the design calls for.
+  printf -v daily_settled_str '%(%Y%m%d)T' "$(( now_epoch - 86400 ))"
   declare -A daily_agg
   daily_out_lines=()
   for dkey in "${!du_peak[@]}"; do
@@ -1226,7 +1239,19 @@ if [ "$daily_persist_due" -eq 1 ]; then
   # fold, so its state is FINAL and merges into that day's _agg row -
   # the file is bounded by ACTIVE sessions, not lifetime session count,
   # and not one cent is lost.
-  if [ "${#daily_out_lines[@]}" -gt 400 ]; then
+  # NOT GATED ON A ROW CAP (round-15): the merge below is what makes
+  # this file bounded by ACTIVE sessions instead of lifetime session
+  # count, but it used to run only past 400 rows - so a machine that
+  # mints a fresh session id per Claude Code start accumulated dead
+  # per-session rows for days, and EVERY frame re-split and re-
+  # validated all of them (measured: +169ms/frame at 200 dead rows,
+  # +93ms at 100, gone the moment they collapse). That is exactly the
+  # "no per-frame rescan that grows with history" law this project
+  # states, dodged by its own threshold. A row whose watermark predates
+  # the fine window can never receive another fold, so collapsing it on
+  # every persist is free of information loss - today/week measured
+  # byte-identical before and after.
+  if [ "${#daily_out_lines[@]}" -gt 0 ]; then
     declare -A daily_agg2
     daily_keep_lines=()
     for dl in "${daily_out_lines[@]}"; do
