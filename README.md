@@ -7,7 +7,7 @@ Claude Code 的信息密集型彩色状态栏（Windows / Git Bash，POSIX 兼�
 ![效果预览](assets/preview.svg)
 
 ```
-10:02:45                            | Fable 5·max·think | ~\proj\webapp                   | acme/webapp | main* | PR#42 approved
+10:02:45                            | fable-5·max·think | ~\proj\webapp                   | acme/webapp | main* | PR#42 approved
 ctx ███░│ 66% 70k/200k              | ▆▆▁ 4.9k/m        | cache 92.3% r60.0k·w312 44m55s  | ↻2 ↓230k
 $0.42 $4.8/h                        | today $55.97      | week $89.20                     | +156/-23
 5h 37%·t60%→12:02 7d 12%·t57%→08-16 | wk Fab8%          | » my-session
@@ -27,8 +27,8 @@ $0.42 $4.8/h                        | today $55.97      | week $89.20           
 ## 子代理面板行（subagentStatusLine）
 
 ```
-▸ 0.2.79 收尾与发布(local_agent) ● | 295k tok | ▆▃▁ 14.9k/m | Σ81% | 19m46s@09:43:00 | 同步文档并推送
-▸ code-reviewer·max ✓              | 68k tok  | 10.8k/m     | Σ18% | 6m17s@09:56:29  | Review auth
+▸ 0.2.79 收尾与发布(local_agent) ● | fable-5   | 295k tok | ▆▃▁ 14.9k/m | Σ81% | 19m46s@09:43:00 | 同步文档并推送
+▸ code-reviewer·max ✓              | haiku-4-5 | 68k tok  | 10.8k/m     | Σ18% | 6m17s@09:56:29  | Review auth
 ```
 
 - 灰`▸` + **身份分色**：等待/终态用语义色（排队黄/完成绿/失败亮红），**运行中的代理按 task id 稳定哈希取色**（亮青/亮蓝/亮紫/青/蓝/亮白六色轮转，同一代理终生同色、跨帧跨会话稳定）——running 是绝大多数时间的状态，若也用固定色，整块面板就会读成一片同色，现在并发的几个代理一眼分得开——身份是行内最宽最靠左的字段，让它直接承载状态，一眼扫左边缘就知道每个代理在干什么；主行身份是亮青，主/子仍一眼分）+ 灰`(类型)` + 热度`·档位`（仅显式指定）+ 状态图标 `●`运行绿/`○`排队黄/`✗`失败红/`✓`完成绿（形状与颜色双编码）；紧随其后是**独立模型列**（青短名恒显，剥 `claude-` 前缀与日期后缀、**保留** `[1m]` 容量标记；全面板无模型则整列裁掉）
@@ -63,7 +63,7 @@ curl -fsSL https://raw.githubusercontent.com/googxi1310328414-afk/claude-code-st
 ```bash
 bash test.sh            # 渲染演示（终端看真色彩）
 bash test.sh --codes    # ANSI 码可视化
-bash test.sh --assert   # 136 项断言（CI 用，含性能门槛与十六轮对抗审查回归组+配色断言）
+bash test.sh --assert   # 145 项断言（CI 用，含性能门槛与十七轮对抗审查回归组+配色断言）
 ```
 
 GitHub Actions 在每次 push 自动跑断言套件。

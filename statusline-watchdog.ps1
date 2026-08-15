@@ -71,7 +71,13 @@ if (Test-Path $pidFile) {
 # 过的同一套纪律），绝不用「命令行提及脚本名」那种会误杀诊断/测试外壳的模糊匹配。
 # 2 小时 = 默认寿命闸 1h 的两倍留足余量；若把 STATUSLINE_PANEL_DAEMON_MAX_LIFE
 # 调到 2h 以上，这里的阈值必须一起改大，否则会误杀健康的长寿实例。
-$orphanCutoff = (Get-Date).AddSeconds(-7200)
+# 300s, not 7200 (round-17): the third orphan storm minted one wedged
+# instance every ~65s, so a 2-hour grace let ~110 of them pile up. An
+# UNREGISTERED daemon is wrong within seconds by design - it concedes
+# on its next 5s beat, or dies of idleness in 2 minutes - so 5 minutes
+# is already generous. The registered one is excluded above and lives
+# up to its own lifetime cap untouched.
+$orphanCutoff = (Get-Date).AddSeconds(-300)
 Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
   Where-Object {
     $_.CommandLine -notmatch '\s-c\s' -and

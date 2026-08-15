@@ -161,6 +161,9 @@ if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null && [[ "$daemon_hb" 
   [ "$hb_age" -ge -60 ] && [ "$hb_age" -le 60 ] && daemon_alive=1
 fi
 if [ "$daemon_alive" -eq 0 ]; then
+  # a reap that FAILED must not be followed by a spawn - see the
+  # escalation note below
+  reap_failed=0
   # REAP BEFORE RESPAWN (round-9, after a real incident: 78 orphaned
   # daemons burning 22 CPU-hours were found on the dev machine). A
   # registered pid that is ALIVE but whose heartbeat froze means the
@@ -193,7 +196,27 @@ if [ "$daemon_alive" -eq 0 ]; then
         # taken that whole group down - the shape of the 2026-08-13/14
         # mis-kill incidents. The child is reaped by pid instead, below.
         kill "$daemon_pid" 2>/dev/null
-        kill -9 "$daemon_pid" 2>/dev/null ;;
+        kill -9 "$daemon_pid" 2>/dev/null
+        # WINDOWS-SIDE ESCALATION (round-17, THIRD orphan storm, caught
+        # live): a cygwin `kill -9` cannot kill a process wedged inside
+        # the cygwin DLL - and that is the ONLY scenario this reap exists
+        # for. Measured: kill -9 returns 0, the process does not budge
+        # (two independent samples), while TerminateProcess on its NATIVE
+        # pid kills it instantly. So the previous two "fixes" for this
+        # incident class were reaping nothing whenever it actually
+        # mattered: every ~65s the hook killed nothing, spawned a
+        # replacement, and that replacement wedged too - one immortal
+        # ~30%-CPU process per minute, forever. The native pid is read
+        # from /proc/<pid>/winpid, i.e. from the very process we just
+        # confirmed by cmdline - never from the pid file, which could be
+        # stale. taskkill needs // to survive MSYS path mangling.
+        if kill -0 "$daemon_pid" 2>/dev/null; then
+          _wp=""
+          [ -r "/proc/$daemon_pid/winpid" ] && read -r _wp < "/proc/$daemon_pid/winpid" 2>/dev/null
+          [[ "$_wp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
+            taskkill //F //PID "$_wp" >/dev/null 2>&1
+          kill -0 "$daemon_pid" 2>/dev/null && reap_failed=1
+        fi ;;
     esac
   fi
   # THE IN-FLIGHT RENDER CHILD (round-13): a wedged daemon is usually
@@ -209,9 +232,24 @@ if [ "$daemon_alive" -eq 0 ]; then
       *subagent-statusline.sh)
         kill -- "-$daemon_rpid" 2>/dev/null
         kill "$daemon_rpid" 2>/dev/null
-        kill -9 -- "-$daemon_rpid" 2>/dev/null ;;
+        kill -9 -- "-$daemon_rpid" 2>/dev/null
+        if kill -0 "$daemon_rpid" 2>/dev/null; then
+          _rwp=""
+          [ -r "/proc/$daemon_rpid/winpid" ] && read -r _rwp < "/proc/$daemon_rpid/winpid" 2>/dev/null
+          [[ "$_rwp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
+            taskkill //F //PID "$_rwp" >/dev/null 2>&1
+        fi ;;
     esac
   fi
-  ( bash "$panel_daemon" </dev/null >/dev/null 2>&1 & )
+  # NEVER MINT A REPLACEMENT FOR SOMETHING WE COULD NOT KILL (round-17):
+  # that is the whole amplifier. If even TerminateProcess did not get
+  # rid of the old instance, the honest outcome is "no panel this tick"
+  # (the host shows its default rows) until the watchdog clears it -
+  # never "one more permanent CPU burner every 65 seconds", which has
+  # now cost this machine 22, 3 and 3.9 CPU-hours in three separate
+  # incidents.
+  if [ "$reap_failed" -eq 0 ]; then
+    ( bash "$panel_daemon" </dev/null >/dev/null 2>&1 & )
+  fi
 fi
 exit 0

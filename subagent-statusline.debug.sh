@@ -349,7 +349,7 @@ jq_all_out=$(jq -r '
   | ([$tasks[]? | .model // empty | select(length>0)] | group_by(.) | max_by(length) | .[0] // "") as $majority_model
   | ([$tasks[]? | .tokenCount // 0 | select(type=="number")] | add // 0 | tostring) as $total_tokens
   | ([$tasks[]? | .tokenCount // empty | select(type=="number" and . > 0)] | length | tostring) as $tokened_count
-  | ($columns | clean), ($majority_model | clean), $total_tokens, $tokened_count,
+  | $columns, ($majority_model | clean), $total_tokens, $tokened_count,
     (
       range(0; $tcount) as $i
       | ($tasks[$i]) as $task
@@ -367,7 +367,7 @@ jq_all_out=$(jq -r '
             # description budget is ONE panel-wide number, so every row lost
             # 15 cells of description because of one task. Drift now makes
             # the segment disappear, like everywhere else in this project.
-            ($task.effort | if type=="object" then (.level? | if type=="string" or type=="number" then . else "" end) elif type=="array" then "" else (. // "") end | clean),
+            ($task.effort | if type=="object" then (.level? // "") elif type=="array" then "" else (. // "") end | clean),
             ($task.status // "" | clean),
             ($task.startTime // "" | clean),
             ($task.tokenCount // "" | clean),
@@ -512,50 +512,6 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # rendering - every other cell looking correct all the while.
   id=${id//"$BSL2"/"$BSL1"}
   identity_plain=${identity_plain//"$BSL2"/"$BSL1"}
-  # IDENTITY WIDTH CAP (round-17): the identity cell had none, and its
-  # width goes straight into col_max[0] - which both pads EVERY row and
-  # is subtracted from the ONE panel-wide description budget. A
-  # local_agent's identity is its `label`, i.e. whatever sentence the
-  # caller wrote (this project's own agents get 20-30 Chinese chars =
-  # 40-60 cells), so one long task pushed the model/tok/rate/share/
-  # elapsed cells of every OTHER row past `columns` and deleted the
-  # description column panel-wide. Same failure shape as the round-16
-  # effort drift, but triggered by ordinary use rather than schema
-  # drift. Cap: a third of the terminal, clamped to [12, 48] cells.
-  if [ -n "$identity_plain" ]; then
-    # a QUARTER of the terminal, not a third: at the common 120 columns a
-    # 40-cell identity plus the five fixed columns already leaves the
-    # description under its 8-cell minimum, i.e. the panel-wide
-    # description column would still vanish - just from a legal cap
-    # instead of an unbounded one
-    ident_cap=$(( columns / 4 ))
-    [ "$ident_cap" -lt 12 ] && ident_cap=12
-    [ "$ident_cap" -gt 40 ] && ident_cap=40
-    # bounded measure, same trick as the description: display width is
-    # always >= char count, so more chars than the cap must overflow
-    if [ "${#identity_plain}" -gt "$ident_cap" ]; then
-      ident_w=$(( ident_cap + 1 ))
-    else
-      disp_width "$identity_plain"; ident_w="$REPLY"
-    fi
-    if [ "$ident_w" -gt "$ident_cap" ]; then
-      itarget=$(( ident_cap - 1 ))
-      iacc=0
-      icut=0
-      for ((ii=0; ii<${#identity_plain}; ii++)); do
-        ic="${identity_plain:ii:1}"
-        disp_width "$ic"; idw="$REPLY"
-        [ "$(( iacc + idw ))" -gt "$itarget" ] && break
-        iacc=$(( iacc + idw ))
-        icut=$(( ii + 1 ))
-      done
-      if [ "$icut" -gt 0 ]; then
-        printf -v ilastc '%d' "'${identity_plain:icut-1:1}" 2>/dev/null || ilastc=0
-        [ "$ilastc" -ge 55296 ] && [ "$ilastc" -le 56319 ] && icut=$(( icut - 1 ))
-      fi
-      identity_plain="${identity_plain:0:$icut}…"
-    fi
-  fi
   task_type=${task_type//"$BSL2"/"$BSL1"}
   description=${description//"$BSL2"/"$BSL1"}
 
@@ -966,6 +922,10 @@ active_col_count=${#active_cols[@]}
 # Description width budget only counts surviving (active) columns and
 # their separators (one "|" per active column, description always last).
 desc_budget=$(( columns - active_col_width_sum - 3 * active_col_count ))
+echo "DEBUG columns=$columns col_max=(${col_max[*]}) active_cols=(${active_cols[*]}) active_col_width_sum=$active_col_width_sum active_col_count=$active_col_count desc_budget=$desc_budget" >&2
+for __dbg_i in "${!ids[@]}"; do
+  echo "DEBUG row id=${ids[$__dbg_i]} col0_w=${col0_w[$__dbg_i]} col1_w=${col1_w[$__dbg_i]} col2_w=${col2_w[$__dbg_i]} col3_w=${col3_w[$__dbg_i]} col4_w=${col4_w[$__dbg_i]} col5_w=${col5_w[$__dbg_i]}" >&2
+done
 
 row_total=${#ids[@]}
 for ((r=0; r<row_total; r++)); do
@@ -1015,22 +975,6 @@ for ((r=0; r<row_total; r++)); do
         acc=$(( acc + dw ))
         cut_pos=$(( di + 1 ))
       done
-      # SURROGATE-PAIR GUARD (round-17): MSYS bash counts UTF-16 units,
-      # so one astral character (emoji, CJK ext-B) is TWO "characters"
-      # to ${#s} and ${s:i:1}. The width walk above is correct (each
-      # half measures 1, the pair 2), but the cut could land BETWEEN
-      # the halves - and the slice then emitted 3 bytes of a 4-byte
-      # sequence, i.e. invalid UTF-8 inside the JSON line handed to the
-      # host: a strict decoder drops the row (that agent silently keeps
-      # default rendering), a tolerant one draws a replacement glyph and
-      # the width bookkeeping is off. This is the only character-level
-      # cut in the whole project, so it is the only place that can put
-      # bad bytes on the wire. A trailing lone HIGH surrogate
-      # (0xD800-0xDBFF) means we split one - drop it.
-      if [ "$cut_pos" -gt 0 ]; then
-        printf -v dlastc '%d' "'${description:cut_pos-1:1}" 2>/dev/null || dlastc=0
-        [ "$dlastc" -ge 55296 ] && [ "$dlastc" -le 56319 ] && cut_pos=$(( cut_pos - 1 ))
-      fi
       desc_text="${description:0:$cut_pos}…"
     else
       desc_text="$description"

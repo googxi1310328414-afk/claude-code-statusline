@@ -126,10 +126,18 @@ if [ "$once" -eq 0 ]; then
   # per-PID tmp files a killed hook/daemon left behind (age-gated so a
   # LIVE instance's in-flight tmp, seconds old, is never swept)
   rm -f "$panel_dir"/render.* 2>/dev/null
-  find "$panel_dir" \( -name 'cache.*' -mmin +1440 -o -name 'spool.*.tmp.*' -mmin +10 -o -name 'daemon.pid.tmp.*' -mmin +10 \) -delete 2>/dev/null
+  find "$panel_dir" \( -name 'cache.*' -mmin +1440 -o -name 'spool.*.tmp.*' -mmin +10 -o -name 'daemon.pid.tmp.*' -mmin +10 -o -name 'cache.*.raw.*' -mmin +10 -o -name '.tick.*' -mmin +10 \) -delete 2>/dev/null
 fi
 
-tick_fifo="$panel_dir/.tick.fifo"
+# PER-INSTANCE FIFO (round-17): every instance used to do timed reads on
+# ONE shared fifo. With several instances alive (exactly what the orphan
+# storms produce) that is N processes doing concurrent read-write opens
+# and 0.3s timed reads on the same cygwin named pipe - a contention
+# shape whose cost lands in SYSTEM time, which is where the wedged
+# instances were measured to burn ~93% of their CPU. Own fifo per
+# instance: no cross-instance contention, and a leftover one is swept
+# by the next start (below) instead of being inherited.
+tick_fifo="$panel_dir/.tick.$$.fifo"
 [ -p "$tick_fifo" ] || mkfifo "$tick_fifo" 2>/dev/null
 
 # ABSOLUTE LIFETIME CAP (round-9): a daemon that wedges ANYWHERE
@@ -255,7 +263,15 @@ while :; do
     # per render sidesteps that entirely
     render_seq=$(( render_seq + 1 ))
     cache_tmp="$panel_dir/cache.$key.tmp.$$.$render_seq"
-    raw_tmp="$cache_tmp.raw"
+    # the raw capture is REUSED per (instance, key) and truncated with a
+    # builtin instead of rm'd (round-17): `rm` is a fork, and a fork on
+    # the per-render path is exactly what cannot be afforded during the
+    # fork exhaustion these storms grow out of - every wedged instance
+    # found on this machine had written its .raw file and then stopped,
+    # i.e. it never got past the next external command. A stable name
+    # also avoids the delete-pending problem the per-render seq exists
+    # for, since nothing is ever unlinked while open.
+    raw_tmp="$panel_dir/cache.$key.raw.$$"
     # own process group (job control) so the timeout path can signal
     # the renderer AND its grandchildren as one unit
     set -m 2>/dev/null
@@ -308,7 +324,8 @@ while :; do
         sleep 0.3 2>/dev/null || break
         r_reap=$(( r_reap + 1 ))
       done
-      rm -f "$cache_tmp" "$raw_tmp" 2>/dev/null
+      rm -f "$cache_tmp" 2>/dev/null
+      : > "$raw_tmp" 2>/dev/null
       frame_bad=1
     elif wait "$r_pid" 2>/dev/null && [ -s "$raw_tmp" ]; then
       # -s gate: a renderer that exits 0 with EMPTY output (fork
@@ -326,7 +343,7 @@ while :; do
       # agents frozen at the same elapsed time, indistinguishable from
       # live. All builtins (mapfile+printf), no extra fork.
       mapfile -t _rows < "$raw_tmp" 2>/dev/null
-      rm -f "$raw_tmp" 2>/dev/null
+      : > "$raw_tmp" 2>/dev/null
       printf -v _cache_ep '%(%s)T' -1
       { printf '%s
 ' "$_cache_ep"; printf '%s
@@ -334,7 +351,8 @@ while :; do
         mv -f "$cache_tmp" "$panel_dir/cache.$key" 2>/dev/null
       bad_streak[$key]=0
     else
-      rm -f "$cache_tmp" "$raw_tmp" 2>/dev/null
+      rm -f "$cache_tmp" 2>/dev/null
+      : > "$raw_tmp" 2>/dev/null
       frame_bad=1
     fi
     if [ "$frame_bad" -eq 1 ]; then
@@ -372,5 +390,6 @@ if [ "$once" -eq 0 ]; then
   cur_holder=""
   [ -r "$panel_dir/daemon.pid" ] && read -r cur_holder < "$panel_dir/daemon.pid"
   [ "$cur_holder" = "$$" ] && rm -f "$panel_dir/daemon.pid" 2>/dev/null
+  rm -f "$tick_fifo" "$panel_dir"/cache.*.raw.$$ 2>/dev/null
 fi
 exit 0

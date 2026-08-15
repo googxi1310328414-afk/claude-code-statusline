@@ -252,7 +252,7 @@ exec 2>>"$statusline_err_log"
 #      is displayable.
 #   (TODAY/WEEK TOTAL, right after cost: gray "today"/"week" + white
 #   "$X.XX" each - fed by a TWO-TIER store: the fine-grained history
-#   file (trimmed to 3h; it only needs to serve sparkline/rate/$-per-
+#   file (trimmed to 90min; it only needs to serve sparkline/rate/$-per-
 #   hour) plus a tiny per-day rollup file (statusline-daily.tsv) that
 #   carries each (day, session)'s monotonic-run spend state forward
 #   incrementally (a /clear resets a session's cost column, so a simple
@@ -897,7 +897,7 @@ daily_dirty=0
 # The early-stop verdict is PER-ROW against that row's OWN session
 # watermark - round 4 used the global minimum watermark across every
 # session the rollup knew, but the rollup retains 9 days of (day, sid)
-# rows while the fine file holds ~3.5h: ANY session idle longer than
+# rows while the fine file holds ~2h (90min + 30min of write slack): ANY session idle longer than
 # the fine window (a yesterday session, or one that just went quiet
 # today) pinned that minimum below every fine row and the early stop
 # NEVER fired on a real machine - the "-30%" win existed only in
@@ -1082,7 +1082,7 @@ fi
 #
 # TWO-TIER STORE (perf): the fine rows only need to serve the sparkline
 # (last ~3min), token rate (5min window) and $/h (60min window), so the
-# fine file is trimmed to 3 HOURS (was 8 days). The spend scopes that DID
+# fine file is trimmed to 90 MINUTES (was 8 days, then 3h). The spend scopes that DID
 # need days of data (today/week) read a tiny per-day rollup file instead
 # of re-walking days of fine rows every render: at the old retention a
 # long-lived multi-session file approached the 50k-row cap, and this
@@ -1312,9 +1312,9 @@ fi
 
 # APPEND-FIRST WRITE: a full trim+rewrite used to run on EVERY appending
 # render (~25KB tmp+mv every 20s per session) even though it only added
-# one row - and in steady state the 3h cutoff expires roughly one row per
+# one row - and in steady state the 90min cutoff expires roughly one row per
 # tick, so "rewrite whenever anything expired" would still rewrite every
-# time. Instead the on-disk file gets 30min of SLACK past the 3h read
+# time. Instead the on-disk file gets 30min of SLACK past the 90min read
 # window (every consumer filters by its own window, so stale-but-present
 # rows cost nothing), and the full rewrite runs only when the oldest row
 # exceeds window+slack (~every 30min) or the row cap trips; malformed

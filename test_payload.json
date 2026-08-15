@@ -1,0 +1,1 @@
+{"columns":120,"tasks":[{"id":"t1","label":"修复第十七轮对抗审查中发现的全部实锤并回归测试","type":"local_agent","status":"running","model":"claude-fable-5","tokenCount":295000,"startTime":1786759108,"description":"同步文档并推送"},{"id":"t2","label":"review","type":"local_agent","status":"running","model":"claude-haiku-4-5","tokenCount":68000,"startTime":1786759108,"description":"Review auth"}]}

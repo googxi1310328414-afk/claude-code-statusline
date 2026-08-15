@@ -950,6 +950,63 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-17 regression asserts (2026-08-15) ----
+  # R67: MSYS bash counts UTF-16 units, so one astral character (emoji,
+  # CJK ext-B) is TWO "characters" - the description cut could land
+  # between the halves and emit 3 bytes of a 4-byte sequence, i.e. INVALID
+  # UTF-8 in the JSON line handed to the host. This is the project's only
+  # character-level cut, so its only way to put bad bytes on the wire.
+  utf_bad=0
+  for _pad in 41 42 43 44 45; do
+    _p=$(printf 'a%.0s' $(seq 1 $_pad))
+    printf '{"columns":60,"tasks":[{"id":"u%s","name":"n","tokenCount":1000,"description":"%s\360\237\232\200BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"}]}' "$_pad" "$_p" |
+      bash ./subagent-statusline.sh > "$tmpd/astral.$_pad" 2>/dev/null
+    iconv -f UTF-8 -t UTF-8 < "$tmpd/astral.$_pad" >/dev/null 2>&1 || utf_bad=$_pad
+  done
+  [ "$utf_bad" -eq 0 ] && ok "astral description truncation stays valid UTF-8" || bad "truncation split a surrogate pair (pad=$utf_bad)"
+  # R68: the identity cell had no width cap, and its width both pads every
+  # row and is subtracted from the ONE panel-wide description budget - so
+  # one long label (a local_agent's identity IS the caller's sentence)
+  # pushed every other row's columns past `columns` and deleted the
+  # description column panel-wide
+  longid=$(jq -nc --argjson n "$(date +%s)" '{columns:120,tasks:[
+    {id:"li1",label:"修复第十七轮对抗审查中发现的全部实锤并回归测试",type:"local_agent",status:"running",model:"claude-fable-5",tokenCount:295000,startTime:(($n-1000)*1000),description:"UNIQUEDESCA"},
+    {id:"li2",label:"review",type:"local_agent",status:"running",model:"claude-haiku-4-5",tokenCount:68000,startTime:(($n-1000)*1000),description:"UNIQUEDESCB"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  case "$longid" in
+    *…*) ok "over-long identity is truncated to its cap" ;;
+    *)   bad "identity cell still has no width cap" ;;
+  esac
+  if printf '%s' "$longid" | grep -q UNIQUEDESCA && printf '%s' "$longid" | grep -q UNIQUEDESCB; then
+    ok "a long identity no longer deletes the panel-wide description column"
+  else
+    bad "description column lost to one long identity"
+  fi
+  # R69: round-16 narrowed .effort but not .level - a nested container was
+  # still tostring'd into the identity cell
+  ne=$(printf '{"columns":120,"tasks":[{"id":"ne1","name":"a","effort":{"level":{"x":"max"}},"tokenCount":1000,"description":"d"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  case "$ne" in
+    *'{'*) bad "nested effort still renders raw JSON ($ne)" ;;
+    *)     ok "nested effort drifts to an empty segment" ;;
+  esac
+  # R70: $columns was the ONE field the panel jq never passed through
+  # clean; a string-shaped value with a newline shifted every positional
+  # field by one and both agents came back with garbage ids
+  cn=$(jq -nc '{columns:"120\nX",tasks:[{id:"cn1",name:"alpha",tokenCount:1000,description:"first"},{id:"cn2",name:"beta",tokenCount:2000,description:"second"}]}' | bash ./subagent-statusline.sh | jq -r .id | tr -d '\r' | tr '\n' ' ')
+  case "$cn" in
+    'cn1 cn2 ') ok "a string-shaped columns cannot shift the field grid" ;;
+    *)          bad "columns drift broke the positional protocol ($cn)" ;;
+  esac
+  # R71: cygwin kill CANNOT kill a daemon wedged inside the cygwin DLL -
+  # measured: kill -9 returns 0 and the process does not budge, while
+  # TerminateProcess on its native pid kills it instantly. Without the
+  # escalation the hook reaped nothing and spawned a replacement anyway:
+  # one immortal ~30%-CPU process per minute (three incidents, 22/3/3.9
+  # CPU-hours). Both halves matter - escalate, and never spawn after a
+  # reap that failed.
+  grep -q 'taskkill //F //PID' ./statusline-panel-hook.sh && ok "hook escalates to a native kill" || bad "hook only sends cygwin signals"
+  grep -q 'reap_failed' ./statusline-panel-hook.sh && ok "hook refuses to respawn after a failed reap" || bad "hook still respawns unconditionally"
+  grep -q 'AddSeconds(-300)' ./statusline-watchdog.ps1 && ok "watchdog reaps unregistered daemons in minutes" || bad "watchdog orphan cutoff still hours"
+  grep -q 'tick.\$\$.fifo' ./statusline-panel-daemon.sh && ok "daemon uses a per-instance tick fifo" || bad "daemon still shares one fifo across instances"
   # ---- adversarial-review round-16 regression asserts (2026-08-15) ----
   # R64: the smoke test must reject the renderer's OWN failure line. A jq
   # that EXISTS but cannot run the filter (built without oniguruma, so
