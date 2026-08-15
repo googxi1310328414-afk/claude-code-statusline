@@ -535,6 +535,29 @@ for _numf in in_tokens win_size out_tokens_ctx cache_r cache_w cache_i added rem
     fi
   fi
 done
+# ...and the fields the loop above could not take (round-21): a
+# percentage may carry a sign and a fraction, an epoch is 13 digits.
+# Round-20 normalised eight fields and left five, so remaining / five /
+# week / the two resets_at still reached $(( )) as raw strings. The
+# damage is worse than a wrong number: bash aborts the WHOLE compound
+# command on an arithmetic error, so "082" did not just mis-read - the
+# entire 5h segment (including the bright-red near-limit warning, the
+# one reading that most needs to be seen) vanished from the bar, exit 0,
+# one blackbox line per frame. Same for the ctx battery via remaining.
+for _numf in remaining five week; do
+  _nv="${!_numf}"
+  [ -n "$_nv" ] || continue
+  _sign=""
+  case "$_nv" in -*) _sign="-"; _nv="${_nv#-}" ;; esac
+  _ipart="${_nv%%.*}"
+  _fpart=""
+  case "$_nv" in *.*) _fpart=".${_nv#*.}" ;; esac
+  [[ "$_ipart" =~ ^[0-9]{1,12}$ ]] && printf -v "$_numf" '%s' "${_sign}$(( 10#$_ipart ))${_fpart}"
+done
+for _numf in five_reset week_reset; do
+  [ -n "${!_numf}" ] && [[ "${!_numf}" =~ ^[0-9]{1,13}$ ]] &&
+    printf -v "$_numf" '%s' "$(( 10#${!_numf} ))"
+done
 
 # model display SYNCED with the panel's naming (user request): when
 # .model.id is present, the short id form replaces display_name - strip
@@ -545,7 +568,12 @@ done
 # one $model variable.
 if [ -n "$model_id" ]; then
   model="${model_id#claude-}"
-  [[ "$model" =~ ^(.*)-20[0-9]{6}$ ]] && model="${BASH_REMATCH[1]}"
+  # the date is not always LAST (round-21): a 1M-context variant of a
+  # dated id is "claude-sonnet-4-5-20250929[1m]", and a tail-anchored
+  # date regex left the whole suffix in place - 9 extra cells on the
+  # bar, and in the panel 9 cells taken off every row's description,
+  # since the model column pads to the panel-wide maximum.
+  [[ "$model" =~ ^(.*)-20[0-9]{6}(\[[^]]*\])?$ ]] && model="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
 fi
 
 # PERF: bash's printf '%(fmt)T' builtin (bash 4.2+) replaces every `date`

@@ -226,10 +226,15 @@ SEP="${RESET}${GRAY}${NBSP}|${NBSP}${RESET}"
 short_model() {
   local m="${1#claude-}"
   # a trailing "[1m]"-style capacity tag is KEPT verbatim (user likes it);
-  # note it also makes the date-suffix regex a no-op on tagged ids, which
-  # is fine - tagged ids don't carry date suffixes in practice
-  if [[ "$m" =~ ^(.*)-20[0-9]{6}$ ]]; then
-    m="${BASH_REMATCH[1]}"
+  # the tag may FOLLOW the date (round-21): "tagged ids don't carry date
+  # suffixes in practice" only held for one generation - the still-live
+  # previous generation is dated (claude-sonnet-4-5-20250929), and the
+  # 1M-context variant appends its tag after it. A tail-anchored date
+  # regex then stripped nothing at all, and this column pads to the
+  # panel-wide maximum AND is subtracted from the one shared description
+  # budget, so those 9 cells come off every row.
+  if [[ "$m" =~ ^(.*)-20[0-9]{6}(\[[^]]*\])?$ ]]; then
+    m="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
   fi
   REPLY="$m"
 }
@@ -491,7 +496,20 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # time. Over-cap values are blanked here, once, so the cells simply
   # disappear rather than showing invented numbers.
   [[ "$token_count" =~ ^[0-9]{1,12}$ ]] || token_count=""
+  # BASE 10 (round-21): the panel never got round-20's 10# treatment,
+  # and here an arithmetic error is far worse than on the main bar -
+  # bash discards the whole top-level compound command, which in PASS 1
+  # is the ENTIRE per-task for loop: one task with "089000" tokens and
+  # every task after it disappears from the output. The daemon then
+  # sees exit 0 with a short/empty capture, the -s gate calls it a bad
+  # frame, and three of those blank the cache for good - the whole
+  # panel goes back to the host default rows and stays there as long as
+  # the host keeps sending that field. "At least it fails loudly" (the
+  # round-20 note) is not true here: the error only reaches the
+  # blackbox.
+  [ -n "$token_count" ] && printf -v token_count '%s' "$(( 10#$token_count ))"
   [[ "$start_time" =~ ^[0-9]{1,15}$ ]] || start_time=""
+  [ -n "$start_time" ] && printf -v start_time '%s' "$(( 10#$start_time ))"
   # SANITY WINDOW (round-14, same discipline as the main bar's
   # resets_at): a digit cap alone let startTime=0 render
   # "496318h25m16s@08:00:00" - a 1970 wall clock in the bright-red

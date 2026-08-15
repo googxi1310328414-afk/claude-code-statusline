@@ -25,7 +25,31 @@ export STATUSLINE_CI_CACHE_PREFIX="$(dirname "$STATUSLINE_HISTORY_FILE")/test-ci
 export STATUSLINE_USAGE_CACHE_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-usage-cache"
 export STATUSLINE_USAGE_BACKOFF_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-usage-backoff"
 export STATUSLINE_CRED_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/no-such-credentials.json"
-trap 'rm -rf "$(dirname "$STATUSLINE_HISTORY_FILE")"' EXIT
+# A --once daemon that wedges never registers, skips the heartbeat AND
+# the absolute lifetime cap, and therefore has no reaper inside the
+# project at all (round-20: two of them, left by earlier runs of THIS
+# suite, were found burning 14 CPU-hours). Two guards, because the
+# round-20 one was placed where the leak makes it unreachable:
+#   * once_daemon() bounds every foreground --once call, so a wedged
+#     instance can no longer hang the suite itself (which is exactly how
+#     the sweep got skipped: the suite was killed before reaching it);
+#   * the sweep runs from the TRAP, on INT/TERM as well as EXIT, and only
+#     touches instances older than 120s - a concurrent run's healthy
+#     --once lives ~1-12s, so this can never interrupt someone else's
+#     test (every other reclaim path in this project is either
+#     registration-scoped or age-gated; this one was neither).
+once_sweep() {
+  command -v powershell.exe >/dev/null 2>&1 || return 0
+  powershell.exe -NoProfile -NonInteractive -Command "\$c=(Get-Date).AddSeconds(-120); Get-CimInstance Win32_Process -Filter \"Name='bash.exe'\" | Where-Object { \$_.CommandLine -notmatch '\\s-c\\s' -and \$_.CommandLine -match 'statusline-panel-daemon\\.sh\\s+--once' -and \$_.CreationDate -lt \$c } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1
+}
+once_daemon() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 60 bash "$@"
+  else
+    bash "$@"
+  fi
+}
+trap 'once_sweep; rm -rf "$(dirname "$STATUSLINE_HISTORY_FILE")"' EXIT INT TERM
 
 strip() { perl -pe 's/\e\[[0-9;]*m//g; s/\e\]8;;[^\e]*\e\\//g'; }
 filter() { if [ "$1" = "--codes" ]; then sed 's/\x1b/\\e/g'; else cat; fi; }
@@ -238,7 +262,7 @@ if [ "$1" = "--assert" ]; then
   printf '#!/bin/bash\nsleep 300\n' > "$tmpd/hangrender.sh"
   printf '{"columns":120,"tasks":[{"id":"tmo1","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.tmo1.new"
   tmo_t0=$SECONDS
-  STATUSLINE_PANEL_RENDERER="$tmpd/hangrender.sh" STATUSLINE_PANEL_RENDER_TIMEOUT=1 bash ./statusline-panel-daemon.sh --once
+  STATUSLINE_PANEL_RENDERER="$tmpd/hangrender.sh" STATUSLINE_PANEL_RENDER_TIMEOUT=1 once_daemon ./statusline-panel-daemon.sh --once
   tmo_el=$(( SECONDS - tmo_t0 ))
   [ "$tmo_el" -lt 6 ] && ok "daemon kills hung render at deadline" || bad "daemon blocked on hung render (${tmo_el}s)"
   [ -f "$STATUSLINE_PANEL_DIR/cache.tmo1" ] && bad "hung render left a cache" || ok "hung render frame skipped"
@@ -310,7 +334,7 @@ if [ "$1" = "--assert" ]; then
   printf '#!/bin/bash\nexit 0\n' > "$tmpd/emptyrender.sh"
   printf '%s\n%s\n' "$(date +%s)" '{"id":"tmo2","content":"GOOD_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.tmo2"
   printf '{"columns":120,"tasks":[{"id":"tmo2","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.tmo2.new"
-  STATUSLINE_PANEL_RENDERER="$tmpd/emptyrender.sh" bash ./statusline-panel-daemon.sh --once
+  STATUSLINE_PANEL_RENDERER="$tmpd/emptyrender.sh" once_daemon ./statusline-panel-daemon.sh --once
   grep -q GOOD_FRAME "$STATUSLINE_PANEL_DIR/cache.tmo2" 2>/dev/null && ok "empty render keeps last good frame" || bad "empty render clobbered cache"
 
   # ---- adversarial-review round-3 regression asserts (2026-08-14) ----
@@ -520,7 +544,7 @@ sleep 60
 ' > "$tmpd/hangterm.sh"
   printf '{"columns":120,"tasks":[{"id":"ht1","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.ht1.new"
   ht_t0=$SECONDS
-  STATUSLINE_PANEL_RENDERER="$tmpd/hangterm.sh" STATUSLINE_PANEL_RENDER_TIMEOUT=2 bash ./statusline-panel-daemon.sh --once
+  STATUSLINE_PANEL_RENDERER="$tmpd/hangterm.sh" STATUSLINE_PANEL_RENDER_TIMEOUT=2 once_daemon ./statusline-panel-daemon.sh --once
   ht_el=$(( SECONDS - ht_t0 ))
   [ "$ht_el" -lt 12 ] && ok "TERM-immune render child does not wedge daemon (${ht_el}s)" || bad "daemon wedged by TERM-immune child (${ht_el}s)"
   rm -f "$STATUSLINE_PANEL_DIR"/render.ht1 "$STATUSLINE_PANEL_DIR"/cache.ht1* 2>/dev/null
@@ -938,7 +962,7 @@ sleep 300
   # cache format (round-6): line 1 = render epoch, rows follow
   printf '%s\n%s\n' "$(date +%s)" '{"id":"ms","content":"CACHED_MARKER"}' > "$STATUSLINE_PANEL_DIR/cache.ms"
   subagent_payload "$now" | bash ./statusline-panel-hook.sh | grep -q CACHED_MARKER && ok "panel hook serves cache" || bad "hook cache serve failed"
-  bash ./statusline-panel-daemon.sh --once
+  once_daemon ./statusline-panel-daemon.sh --once
   grep -q '"id":"ms"' "$STATUSLINE_PANEL_DIR/cache.ms" && ! grep -q CACHED_MARKER "$STATUSLINE_PANEL_DIR/cache.ms" && ok "panel daemon renders spool to cache" || bad "daemon render failed"
 
   # one-line installer: local mode into an isolated HOME must install all
@@ -950,6 +974,42 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-21 regression asserts (2026-08-15) ----
+  # R81: round-20 normalised eight fields and left five. A zero-padded
+  # percentage does not merely mis-read - bash aborts the WHOLE compound
+  # command on an arithmetic error, so the entire 5h segment (including
+  # the bright-red near-limit warning) vanished, exit 0, no visible sign.
+  z5=$(jq -c --argjson r "$(( now + 7200 ))" '.rate_limits.five_hour.resets_at=$r|.rate_limits.five_hour.used_percentage="082"' fixtures/full.json | bash ./statusline-command.sh | strip | sed -n 4p)
+  case "$z5" in
+    *'5h 82%'*) ok "a zero-padded percentage keeps its segment" ;;
+    *)          bad "zero-padded percentage deleted the 5h segment ($z5)" ;;
+  esac
+  # R82: the ctx battery reads `remaining` the same way - "070.0" was
+  # read as OCTAL 56 and drew one bar too few, silently
+  z2=$(jq -c 'del(.context_window.total_input_tokens,.context_window.context_window_size)|.context_window.remaining_percentage="070.0"' fixtures/full.json | bash ./statusline-command.sh | strip | sed -n 2p)
+  case "$z2" in
+    *'████│ 70%'*) ok "a zero-padded remaining draws the right battery" ;;
+    *)            bad "octal remaining drew a fake battery ($z2)" ;;
+  esac
+  # R83: in the panel the same error is worse - bash discards the whole
+  # top-level compound command, which in PASS 1 is the entire per-task
+  # loop, so that task AND every task after it disappears; the daemon
+  # then blanks the cache after three such frames and the panel is dark
+  zp=$(printf '{"columns":160,"tasks":[{"id":"zp1","label":"x","status":"running","tokenCount":11000},{"id":"zp2","label":"y","status":"running","tokenCount":"089000"},{"id":"zp3","label":"z","status":"running","tokenCount":33000}]}' | bash ./subagent-statusline.sh | jq -r .id | tr -d '\r' | tr '\n' ' ')
+  [ "$zp" = "zp1 zp2 zp3 " ] && ok "a bad numeric cannot discard the whole panel loop" || bad "panel lost rows to an arithmetic error ($zp)"
+  zo=$(printf '{"columns":160,"tasks":[{"id":"zo1","label":"x","status":"running","tokenCount":"010000"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  case "$zo" in
+    *'10k tok'*) ok "panel token counts are read base-10" ;;
+    *)           bad "octal tokenCount rendered a fake spend ($zo)" ;;
+  esac
+  # R84: the date suffix is not always last - a 1M-context variant of a
+  # dated id carries its tag after the date, and a tail-anchored regex
+  # stripped nothing at all
+  zm=$(printf '{"columns":120,"tasks":[{"id":"zm1","label":"a","status":"running","tokenCount":68000,"model":"claude-sonnet-4-5-20250929[1m]"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  case "$zm" in
+    *'sonnet-4-5[1m]'*) ok "a dated id keeps its capacity tag and loses the date" ;;
+    *)                  bad "date suffix survived behind the tag ($zm)" ;;
+  esac
   # ---- adversarial-review round-20 regression asserts (2026-08-15) ----
   # R78: every reclaim judgement anchored on the LAST argv, so ANY
   # instance started with an argument was invisible - and the daemon
@@ -1125,14 +1185,6 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer idempotent rerun" || bad "installer rerun failed"
   rm -rf "$ihome"
 
-  # A --once daemon that wedges never registers and therefore has no
-  # reaper inside the project (round-20: two of them, started by earlier
-  # runs of THIS suite, were found burning 14 CPU-hours). Sweep anything
-  # this run may have left behind, by native pid so a cygwin-side wedge
-  # cannot survive it.
-  if command -v powershell.exe >/dev/null 2>&1; then
-    powershell.exe -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \"Name='bash.exe'\" | Where-Object { \$_.CommandLine -notmatch '\\s-c\\s' -and \$_.CommandLine -match 'statusline-panel-daemon\\.sh\\s+--once' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1
-  fi
   rm -rf "$tmpd"
   echo "----"
   [ "$fails" -eq 0 ] && echo "ALL PASS" || echo "$fails FAILURE(S)"
