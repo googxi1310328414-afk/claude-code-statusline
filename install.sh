@@ -216,6 +216,16 @@ smoke_line1=$(printf '%s' "$smoke_out" | sed -n 1p | sed 's/\x1b\[[0-9;]*m//g; s
 # 「非空」不够（round-15）：一行纯转义码同样非空。剥色后必须还剩可见内容，
 # 否则就是白屏——它长得跟成功一模一样，只有这一条判据能把它认出来。
 [ -n "$(printf '%s' "$smoke_line1" | tr -d ' \t')" ] || die "主状态栏冒烟渲染只有转义码（剥色后为空）"
+# 降级行同样「剥色后可见」（round-16）：渲染脚本无法渲染时输出的正是
+# 一行 `HH:MM:SS | statusline: degraded (fork)`——jq 在场但跑不通（不带
+# oniguruma 编译的 jq 使 gsub 未定义、jq 过老、脚本被截断），装机那一刻
+# fork 枯竭也会走到这里。旧判据把它当成功，于是一行命令告诉用户「已验证
+# 通过」，而此后每一帧状态栏永远只有那行降级文本。这类「长得跟成功一模
+# 一样」的失败正是冒烟要挡的东西。
+case "$smoke_line1" in
+  *'statusline: degraded'*|*'statusline: jq missing'*)
+    die "主状态栏冒烟只得到降级行（$smoke_line1）：jq 存在但不可用（gsub 需 oniguruma 支持）或版本过老，装完也只会是这一行" ;;
+esac
 say "✓ 主状态栏冒烟通过：$smoke_line1"
 
 panel_tmp=$(mktemp -d) || die "mktemp 失败"

@@ -950,6 +950,40 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-16 regression asserts (2026-08-15) ----
+  # R64: the smoke test must reject the renderer's OWN failure line. A jq
+  # that EXISTS but cannot run the filter (built without oniguruma, so
+  # gsub is undefined; or simply too old) makes every frame render
+  # "HH:MM:SS | statusline: degraded (fork)" - which is visible text, so
+  # the round-15 "strip colors, still non-empty" gate happily called it a
+  # pass and the installer told the user it had verified a working bar.
+  jqstub=$(mktemp -d)
+  printf '#!/bin/bash\necho "jq: error: gsub/2 is not defined" >&2\nexit 3\n' > "$jqstub/jq"
+  chmod +x "$jqstub/jq"
+  ihome2=$(mktemp -d)
+  mkdir -p "$ihome2/.claude"
+  if HOME="$ihome2" PATH="$jqstub:$PATH" bash ./install.sh >/dev/null 2>&1; then
+    bad "installer passed smoke on a degraded render"
+  else
+    ok "installer fails smoke when the bar can only render degraded"
+  fi
+  rm -rf "$jqstub" "$ihome2"
+  # R65: effort may arrive OBJECT-shaped (that is the main bar's payload
+  # shape, same producer) - clean's tostring then printed the raw JSON
+  # into the identity cell AND stole ~15 cells from every row's
+  # description, since the budget is one panel-wide number
+  eo=$(printf '{"columns":120,"tasks":[{"id":"eo1","label":"a","effort":{"level":"max"},"tokenCount":100}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  case "$eo" in
+    *'{'*) bad "object-shaped effort rendered as raw JSON ($eo)" ;;
+    *max*) ok "object-shaped effort renders like a scalar ($eo)" ;;
+    *)     bad "object-shaped effort lost the level ($eo)" ;;
+  esac
+  # R66: id is the protocol key handed BACK to the host, so it needs the
+  # same @tsv backslash decode the display fields get - a doubled
+  # backslash means the host cannot match the row and that agent silently
+  # keeps its default rendering
+  idbs=$(jq -nc --arg id 'a\b' '{columns:120,tasks:[{id:$id,label:"x",tokenCount:100}]}' | bash ./subagent-statusline.sh | jq -r .id)
+  [ "$idbs" = 'a\b' ] && ok "task id round-trips through the @tsv decode" || bad "id came back re-escaped ($idbs)"
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer idempotent rerun" || bad "installer rerun failed"
   rm -rf "$ihome"
 

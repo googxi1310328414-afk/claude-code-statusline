@@ -359,7 +359,15 @@ jq_all_out=$(jq -r '
             ((if ($task.name != null and $task.name != "") then $task.name elif ($task.label != null and $task.label != "") then $task.label elif ($task.type != null and $task.type != "") then $task.type else "" end) | clean),
             ($task.type // "" | clean),
             ($task.model // "" | clean),
-            ($task.effort // "" | clean),
+            # TYPE-NARROWED (round-16): clean starts with tostring, so an
+            # OBJECT-shaped effort - the shape the MAIN bar payload uses
+            # ({level:"max"}), one producer away from this one - was
+            # rendered verbatim into the identity cell as `.{"level":"max"}`.
+            # Worse than ugly: those ~15 columns enter col_max[0], and the
+            # description budget is ONE panel-wide number, so every row lost
+            # 15 cells of description because of one task. Drift now makes
+            # the segment disappear, like everywhere else in this project.
+            ($task.effort | if type=="object" then (.level? // "") elif type=="array" then "" else (. // "") end | clean),
             ($task.status // "" | clean),
             ($task.startTime // "" | clean),
             ($task.tokenCount // "" | clean),
@@ -498,6 +506,11 @@ for ((ti=0; ti<task_count_total; ti++)); do
     [ "$st_probe" -gt 1000000000000 ] && st_probe=$(( st_probe / 1000 ))
     { [ "$st_probe" -lt $(( samp_now - 604800 )) ] || [ "$st_probe" -gt $(( samp_now + 3600 )) ]; } && start_time=""
   fi
+  # id decodes too (round-16): it is the one field handed BACK to the
+  # host as a protocol key, so a stale doubled backslash means the host
+  # cannot match the row and that agent silently keeps its default
+  # rendering - every other cell looking correct all the while.
+  id=${id//"$BSL2"/"$BSL1"}
   identity_plain=${identity_plain//"$BSL2"/"$BSL1"}
   task_type=${task_type//"$BSL2"/"$BSL1"}
   description=${description//"$BSL2"/"$BSL1"}

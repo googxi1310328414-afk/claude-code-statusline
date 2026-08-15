@@ -63,7 +63,7 @@ curl -fsSL https://raw.githubusercontent.com/googxi1310328414-afk/claude-code-st
 ```bash
 bash test.sh            # 渲染演示（终端看真色彩）
 bash test.sh --codes    # ANSI 码可视化
-bash test.sh --assert   # 133 项断言（CI 用，含性能门槛与十五轮对抗审查回归组+配色断言）
+bash test.sh --assert   # 136 项断言（CI 用，含性能门槛与十六轮对抗审查回归组+配色断言）
 ```
 
 GitHub Actions 在每次 push 自动跑断言套件。

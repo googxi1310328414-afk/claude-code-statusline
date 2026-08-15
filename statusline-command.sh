@@ -813,7 +813,7 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
   #
   # UNKNOWN BASELINE IS NOT ZERO (round-14): du_sidprev only survives in
   # PER-SESSION rows, and three paths replace those with an _agg row
-  # (settled-day fold, the >400-row overflow merge at 3h, the 9-day trim).
+  # (settled-day fold, the terminal-row merge at 3h, the 9-day trim).
   # A session that returns afterwards - a background tab resuming, a
   # yesterday row merged away on a busy machine - was then seeded at base
   # 0, i.e. its whole inherited cumulative was booked as today's spend
@@ -1193,7 +1193,8 @@ if [ "$daily_persist_due" -eq 1 ]; then
   # no longer receive folds (the fine window is 90min), so their rows
   # collapse into ONE row per day under the reserved sid "_agg"
   # carrying the summed cents; today and yesterday stay per-session
-  # for the live state machine. A 500-row cap backstops the rest.
+  # for the live state machine, and the terminal-row merge below drops
+  # even those once their watermark leaves the fine window.
   SEP1=$''
   # 86400, not 172800 (round-15): the comment above - and the spec -
   # promise "today and yesterday stay per-session", but 48h resolves to
