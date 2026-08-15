@@ -950,6 +950,28 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-19 regression asserts (2026-08-15) ----
+  # R76: the identity falls back to the TYPE when name and label are both
+  # absent, and "(type)" is then suppressed as a duplicate - but that call
+  # was re-made on the TRUNCATED text, which truncation itself makes
+  # differ, so the type came back: the same string twice in one cell, a
+  # cell of ~2x the cap, and the panel-wide description budget crushed
+  # again (exactly what the cap exists to prevent).
+  tdup=$(printf '{"columns":80,"tasks":[{"id":"td1","type":"general-purpose-reviewer","status":"running","model":"claude-fable-5","tokenCount":68000,"description":"UNIQDESCX"},{"id":"td2","name":"researcher","status":"completed","model":"claude-fable-5","tokenCount":12000,"description":"UNIQDESCY"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  case "$tdup" in
+    *'(general-purpose-reviewer)'*) bad "truncated identity got its type appended back" ;;
+    *) ok "type is not re-appended to a truncated identity" ;;
+  esac
+  if printf '%s' "$tdup" | grep -q UNIQDESCX && printf '%s' "$tdup" | grep -q UNIQDESCY; then
+    ok "type-as-identity keeps the description column"
+  else
+    bad "type back-fill crushed the description budget"
+  fi
+  # R77: the concede path runs from inside the render wait loop, so it
+  # almost always has a child in flight - it needs the same native
+  # escalation the render deadline got, or one takeover race plus one
+  # wedged child leaves an immortal renderer nothing can reach
+  awk '/^quit_with_child\(\)/,/^}/' ./statusline-panel-daemon.sh | grep -q 'taskkill //F //PID' && ok "concede path escalates to a native kill" || bad "concede path only sends cygwin signals"
   # ---- adversarial-review round-18 regression asserts (2026-08-15) ----
   # R72: the hook is called DIRECTLY by the host, so hard requirement
   # 0c(a) applies to it too - and `cmd > file 2>/dev/null` does NOT cover

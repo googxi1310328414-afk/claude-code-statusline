@@ -523,8 +523,20 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # column still vanished panel-wide. That is precisely the outcome this
   # cap was added to prevent. Budget the decoration first, then give the
   # name whatever is left of a third of the terminal.
+  # DECIDE ONCE, BEFORE TRUNCATION (round-19): the identity falls back
+  # to the type when name and label are both absent, and "(type)" is
+  # then suppressed as a duplicate. The budget below made that call on
+  # the ORIGINAL text, but the printer re-made it on the TRUNCATED one -
+  # and truncation is exactly what makes the two differ, so "(type)" was
+  # appended after all: the same string printed twice in one cell, a
+  # cell of ~2x the cap, and the panel-wide description budget crushed
+  # again - the very outcome this cap exists to prevent (measured at
+  # columns=80 with a 24-char type: 52 cells, no descriptions on any
+  # row). One flag, decided once, used by both.
+  ident_is_type=0
+  [ -n "$task_type" ] && [ "$task_type" = "$identity_plain" ] && ident_is_type=1
   ident_deco=4
-  [ -n "$task_type" ] && [ "$task_type" != "$identity_plain" ] && ident_deco=$(( ident_deco + ${#task_type} + 2 ))
+  [ -n "$task_type" ] && [ "$ident_is_type" -eq 0 ] && ident_deco=$(( ident_deco + ${#task_type} + 2 ))
   [ -n "$effort" ] && ident_deco=$(( ident_deco + ${#effort} + 1 ))
   cell_cap=$(( columns / 3 ))
   [ "$cell_cap" -lt 16 ] && cell_cap=16
@@ -615,7 +627,7 @@ for ((ti=0; ti<task_count_total; ti++)); do
     seg1_plain="▸ ${identity_plain}"
     seg1="${GRAY}▸ ${RESET}${ident_color}${identity_plain}${RESET}"
 
-    if [ -n "$task_type" ] && [ "$task_type" != "$identity_plain" ]; then
+    if [ -n "$task_type" ] && [ "$ident_is_type" -eq 0 ]; then
       seg1_plain="${seg1_plain}(${task_type})"
       seg1="${seg1}${GRAY}(${task_type})${RESET}"
     fi

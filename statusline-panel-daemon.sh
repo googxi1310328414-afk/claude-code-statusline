@@ -200,6 +200,20 @@ quit_with_child() {
     # deadline's escalation, and test R35) would otherwise walk away
     kill -9 -- "-$r_pid_pub" 2>/dev/null
     kill -9 "$r_pid_pub" 2>/dev/null
+    # SAME NATIVE ESCALATION AS THE RENDER DEADLINE (round-19): a cygwin
+    # kill cannot touch a child wedged inside the cygwin DLL, and this
+    # path runs from inside the render wait loop - so conceding almost
+    # always means there IS a child in flight. Without this, one takeover
+    # race plus one wedged child = one immortal renderer, and the winning
+    # instance immediately overwrites line 4, leaving nothing that can
+    # reach it. /proc/<pid> is gone for a child that really died, so this
+    # never fires on a corpse.
+    if kill -0 "$r_pid_pub" 2>/dev/null && [ -r "/proc/$r_pid_pub/winpid" ]; then
+      q_wp=""
+      read -r q_wp < "/proc/$r_pid_pub/winpid" 2>/dev/null
+      [[ "$q_wp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
+        taskkill //F //PID "$q_wp" >/dev/null 2>&1
+    fi
     # the aborted render's tmp pair has no other sweeper on this path
     # (cache.* is only age-swept after a day)
     [ -n "${cache_tmp:-}" ] && rm -f "$cache_tmp" "${raw_tmp:-}" 2>/dev/null
