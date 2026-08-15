@@ -65,12 +65,13 @@ if (Test-Path $pidFile) {
 # fork，而它恰恰只在 fork 枯竭时才被走到：捕获为空、模式不匹配、于是什么都不
 # 杀却照样拉新，每 ~65 秒净增一个永不退出的实例（与 2026-08-14 的 78 孤儿事故
 # 同型，由它自己的修复重新引入）。钩子侧已改为纯内建读 cmdline，这里是**兜底**：
-# 一个既不在注册中、又活过绝对寿命闸两倍的 daemon，必然是卡在了它自己的检查点
+# 一个既不在注册中、又活过 5 分钟的 daemon，必然是卡在了它自己的检查点
 # 之外（寿命闸要求循环还在转），四条回收路径没有一条够得着它。
 # 判据仍是 argv 位置匹配 + 排除 `-c` 外壳（round-10 起在渲染脚本那条分支上验证
 # 过的同一套纪律），绝不用「命令行提及脚本名」那种会误杀诊断/测试外壳的模糊匹配。
-# 2 小时 = 默认寿命闸 1h 的两倍留足余量；若把 STATUSLINE_PANEL_DAEMON_MAX_LIFE
-# 调到 2h 以上，这里的阈值必须一起改大，否则会误杀健康的长寿实例。
+# 阈值与 STATUSLINE_PANEL_DAEMON_MAX_LIFE 无关（round-18 订正）：注册中的那个
+# 实例由 $regWpid 排除、活到自己的寿命闸都不会被碰，而未注册的实例无论寿命闸
+# 设多大都该在几秒内让位——把这里调大只会把第 17 轮刚补上的盲区重新开成小时级。
 # 300s, not 7200 (round-17): the third orphan storm minted one wedged
 # instance every ~65s, so a 2-hour grace let ~110 of them pile up. An
 # UNREGISTERED daemon is wrong within seconds by design - it concedes

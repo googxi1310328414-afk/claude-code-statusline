@@ -950,6 +950,30 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-18 regression asserts (2026-08-15) ----
+  # R72: the hook is called DIRECTLY by the host, so hard requirement
+  # 0c(a) applies to it too - and `cmd > file 2>/dev/null` does NOT cover
+  # a failure to OPEN the target, because bash reports that on the fd 2
+  # that is still the host's. One directory sitting where the spool file
+  # goes leaked a diagnostic to the host every ~5s tick.
+  hkdir="$tmpd/hookblack"
+  mkdir -p "$hkdir/spool.leak1.new"
+  printf '{"columns":120,"tasks":[{"id":"leak1","label":"x","tokenCount":5}]}' |
+    STATUSLINE_PANEL_DIR="$hkdir" STATUSLINE_PANEL_DAEMON=/dev/null bash ./statusline-panel-hook.sh >/dev/null 2>"$hkdir/err.txt"
+  [ -s "$hkdir/err.txt" ] && bad "hook leaked stderr to the host ($(head -c 80 "$hkdir/err.txt"))" || ok "hook keeps its stderr off the host"
+  rm -rf "$hkdir"
+  # R73: the native kill is the one action here that could hit a stranger
+  # if a pid were recycled, so it re-confirms the cmdline first - and that
+  # doubles as the liveness proof, since /proc/<pid> vanishes immediately
+  # for a process that really died while `kill -0` lingers
+  awk '/WINDOWS-SIDE ESCALATION/,/esac/' ./statusline-panel-hook.sh | grep -q 'argv_identity' && ok "native escalation re-confirms identity first" || bad "native escalation fires without a fresh identity check"
+  # R74: the render deadline exists for a child wedged in a Windows
+  # syscall - exactly what a cygwin kill cannot touch - so it needs the
+  # same escalation, else one immortal renderer leaks per timeout
+  grep -q 'taskkill //F //PID "$r_wp"' ./statusline-panel-daemon.sh && ok "render deadline escalates to a native kill" || bad "render deadline only sends cygwin signals"
+  # R75: a child that survives the deadline must STAY published on line 4,
+  # or nothing outside the daemon can ever reach it
+  grep -q 'r_survived' ./statusline-panel-daemon.sh && ok "a surviving render child stays reachable" || bad "give-up clears the only handle on a leaked child"
   # ---- adversarial-review round-17 regression asserts (2026-08-15) ----
   # R67: MSYS bash counts UTF-16 units, so one astral character (emoji,
   # CJK ext-B) is TWO "characters" - the description cut could land
@@ -970,8 +994,8 @@ sleep 300
   # pushed every other row's columns past `columns` and deleted the
   # description column panel-wide
   longid=$(jq -nc --argjson n "$(date +%s)" '{columns:120,tasks:[
-    {id:"li1",label:"修复第十七轮对抗审查中发现的全部实锤并回归测试",type:"local_agent",status:"running",model:"claude-fable-5",tokenCount:295000,startTime:(($n-1000)*1000),description:"UNIQUEDESCA"},
-    {id:"li2",label:"review",type:"local_agent",status:"running",model:"claude-haiku-4-5",tokenCount:68000,startTime:(($n-1000)*1000),description:"UNIQUEDESCB"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+    {id:"li1",label:"修复第十七轮对抗审查中发现的全部实锤并回归测试",type:"local_agent",effort:"high",status:"running",model:"claude-opus-5[1m]",tokenCount:295000,startTime:(($n-1000)*1000),description:"UNIQUEDESCA"},
+    {id:"li2",label:"并发竞争与性能视角的对抗审查代理2号",type:"local_agent",effort:"high",status:"running",model:"claude-opus-5[1m]",tokenCount:68000,startTime:(($n-1000)*1000),description:"UNIQUEDESCB"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
   case "$longid" in
     *…*) ok "over-long identity is truncated to its cap" ;;
     *)   bad "identity cell still has no width cap" ;;

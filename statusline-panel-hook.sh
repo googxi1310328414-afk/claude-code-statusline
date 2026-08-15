@@ -9,6 +9,18 @@
 # daemon (re)launch when the daemon pid is dead.
 export LC_ALL=C.UTF-8
 panel_dir="${STATUSLINE_PANEL_DIR:-$HOME/.claude/statusline-panel.d}"
+# STDERR BLACKBOX (round-18): hard requirement 0c(a) - anything the host
+# calls DIRECTLY must swallow its own stderr, because a single leaked
+# byte blanks the whole bar. The main bar and the daemon both did this;
+# the hook, which the host calls just as directly, did not. And the
+# per-command `> file 2>/dev/null` idiom does NOT cover it: bash applies
+# redirections left to right, so a failure to OPEN the target is
+# reported on the fd 2 that is still the host's (measured: a directory
+# sitting where the spool file goes leaks "Is a directory" to the host
+# every ~5s tick). Its own fork-exhaustion retries would leak the same
+# way - during exactly the storm this architecture exists to survive.
+# Shares the daemon's log, which the daemon already rotates at startup.
+[ -d "$panel_dir" ] && exec 2>>"$panel_dir/daemon-err.log"
 panel_daemon="${STATUSLINE_PANEL_DAEMON:-$HOME/.claude/statusline-panel-daemon.sh}"
 
 # chunked zero-fork stdin slurp (see the render scripts' identical block)
@@ -210,12 +222,25 @@ if [ "$daemon_alive" -eq 0 ]; then
         # from /proc/<pid>/winpid, i.e. from the very process we just
         # confirmed by cmdline - never from the pid file, which could be
         # stale. taskkill needs // to survive MSYS path mangling.
+        # RE-CONFIRM BEFORE ESCALATING (round-18): `kill -0` stays true
+        # for a moment after a SUCCESSFUL kill while the cygwin process
+        # table entry drains, so it alone cannot tell "wedged" from "just
+        # died". /proc/<pid> disappears immediately in the successful case
+        # (measured, both detached and child shapes), so re-reading the
+        # cmdline there is both the liveness proof and a fresh identity
+        # check - a native kill is the one action in this file that could
+        # hit a stranger if the pid were recycled, so it gets confirmed
+        # twice and never fires on a corpse.
         if kill -0 "$daemon_pid" 2>/dev/null; then
-          _wp=""
-          [ -r "/proc/$daemon_pid/winpid" ] && read -r _wp < "/proc/$daemon_pid/winpid" 2>/dev/null
-          [[ "$_wp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
-            taskkill //F //PID "$_wp" >/dev/null 2>&1
-          kill -0 "$daemon_pid" 2>/dev/null && reap_failed=1
+          argv_identity "$daemon_pid"
+          case "$REPLY_CMD" in
+            *statusline-panel-daemon.sh)
+              _wp=""
+              [ -r "/proc/$daemon_pid/winpid" ] && read -r _wp < "/proc/$daemon_pid/winpid" 2>/dev/null
+              [[ "$_wp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
+                taskkill //F //PID "$_wp" >/dev/null 2>&1
+              kill -0 "$daemon_pid" 2>/dev/null && [ -r "/proc/$daemon_pid/winpid" ] && reap_failed=1 ;;
+          esac
         fi ;;
     esac
   fi

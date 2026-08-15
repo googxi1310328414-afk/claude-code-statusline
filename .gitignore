@@ -25,3 +25,5 @@ out*.stderr
 *.debug.sh
 test_payload*.json
 astral*
+payload_*.json
+trace_*.txt

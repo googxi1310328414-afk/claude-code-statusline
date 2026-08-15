@@ -155,6 +155,10 @@ render_seq=0
 # pid of the render child while one is in flight, published on line 4
 # of the pid file by the next beat so an external reaper can reach it
 r_pid_pub=""
+# bumped only when a timed-out render child outlives its reap, so the
+# capture file it may still be writing into is never reused
+raw_gen=0
+r_survived=0
 last_hb=0
 [ "$once" -eq 0 ] && last_hb=$hb_now
 # WALL-CLOCK heartbeat (round-4 fix for a round-3 regression): the first
@@ -271,7 +275,7 @@ while :; do
     # i.e. it never got past the next external command. A stable name
     # also avoids the delete-pending problem the per-render seq exists
     # for, since nothing is ever unlinked while open.
-    raw_tmp="$panel_dir/cache.$key.raw.$$"
+    raw_tmp="$panel_dir/cache.$key.raw.$$.$raw_gen"
     # own process group (job control) so the timeout path can signal
     # the renderer AND its grandchildren as one unit
     set -m 2>/dev/null
@@ -324,8 +328,32 @@ while :; do
         sleep 0.3 2>/dev/null || break
         r_reap=$(( r_reap + 1 ))
       done
+      # NATIVE ESCALATION (round-18): this deadline exists for a child
+      # wedged inside a Windows syscall, and round-17 measured that a
+      # cygwin kill -9 cannot kill exactly that - only TerminateProcess
+      # on the native pid can. Without it the daemon "gave up" on an
+      # immortal renderer every render_timeout and started another: one
+      # permanent process per ~15s, four times the rate of the daemon
+      # storm this was patterned after, and nothing else could reach
+      # them (the hook only sees line 4, which give-up used to clear).
+      # /proc/<pid> is already gone for a child that really died, so
+      # this can never fire on a corpse.
+      if kill -0 "$r_pid" 2>/dev/null && [ -r "/proc/$r_pid/winpid" ]; then
+        r_wp=""
+        read -r r_wp < "/proc/$r_pid/winpid" 2>/dev/null
+        [[ "$r_wp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
+          taskkill //F //PID "$r_wp" >/dev/null 2>&1
+      fi
+      if kill -0 "$r_pid" 2>/dev/null && [ -r "/proc/$r_pid/winpid" ]; then
+        # still alive: keep its pid published on line 4 so the hook and
+        # install can still reach it, and switch capture generations -
+        # that file now belongs to a process we do not control, and a
+        # late flush into a REUSED name would interleave itself into the
+        # next frame, which the -s gate would then publish as good.
+        r_survived=1
+        raw_gen=$(( raw_gen + 1 ))
+      fi
       rm -f "$cache_tmp" 2>/dev/null
-      : > "$raw_tmp" 2>/dev/null
       frame_bad=1
     elif wait "$r_pid" 2>/dev/null && [ -s "$raw_tmp" ]; then
       # -s gate: a renderer that exits 0 with EMPTY output (fork
@@ -364,7 +392,9 @@ while :; do
         bad_streak[$key]=0
       fi
     fi
-    r_pid_pub=""
+    # keep publishing a child that outlived its reap (see above)
+    [ "$r_survived" -eq 0 ] && r_pid_pub=""
+    r_survived=0
     rm -f "$panel_dir/render.$key" 2>/dev/null
     worked=1
   done
@@ -390,6 +420,6 @@ if [ "$once" -eq 0 ]; then
   cur_holder=""
   [ -r "$panel_dir/daemon.pid" ] && read -r cur_holder < "$panel_dir/daemon.pid"
   [ "$cur_holder" = "$$" ] && rm -f "$panel_dir/daemon.pid" 2>/dev/null
-  rm -f "$tick_fifo" "$panel_dir"/cache.*.raw.$$ 2>/dev/null
+  rm -f "$tick_fifo" "$panel_dir"/cache.*.raw.$$.* 2>/dev/null
 fi
 exit 0

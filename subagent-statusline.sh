@@ -512,25 +512,26 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # rendering - every other cell looking correct all the while.
   id=${id//"$BSL2"/"$BSL1"}
   identity_plain=${identity_plain//"$BSL2"/"$BSL1"}
-  # IDENTITY WIDTH CAP (round-17): the identity cell had none, and its
-  # width goes straight into col_max[0] - which both pads EVERY row and
-  # is subtracted from the ONE panel-wide description budget. A
-  # local_agent's identity is its `label`, i.e. whatever sentence the
-  # caller wrote (this project's own agents get 20-30 Chinese chars =
-  # 40-60 cells), so one long task pushed the model/tok/rate/share/
-  # elapsed cells of every OTHER row past `columns` and deleted the
-  # description column panel-wide. Same failure shape as the round-16
-  # effort drift, but triggered by ordinary use rather than schema
-  # drift. Cap: a third of the terminal, clamped to [12, 48] cells.
+  task_type=${task_type//"$BSL2"/"$BSL1"}
+  description=${description//"$BSL2"/"$BSL1"}
+  # IDENTITY CELL CAP (round-17, corrected round-18): the cap has to
+  # bound the whole CELL, not just the name inside it. Column 0 is
+  # "▸ " + identity + "(type)" + "·effort" + " <glyph>", and for a
+  # local_agent the type and glyph are always there - so capping only the
+  # text left the cell at cap+22 cells, and at the common 120 columns the
+  # panel-wide description budget still went negative and the description
+  # column still vanished panel-wide. That is precisely the outcome this
+  # cap was added to prevent. Budget the decoration first, then give the
+  # name whatever is left of a third of the terminal.
+  ident_deco=4
+  [ -n "$task_type" ] && [ "$task_type" != "$identity_plain" ] && ident_deco=$(( ident_deco + ${#task_type} + 2 ))
+  [ -n "$effort" ] && ident_deco=$(( ident_deco + ${#effort} + 1 ))
+  cell_cap=$(( columns / 3 ))
+  [ "$cell_cap" -lt 16 ] && cell_cap=16
+  [ "$cell_cap" -gt 60 ] && cell_cap=60
+  ident_cap=$(( cell_cap - ident_deco ))
+  [ "$ident_cap" -lt 8 ] && ident_cap=8
   if [ -n "$identity_plain" ]; then
-    # a QUARTER of the terminal, not a third: at the common 120 columns a
-    # 40-cell identity plus the five fixed columns already leaves the
-    # description under its 8-cell minimum, i.e. the panel-wide
-    # description column would still vanish - just from a legal cap
-    # instead of an unbounded one
-    ident_cap=$(( columns / 4 ))
-    [ "$ident_cap" -lt 12 ] && ident_cap=12
-    [ "$ident_cap" -gt 40 ] && ident_cap=40
     # bounded measure, same trick as the description: display width is
     # always >= char count, so more chars than the cap must overflow
     if [ "${#identity_plain}" -gt "$ident_cap" ]; then
@@ -549,6 +550,7 @@ for ((ti=0; ti<task_count_total; ti++)); do
         iacc=$(( iacc + idw ))
         icut=$(( ii + 1 ))
       done
+      # never split a surrogate pair (see the description cut)
       if [ "$icut" -gt 0 ]; then
         printf -v ilastc '%d' "'${identity_plain:icut-1:1}" 2>/dev/null || ilastc=0
         [ "$ilastc" -ge 55296 ] && [ "$ilastc" -le 56319 ] && icut=$(( icut - 1 ))
@@ -556,8 +558,6 @@ for ((ti=0; ti<task_count_total; ti++)); do
       identity_plain="${identity_plain:0:$icut}…"
     fi
   fi
-  task_type=${task_type//"$BSL2"/"$BSL1"}
-  description=${description//"$BSL2"/"$BSL1"}
 
   # column 1: identity segment: "▸ " + identity (STATE-COLORED, see
   # below) + "(type)" (gray) + "·"+effort (heat-colored) + " "+status
