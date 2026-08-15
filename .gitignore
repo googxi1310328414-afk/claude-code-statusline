@@ -19,3 +19,9 @@ innocent.txt
 mg.sh
 extracted_*.bin
 *.bin
+measure_width.sh
+out*.jsonl
+out*.stderr
+*.debug.sh
+test_payload*.json
+astral*
