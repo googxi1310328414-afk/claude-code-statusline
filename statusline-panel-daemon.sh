@@ -367,7 +367,10 @@ while :; do
         r_survived=1
         raw_gen=$(( raw_gen + 1 ))
       fi
-      rm -f "$cache_tmp" 2>/dev/null
+      # no rm here (round-20): $cache_tmp is only ever CREATED in the
+      # success branch below and mv'd away in the same breath, so on
+      # this path it never exists - and `rm` is a fork, on the one path
+      # that only runs when forking is already failing.
       frame_bad=1
     elif wait "$r_pid" 2>/dev/null && [ -s "$raw_tmp" ]; then
       # -s gate: a renderer that exits 0 with EMPTY output (fork
@@ -393,7 +396,6 @@ while :; do
         mv -f "$cache_tmp" "$panel_dir/cache.$key" 2>/dev/null
       bad_streak[$key]=0
     else
-      rm -f "$cache_tmp" 2>/dev/null
       : > "$raw_tmp" 2>/dev/null
       frame_bad=1
     fi

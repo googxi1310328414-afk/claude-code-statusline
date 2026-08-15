@@ -516,9 +516,23 @@ session_name="${F[27]}"; transcript_path="${F[28]}"; model_id="${F[29]}"
 # so the segment disappears (the project's "never render a fake
 # reading" line) instead of lying. Same discipline as the {1,3}/{1,9}/
 # {1,13} caps on remaining/cost/resets_at.
+# ...and NORMALISED TO BASE 10 (round-20): bash arithmetic reads a
+# leading-zero literal as OCTAL, while `test -gt` reads it as decimal -
+# so a host that sends a numeric field as a zero-padded STRING (a drift
+# this project already treats as real: round-6 added clean to every
+# field for exactly that reason) passed every guard and then rendered a
+# FABRICATED number with no error at all: cache_read "060000" printed
+# "cache 90.5% r24.5k" instead of 92.3% / r60.0k. An 8 or 9 in such a
+# string fails arithmetic outright ("value too great for base"), which
+# at least fails loudly - the silent wrong reading is the one that
+# breaks the "never render a fake reading" line.
 for _numf in in_tokens win_size out_tokens_ctx cache_r cache_w cache_i added removed; do
-  if [ -n "${!_numf}" ] && [[ ! "${!_numf}" =~ ^[0-9]{1,12}$ ]]; then
-    printf -v "$_numf" '%s' ""
+  if [ -n "${!_numf}" ]; then
+    if [[ "${!_numf}" =~ ^[0-9]{1,12}$ ]]; then
+      printf -v "$_numf" '%s' "$(( 10#${!_numf} ))"
+    else
+      printf -v "$_numf" '%s' ""
+    fi
   fi
 done
 
@@ -618,7 +632,11 @@ cost_to_cents() {
     decpart="${decpart}0"
   done
   [[ "$decpart" =~ ^[0-9]{2}$ ]] || return 1
-  REPLY=$(( intpart * 100 + 10#$decpart ))
+  # both halves need 10# (round-20): decpart had it, intpart did not, so
+  # a zero-padded "08.50" failed arithmetic every frame and silently
+  # took today/week/$-per-hour down with it while the cost itself kept
+  # rendering - the bar looked completely healthy
+  REPLY=$(( 10#$intpart * 100 + 10#$decpart ))
 }
 
 # --- history state file (used by the token-rate/sparkline and cost-rate
@@ -922,7 +940,17 @@ for (( hi=hist_count-1; hi>=0; hi-- )); do
   hline=${hist_all_lines[hi]}
   h_epoch=${hline%%[$'\x1f\t']*}
   h_epoch=${h_epoch//$'\r'/}
-  [[ "$h_epoch" =~ ^[0-9]+$ ]] || { hist_stop_streak=0; continue; }
+  # DIGIT CAP (round-20): this was the ONE numeric gate in the project
+  # without one, while the rollup loader caps the SAME field at 13. A
+  # 20-digit epoch (torn/interleaved O_APPEND, a truncated write that
+  # the next append concatenated onto, a hand-edited row - all of which
+  # the read contract promises to tolerate) passed every shape check,
+  # then turned each `-gt`/`-le` into "integer expected" (which returns
+  # FALSE, i.e. "do not skip"): it was folded as a real row, poisoned
+  # du_watermark with garbage, and from the next frame on the "already
+  # folded" gate failed for every later row - week DOUBLED until the
+  # ~30min rewrite dropped it, plus 6 blackbox lines per frame.
+  [[ "$h_epoch" =~ ^[0-9]{1,13}$ ]] || { hist_stop_streak=0; continue; }
   if [ "$h_epoch" -lt "$hist_scan_horizon" ]; then
     h_psid=${hline#*[$'\x1f\t']}
     h_psid=${h_psid%%[$'\x1f\t']*}
@@ -944,7 +972,7 @@ hist_probe_failed=0
 for (( hi=0; hi<hist_count && hi<20; hi++ )); do
   h_epoch=${hist_all_lines[hi]%%[$'\x1f\t']*}
   h_epoch=${h_epoch//$'\r'/}
-  if [[ "$h_epoch" =~ ^[0-9]+$ ]] && [ "$h_epoch" -le "$hist_future_cutoff" ]; then
+  if [[ "$h_epoch" =~ ^[0-9]{1,13}$ ]] && [ "$h_epoch" -le "$hist_future_cutoff" ]; then
     hist_oldest_epoch="$h_epoch"
     break
   fi
@@ -970,7 +998,7 @@ for (( hi=hist_tail_start; hi<hist_count; hi++ )); do
   [[ "$h_rest" != *$'\x1f'* ]] && continue
   [[ "$h_rest2" != *$'\x1f'* ]] && continue
   [[ "$h_cost" == *$'\x1f'* ]] && continue
-  [[ "$h_epoch" =~ ^[0-9]+$ ]] || continue
+  [[ "$h_epoch" =~ ^[0-9]{1,13}$ ]] || continue
   # CLOCK-ROLLBACK GUARD: rows stamped >1h in the future (wall clock
   # stepped back since they were written) are dropped whole - folding
   # them would book their spend onto a future day and re-poison the
@@ -1352,7 +1380,7 @@ if [ -n "$session_id" ] && [ "$should_append" -eq 1 ]; then
       [[ "$h_rest" != *$'\x1f'* ]] && continue
       [[ "$h_rest2" != *$'\x1f'* ]] && continue
       [[ "$h_cost" == *$'\x1f'* ]] && continue
-      [[ "$h_epoch" =~ ^[0-9]+$ ]] || continue
+      [[ "$h_epoch" =~ ^[0-9]{1,13}$ ]] || continue
       [ "$h_epoch" -gt "$hist_future_cutoff" ] && continue
       [ "$h_epoch" -ge "$hist_time_cutoff" ] && hist_trimmed+=("$hline")
     done

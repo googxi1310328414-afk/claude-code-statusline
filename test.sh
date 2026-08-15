@@ -950,6 +950,41 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-20 regression asserts (2026-08-15) ----
+  # R78: every reclaim judgement anchored on the LAST argv, so ANY
+  # instance started with an argument was invisible - and the daemon
+  # ships its own `--once` switch, whose instances never register and can
+  # therefore only ever be reclaimed by the watchdog's orphan branch. Two
+  # wedged argument-bearing instances were measured burning 14 CPU-hours
+  # on this machine, having survived 150+ two-minute watchdog ticks.
+  grep -q 'bash(\\.exe)?"?' ./statusline-watchdog.ps1 && ok "watchdog anchors on bash's first argv" || bad "watchdog still anchors on the last argv (--once invisible)"
+  grep -c 'sh"?\\s\*\$' ./statusline-watchdog.ps1 | grep -q '^0$' && ok "no tail-anchored judgement left in the watchdog" || bad "a tail-anchored judgement survives"
+  # R79: the fine history epoch was the ONE numeric gate without a digit
+  # cap; a 20-digit epoch passed every shape check, poisoned the
+  # watermark, and week DOUBLED from the next frame on
+  : > "$STATUSLINE_DAILY_FILE"
+  S20=''
+  {
+    printf '%s%ss1%s50000%s0.10\n' "$((now-300))" "$S20" "$S20" "$S20"
+    printf '%s%ss1%s60000%s0.20\n' "$((now-200))" "$S20" "$S20" "$S20"
+    printf '%s%s%ss1%s65000%s0.25\n' "$((now-150))" "$((now-150))" "$S20" "$S20" "$S20"
+    printf '%s%ss1%s70000%s0.30\n' "$((now-100))" "$S20" "$S20" "$S20"
+  } > "$STATUSLINE_HISTORY_FILE"
+  ep1=$(jq '.session_id="s1"|.cost.total_cost_usd=0.40' fixtures/full.json | bash ./statusline-command.sh | strip | grep -o 'week \$[0-9.]*' | head -1)
+  ep2=$(jq '.session_id="s1"|.cost.total_cost_usd=0.40' fixtures/full.json | bash ./statusline-command.sh | strip | grep -o 'week \$[0-9.]*' | head -1)
+  ep3=$(jq '.session_id="s1"|.cost.total_cost_usd=0.40' fixtures/full.json | bash ./statusline-command.sh | strip | grep -o 'week \$[0-9.]*' | head -1)
+  if [ "$ep1" = "$ep2" ] && [ "$ep2" = "$ep3" ]; then
+    ok "an over-long epoch row cannot double week ($ep1)"
+  else
+    bad "over-long epoch poisoned the watermark ($ep1 -> $ep2 -> $ep3)"
+  fi
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R80: bash arithmetic reads a leading-zero literal as OCTAL while
+  # `test` reads it as decimal, so a zero-padded numeric STRING from the
+  # host rendered a fabricated cache reading with no error at all
+  oct=$(jq '.context_window.current_usage.input_tokens="02000"|.context_window.current_usage.cache_creation_input_tokens="03000"|.context_window.current_usage.cache_read_input_tokens="060000"' fixtures/full.json | bash ./statusline-command.sh | strip | grep -o 'cache [0-9.]*%' | head -1)
+  [ "$oct" = "cache 92.3%" ] && ok "zero-padded numerics are read base-10 ($oct)" || bad "octal drift rendered a fake cache reading ($oct, want cache 92.3%)"
   # ---- adversarial-review round-19 regression asserts (2026-08-15) ----
   # R76: the identity falls back to the TYPE when name and label are both
   # absent, and "(type)" is then suppressed as a duplicate - but that call
@@ -1090,6 +1125,14 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer idempotent rerun" || bad "installer rerun failed"
   rm -rf "$ihome"
 
+  # A --once daemon that wedges never registers and therefore has no
+  # reaper inside the project (round-20: two of them, started by earlier
+  # runs of THIS suite, were found burning 14 CPU-hours). Sweep anything
+  # this run may have left behind, by native pid so a cygwin-side wedge
+  # cannot survive it.
+  if command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \"Name='bash.exe'\" | Where-Object { \$_.CommandLine -notmatch '\\s-c\\s' -and \$_.CommandLine -match 'statusline-panel-daemon\\.sh\\s+--once' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1
+  fi
   rm -rf "$tmpd"
   echo "----"
   [ "$fails" -eq 0 ] && echo "ALL PASS" || echo "$fails FAILURE(S)"
