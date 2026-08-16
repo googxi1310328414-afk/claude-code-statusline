@@ -46,7 +46,7 @@
 # this daemon - by design, since the daemon legitimately runs long).
 # The render is now launched in the background and awaited on the same
 # zero-spawn fifo tick, with a hard deadline
-# ($STATUSLINE_PANEL_RENDER_TIMEOUT seconds, default 15, ~50x a normal
+# ($STATUSLINE_PANEL_RENDER_TIMEOUT seconds, default 15, floor 1, measured on the WALL CLOCK, ~50x a normal
 # render): on expiry the child is killed, the frame is skipped, and the
 # next spool retries - the daemon itself can no longer be wedged by its
 # child. The 0.3s idle tick uses the fifo `read -t` trick - zero spawns
@@ -85,10 +85,15 @@ if [[ "$render_timeout" =~ ^[0-9]{1,5}$ ]]; then
 else
   render_timeout=15
 fi
-# deadline in 0.3s ticks (integer ceil-ish; 15s -> 50 ticks)
-render_ticks=$(( render_timeout * 10 / 3 ))
-[[ "$render_ticks" =~ ^[0-9]+$ ]] || render_ticks=50
-[ "$render_ticks" -lt 1 ] && render_ticks=1
+# THE FLOOR BELONGS ON THE TIMEOUT ITSELF (round-27): it used to sit on
+# render_ticks, and round-26 replaced tick counting with a wall-clock
+# deadline - leaving the guard attached to a variable nobody reads any
+# more. With the floor gone, RENDER_TIMEOUT=0 (which the digit test
+# accepts, and which reads naturally as "no timeout") made the deadline
+# equal to now: every render was killed before its first statement,
+# every frame was bad, and three of those blank the cache for good -
+# "no timeout" turned into "the panel never renders again".
+[ "$render_timeout" -lt 1 ] && render_timeout=1
 
 err_log="$panel_dir/daemon-err.log"
 if [ -f "$err_log" ]; then
@@ -444,7 +449,6 @@ while :; do
     # cannot fork at all - which is exactly when killing a working
     # render and blanking every panel is the worst possible answer.
     r_deadline=$(( SECONDS + render_timeout ))
-    r_waited=0
     while kill -0 "$r_pid" 2>/dev/null; do
       [ "$SECONDS" -ge "$r_deadline" ] && break
       if [ -p "$tick_fifo" ]; then
@@ -452,7 +456,6 @@ while :; do
       else
         sleep 0.3 2>/dev/null
       fi
-      r_waited=$(( r_waited + 1 ))
       # keep the wall-clock heartbeat alive DURING renders too - a hung
       # child otherwise starves the beat for up to render_timeout per
       # spool and gets this live daemon judged dead (see hb_beat)
@@ -477,16 +480,29 @@ while :; do
       # jq) are reaped by killing the whole process GROUP when the
       # shell supports job control; otherwise they exit on their own
       # once their pipe closes.
+      # BEAT THROUGH THE REAP TOO (round-27): everything below is a
+      # fork (kill is a builtin, but sleep and taskkill are not), and
+      # this path only ever runs when forking is already failing - a
+      # single `sleep` then blocks ~31s inside bash's make_child retry
+      # ladder. Measured heartbeat age peaked at 62s with just two of
+      # them, one second past the hook's 60s liveness gate: a daemon
+      # doing its timeout recovery correctly got judged dead, killed,
+      # and replaced by a stand-in that walks into the same trap. The
+      # wait loop got its checkpoints in round-4; the reap never did.
       kill "$r_pid" 2>/dev/null
       kill -- "-$r_pid" 2>/dev/null
+      hb_beat
       sleep 0.3 2>/dev/null
+      hb_beat
       kill -9 "$r_pid" 2>/dev/null
       kill -9 -- "-$r_pid" 2>/dev/null
       r_reap=0
       while kill -0 "$r_pid" 2>/dev/null && [ "$r_reap" -lt 4 ]; do
         sleep 0.3 2>/dev/null || break
+        hb_beat
         r_reap=$(( r_reap + 1 ))
       done
+      hb_beat
       # NATIVE ESCALATION (round-18): this deadline exists for a child
       # wedged inside a Windows syscall, and round-17 measured that a
       # cygwin kill -9 cannot kill exactly that - only TerminateProcess

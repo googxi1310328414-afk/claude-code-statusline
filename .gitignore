@@ -31,3 +31,4 @@ trace_*.txt
 caught.txt
 trace*.txt
 .local/
+out_repro_*

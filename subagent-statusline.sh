@@ -358,15 +358,28 @@ jq_all_out=$(jq -r '
   # trace at all, and the daemon read the empty output as a bad frame.
   | ($tasks_raw | if type == "array" then map(select(type == "object")) else [] end) as $tasks
   | ($tasks | length) as $tcount
-  | ([$tasks[]? | .model // empty | select(length>0)] | group_by(.) | max_by(length) | .[0] // "") as $majority_model
+  # length on a BOOLEAN is a jq ERROR (round-27), and jq aborts the whole
+  # filter on it: the capture came back empty, the row count computed to
+  # 0, and one task with "model": true blanked the ENTIRE panel - with
+  # jq stderr swallowed, so not a byte anywhere. false/null are absorbed
+  # by //, objects and arrays render fine; only true hit it. The value is
+  # not even displayed any more (the model column is its own field); it
+  # is kept purely to hold the scalar slot.
+  | ([$tasks[]? | .model // empty | select(type=="string" and length>0)] | group_by(.) | max_by(length) | .[0] // "") as $majority_model
   # ONE GATE FOR ALL THREE (round-26): the per-row numerator goes
   # through clean (tostring), so a string-shaped tokenCount - the drift
   # shape this project has treated as real since round-6 - was counted
   # in the numerator but dropped from the denominator, and that row
   # rendered a share of 30000% in the bright-red tier while the other
   # rows summed past 100. Accept the same values everywhere.
-  | ([$tasks[]? | .tokenCount // 0 | tostring | select(test("^[0-9]+$")) | tonumber] | add // 0 | tostring) as $total_tokens
-  | ([$tasks[]? | .tokenCount // empty | tostring | select(test("^[0-9]+$")) | tonumber | select(. > 0)] | length | tostring) as $tokened_count
+  # the MAGNITUDE cap belongs here too (round-27): round-26 unified the
+  # TYPE gate, but the 12-digit cap that keeps int64 arithmetic honest
+  # lived only on the per-row numerator - so a 13-digit tokenCount
+  # correctly dropped its own cells yet still entered the denominator and
+  # still satisfied the "2 tasks with tokens" display gate, and every
+  # OTHER row then rendered a fabricated 0%.
+  | ([$tasks[]? | .tokenCount // 0 | tostring | select(test("^[0-9]{1,12}$")) | tonumber] | add // 0 | tostring) as $total_tokens
+  | ([$tasks[]? | .tokenCount // empty | tostring | select(test("^[0-9]{1,12}$")) | tonumber | select(. > 0)] | length | tostring) as $tokened_count
   | ($columns | clean), ($majority_model | clean), $total_tokens, $tokened_count,
     (
       range(0; $tcount) as $i
@@ -429,13 +442,18 @@ fi
 # each task's cumulative tokenCount is ALSO sampled here, at most one row
 # per task every 10s, into a small state file - giving every sparkline
 # bar a KNOWN ~10s span (the main script's history file does the same
-# for the session chart at a 20s step). Row shape: epoch/task_id/count,
+# for the session chart, at a 30s step). ROW SHAPE (corrected round-27 -
+# this block had drifted two formats behind the writer, and field ORDER
+# is exactly what one earlier drift got wrong, writing startTime into
+# the trend file):
+#   task_id<0x1F>last_epoch<0x1F>csv-of-up-to-9-token-counts
 # 0x1F-separated like every other state file in this pair. Reads apply
-# strict whole-row validation (exactly 3 columns, numeric epoch/count -
-# malformed rows dropped whole, never partially trusted) plus a 1h read
-# window (the trend needs ~90s of samples; churned-away task ids age out
-# with it); expired rows vanish for good at the next slack-triggered
-# rewrite. Multiple concurrent
+# strict whole-row validation (exactly 3 columns; the third is a COMMA
+# LIST validated as digits-and-commas only, not a single number -
+# malformed rows dropped whole, never partially trusted) plus a 1800s
+# read window (the trend needs ~90s of samples; churned-away task ids
+# age out with it); expired rows vanish for good at the next
+# slack-triggered rewrite. Multiple concurrent
 # sessions share the file: task ids are globally unique so rows never
 # clash logically, and the rewrite (after PASS 1) goes through a per-PID
 # tmp + atomic mv, so a same-tick race is last-writer-wins with the

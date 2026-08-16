@@ -1050,6 +1050,14 @@ for (( hi=hist_tail_start; hi<hist_count; hi++ )); do
   # this session's rate/sparkline arrays + the throttle's last epoch
   if [ -n "$session_id" ] && [ "$h_sid" = "$session_id" ]; then
     last_hist_epoch="$h_epoch"
+    # cap + base 10 like every other external numeric (round-27): this
+    # column feeds the sparkline deltas and the token rate directly, so
+    # a 20-digit value wrapped int64 into a 14-digit fake rate (a width
+    # bomb as well as a lie), and a zero-padded one was read as decimal
+    # by `test` but as OCTAL by $(( )), turning a +8000 step negative.
+    if [[ "$h_tok" =~ ^[0-9]{1,13}$ ]]; then
+      printf -v h_tok '%s' "$(( 10#$h_tok ))"
+    fi
     if [[ "$h_tok" =~ ^[0-9]+$ ]]; then
       tok_epochs+=("$h_epoch")
       tok_values+=("$h_tok")

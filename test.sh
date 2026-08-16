@@ -990,6 +990,31 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-27 regression asserts (2026-08-17) ----
+  # R103: jq's `length` on a BOOLEAN is an error, and jq aborts the whole
+  # filter - one task with "model": true emitted zero rows, exit 0, with
+  # the error swallowed, and three such frames blank the cache.
+  mb=$(jq -c '.tasks[2].model = true' fixtures/subagent-tasks.json | bash ./subagent-statusline.sh | jq -r .id | grep -c '^t[123]')
+  [ "${mb:-0}" -eq 3 ] && ok "a boolean model cannot blank the panel" || bad "boolean model took the panel down (${mb:-0}/3 rows)"
+  # R104: RENDER_TIMEOUT=0 is accepted by the digit test and reads as "no
+  # timeout" - after round-26 moved to a wall-clock deadline it meant the
+  # opposite: every render killed before its first statement
+  z0="$tmpd/zerotmo"
+  mkdir -p "$z0"
+  cp fixtures/subagent-tasks.json "$z0/spool.z1.new"
+  STATUSLINE_PANEL_DIR="$z0" STATUSLINE_PANEL_RENDERER="$PWD/subagent-statusline.sh"     STATUSLINE_SUBAGENT_TREND_FILE="$tmpd/z0trend" STATUSLINE_PANEL_RENDER_TIMEOUT=0     once_daemon ./statusline-panel-daemon.sh --once >/dev/null 2>&1
+  [ -s "$z0/cache.z1" ] && ok "a zero render timeout cannot kill every frame" || bad "RENDER_TIMEOUT=0 killed the render"
+  rm -rf "$z0"
+  # R105: the share denominator needs the numerator's 12-digit magnitude
+  # cap too - a 13-digit tokenCount dropped its own cells but still
+  # entered the denominator, so every other row rendered a fake 0%
+  bs=$(printf '{"columns":150,"tasks":[{"id":"bs1","label":"a","status":"running","tokenCount":99999999999999999999},{"id":"bs2","label":"b","status":"running","tokenCount":1000},{"id":"bs3","label":"c","status":"running","tokenCount":3000}]}' | bash ./subagent-statusline.sh | jq -r .content | strip | grep -o 'Σ[0-9]*%' | tr -d '' | tr '
+' ' ')
+  [ "$bs" = 'Σ25% Σ75% ' ] && ok "an over-large token count cannot zero everyone's share" || bad "share denominator ignored the magnitude cap ($bs)"
+  # R106: the reap path after a render timeout is all forks and only runs
+  # under fork exhaustion - without heartbeat checkpoints a healthy daemon
+  # went >60s without beating and the hook judged it dead
+  awk '/deadline expired/,/frame_bad=1/' ./statusline-panel-daemon.sh | grep -c 'hb_beat' | grep -qv '^[01]$' && ok "the reap path keeps beating" || bad "no heartbeat checkpoint in the reap path"
   # ---- adversarial-review round-26 regression asserts (2026-08-17) ----
   # R99: a render that cannot use the fifo AND cannot fork `sleep` used
   # to break out of the wait loop at tick 0, and the branch after it
