@@ -30,3 +30,4 @@ trace_*.txt
 .tmp_*
 caught.txt
 trace*.txt
+.local/

@@ -990,6 +990,39 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-25 regression asserts (2026-08-17) ----
+  # R95: the blackbox redirect must never leave fd 2 with the host - not
+  # even when it is the redirect itself that fails. The main bar had no
+  # pre-check at all, and the hook's round-24 pre-check merely SKIPPED
+  # the redirect, so every later diagnostic (including bash's own
+  # fork-retry storm) still went straight to the bar.
+  bbh="$tmpd/bbhome"
+  mkdir -p "$bbh/.claude/statusline-err.log"
+  HOME="$bbh" bash ./statusline-command.sh < fixtures/full.json >/dev/null 2>"$tmpd/bb_host.txt"
+  [ -s "$tmpd/bb_host.txt" ] && bad "main bar leaked stderr when its log could not be opened ($(head -c 60 "$tmpd/bb_host.txt"))" || ok "main bar falls back instead of leaking to the host"
+  bbp="$tmpd/bbpanel"
+  mkdir -p "$bbp/daemon-err.log" "$bbp/spool.bb1.new"
+  printf '{"columns":120,"tasks":[{"id":"bb1","label":"x","tokenCount":5}]}' |
+    STATUSLINE_PANEL_DIR="$bbp" STATUSLINE_PANEL_DAEMON=/dev/null bash ./statusline-panel-hook.sh >/dev/null 2>"$tmpd/bb_hook.txt"
+  [ -s "$tmpd/bb_hook.txt" ] && bad "hook leaked stderr when its log could not be opened" || ok "hook falls back instead of leaking to the host"
+  rm -rf "$bbh" "$bbp"
+  # R96: the last two env knobs needed the cap+10# too - a 20-digit TTL
+  # wrapped int64 into an 18-digit fake countdown, "0900" discarded the
+  # whole countdown block, "07200" was silently read as octal
+  tt=$(STATUSLINE_CACHE_TTL_SECONDS=99999999999999999999 bash ./statusline-command.sh < fixtures/full.json | strip | sed -n 2p)
+  case "$tt" in
+    *[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]m*) bad "an over-long cache TTL rendered a fabricated countdown ($tt)" ;;
+    *) ok "an over-long cache TTL cannot fabricate a countdown" ;;
+  esac
+  # R97: the tick fifo must be swept by LIVENESS, not age - its mtime
+  # never advances, so an age gate deleted live instances' fifos and
+  # dropped them into the external-sleep fallback (~200 forks/minute)
+  grep -q 'tick.\*.fifo' ./statusline-panel-daemon.sh && ok "tick fifos are swept by liveness" || bad "tick fifo still swept by age"
+  grep -q 'fifo_retry_at' ./statusline-panel-daemon.sh && ok "a failed mkfifo is retried, not given up on" || bad "mkfifo is tried once and never again"
+  # R98: the native escalation must re-confirm identity at the moment it
+  # fires - the render deadline reaches it only after ~1.5s of bounded
+  # reaping, plenty of time for the pid to have been recycled
+  grep -c 'child_is_renderer' ./statusline-panel-daemon.sh | grep -qv '^[012]$' && ok "every native escalation re-confirms identity" || bad "an escalation path skips the identity re-check"
   # ---- adversarial-review round-24 regression asserts (2026-08-16) ----
   # R92: the env knobs need the same cap+10# as payload fields. "09"
   # passed the bare digit test, failed the arithmetic, left render_ticks

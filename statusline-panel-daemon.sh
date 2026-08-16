@@ -95,7 +95,17 @@ if [ -f "$err_log" ]; then
   mapfile -t -n 501 _el < "$err_log" 2>/dev/null
   [ "${#_el[@]}" -gt 500 ] && : > "$err_log" 2>/dev/null
 fi
-exec 2>>"$err_log"
+# same discipline as the bar and the hook (round-25): a redirect that
+# cannot open its target reports that on the fd it is replacing, and
+# leaves it in place afterwards - so fall back to /dev/null instead of
+# running the whole daemon with the caller's stderr
+if [ ! -d "$err_log" ] &&
+   { { [ -e "$err_log" ] && [ -w "$err_log" ]; } ||
+     { [ ! -e "$err_log" ] && [ -w "$panel_dir" ]; }; }; then
+  exec 2>>"$err_log"
+else
+  exec 2>/dev/null
+fi
 
 # pid file format: FOUR lines - cygwin_pid / heartbeat_epoch /
 # windows_pid / in-flight render child pid (empty when idle). Lines 3
@@ -139,7 +149,18 @@ if [ "$once" -eq 0 ]; then
   # per-PID tmp files a killed hook/daemon left behind (age-gated so a
   # LIVE instance's in-flight tmp, seconds old, is never swept)
   rm -f "$panel_dir"/render.* 2>/dev/null
-  find "$panel_dir" \( -name 'cache.*' -mmin +1440 -o -name 'spool.*.tmp.*' -mmin +10 -o -name 'daemon.pid.tmp.*' -mmin +10 -o -name 'cache.*.raw.*' -mmin +10 -o -name '.tick.*' -mmin +10 \) -delete 2>/dev/null
+  find "$panel_dir" \( -name 'cache.*' -mmin +1440 -o -name 'spool.*.tmp.*' -mmin +10 -o -name 'daemon.pid.tmp.*' -mmin +10 -o -name 'cache.*.raw.*' -mmin +10 \) -delete 2>/dev/null
+  # FIFOS ARE SWEPT BY LIVENESS, NOT AGE (round-25): a fifo's mtime
+  # never advances, so an age gate deleted the tick fifo of any
+  # instance older than the threshold - and losing it drops that
+  # daemon into the external-sleep fallback (~200 forks/minute). The
+  # pid is in the name, so ask whether that process is still alive.
+  for _tf in "$panel_dir"/.tick.*.fifo; do
+    _tp=${_tf##*/.tick.}
+    _tp=${_tp%.fifo}
+    [[ "$_tp" =~ ^[0-9]{1,10}$ ]] || continue
+    kill -0 "$_tp" 2>/dev/null || rm -f "$_tf" 2>/dev/null
+  done
 fi
 
 # PER-INSTANCE FIFO (round-17): every instance used to do timed reads on
@@ -152,6 +173,15 @@ fi
 # by the next start (below) instead of being inherited.
 tick_fifo="$panel_dir/.tick.$$.fifo"
 [ -p "$tick_fifo" ] || mkfifo "$tick_fifo" 2>/dev/null
+# RETRYABLE (round-25): mkfifo is itself a fork, run on the one path
+# that only happens when something is already wrong - so it is exactly
+# the step most likely to fail under fork exhaustion. It used to be
+# tried once and never again, and the fallback tick is an EXTERNAL
+# sleep: a resident process then forked ~200 times a minute for up to
+# an hour, amplifying the very shortage it just hit. Retry at most
+# once a minute instead (bounded to 1 fork/min in the bad case, 0 in
+# the good one).
+fifo_retry_at=$(( SECONDS + 60 ))
 
 # ABSOLUTE LIFETIME CAP (round-9): a daemon that wedges ANYWHERE
 # outside the beat checkpoints can no longer be detected by its own
@@ -275,7 +305,7 @@ quit_with_child() {
     # instance immediately overwrites line 4, leaving nothing that can
     # reach it. /proc/<pid> is gone for a child that really died, so this
     # never fires on a corpse.
-    if kill -0 "$r_pid_pub" 2>/dev/null && [ -r "/proc/$r_pid_pub/winpid" ]; then
+    if kill -0 "$r_pid_pub" 2>/dev/null && child_is_renderer "$r_pid_pub" && [ -r "/proc/$r_pid_pub/winpid" ]; then
       q_wp=""
       read -r q_wp < "/proc/$r_pid_pub/winpid" 2>/dev/null
       [[ "$q_wp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
@@ -446,7 +476,12 @@ while :; do
       # them (the hook only sees line 4, which give-up used to clear).
       # /proc/<pid> is already gone for a child that really died, so
       # this can never fire on a corpse.
-      if kill -0 "$r_pid" 2>/dev/null && [ -r "/proc/$r_pid/winpid" ]; then
+      # RE-CONFIRM BEFORE THE NATIVE KILL (round-25): the documented
+      # recipe says to check the cmdline again at this point, and this
+      # path gets here only AFTER TERM/KILL/group kills and up to 1.5s
+      # of bounded reaping - plenty of room for the child to have died
+      # and its cygwin pid to have been recycled onto something else.
+      if kill -0 "$r_pid" 2>/dev/null && child_is_renderer "$r_pid" && [ -r "/proc/$r_pid/winpid" ]; then
         r_wp=""
         read -r r_wp < "/proc/$r_pid/winpid" 2>/dev/null
         [[ "$r_wp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
@@ -534,6 +569,10 @@ while :; do
   if [ -p "$tick_fifo" ]; then
     read -t 0.3 -r _tick <> "$tick_fifo" 2>/dev/null
   else
+    if [ "$SECONDS" -ge "$fifo_retry_at" ]; then
+      fifo_retry_at=$(( SECONDS + 60 ))
+      mkfifo "$tick_fifo" 2>/dev/null
+    fi
     sleep 0.3 2>/dev/null || break
   fi
 done

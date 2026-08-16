@@ -30,12 +30,15 @@ panel_dir="${STATUSLINE_PANEL_DIR:-$HOME/.claude/statusline-panel.d}"
 # else runs while stderr still belongs to the host.
 [ -d "$panel_dir" ] || exit 0
 hook_log="$panel_dir/daemon-err.log"
-if [ ! -d "$hook_log" ]; then
-  if [ -e "$hook_log" ]; then
-    [ -w "$hook_log" ] && exec 2>>"$hook_log"
-  else
-    [ -w "$panel_dir" ] && exec 2>>"$hook_log"
-  fi
+# and when it CANNOT be opened, fd 2 must still leave the host
+# (round-25): skipping the redirect left every later diagnostic -
+# including bash's own fork-retry storm - going straight to the bar.
+if [ ! -d "$hook_log" ] &&
+   { { [ -e "$hook_log" ] && [ -w "$hook_log" ]; } ||
+     { [ ! -e "$hook_log" ] && [ -w "$panel_dir" ]; }; }; then
+  exec 2>>"$hook_log"
+else
+  exec 2>/dev/null
 fi
 panel_daemon="${STATUSLINE_PANEL_DAEMON:-$HOME/.claude/statusline-panel-daemon.sh}"
 

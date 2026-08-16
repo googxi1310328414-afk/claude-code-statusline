@@ -34,7 +34,21 @@ statusline_err_log="$HOME/.claude/statusline-err.log"
 # the rare (~30min) history-rewrite path further down, where a single
 # `find -size` test decides it; the blackbox stays bounded, at a
 # cadence appropriate for a debug log.
-exec 2>>"$statusline_err_log"
+# NEVER LEAVE fd 2 WITH THE HOST (round-25): the redirection's own
+# failure is reported on the fd it is trying to replace, and after it
+# fails fd 2 stays the host's for the WHOLE render - so the very
+# fork-exhaustion diagnostics this blackbox exists for leak too. A
+# read-only log, a directory sitting in its place, or a missing state
+# dir is enough. Pre-check with pure builtins, and when the log cannot
+# be opened fall back to /dev/null: losing the blackbox is a bad day,
+# leaking one byte to the host is a white bar.
+if [ ! -d "$statusline_err_log" ] &&
+   { { [ -e "$statusline_err_log" ] && [ -w "$statusline_err_log" ]; } ||
+     { [ ! -e "$statusline_err_log" ] && [ -w "${statusline_err_log%/*}" ]; }; }; then
+  exec 2>>"$statusline_err_log"
+else
+  exec 2>/dev/null
+fi
 # Claude Code status line (detailed layout, ANSI colors, FOUR printed
 # lines, column-aligned, narrow-terminal adaptive)
 #
@@ -2262,7 +2276,11 @@ if [ "$COLUMNS" -ge 100 ] && [ -n "$transcript_path" ] && [ -f "$transcript_path
   # freshness/compaction segments. 512KiB keeps ~4x headroom over the
   # largest entry seen while still being one cheap seek+read.
   tail_bytes="${STATUSLINE_TRANSCRIPT_TAIL_BYTES:-524288}"
-  [[ "$tail_bytes" =~ ^[0-9]+$ ]] || tail_bytes=524288
+  if [[ "$tail_bytes" =~ ^[0-9]{1,9}$ ]]; then
+    printf -v tail_bytes '%s' "$(( 10#$tail_bytes ))"
+  else
+    tail_bytes=524288
+  fi
   # O(bytes) TRAP FIXED (adversarial review, 2026-08-14): the old
   # `mapfile <<<` split of the whole tail window ran at a measured
   # ~3.5us PER BYTE on MSYS - ~1.8s of EVERY frame once a long session
@@ -2372,7 +2390,16 @@ if [ -n "$cache_seg" ] && [ -n "$cache_cand_ts" ] && command -v date >/dev/null 
     cache_ts_epoch=$(date -d "$cache_ts" +%s 2>/dev/null)
     if [[ "$cache_ts_epoch" =~ ^[0-9]+$ ]]; then
       cache_ttl="${STATUSLINE_CACHE_TTL_SECONDS:-3600}"
-      [[ "$cache_ttl" =~ ^[0-9]+$ ]] || cache_ttl=3600
+      # cap + base 10, like every other external numeric (round-25):
+      # without the cap a 20-digit TTL wrapped int64 and rendered an
+      # 18-digit fake countdown (also a width bomb); without 10# a
+      # padded "0900" failed arithmetic and bash discarded the whole
+      # countdown block, while "07200" was silently read as octal 3712.
+      if [[ "$cache_ttl" =~ ^[0-9]{1,7}$ ]]; then
+        printf -v cache_ttl '%s' "$(( 10#$cache_ttl ))"
+      else
+        cache_ttl=3600
+      fi
       cache_remaining=$(( cache_ttl - 5 - (now_epoch - cache_ts_epoch) ))
       if [ "$cache_remaining" -le 0 ]; then
         cache_fresh_text="cold"
