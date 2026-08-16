@@ -155,7 +155,7 @@ if [ "$daemon_updated" -eq 1 ]; then
   # 正是它存在的理由；安全性由这里自己这份同等严格的判据保证。
   # 且只有真的杀掉了才算「已回收」——原先无条件置位，什么都没杀也报成功。
   if [[ "$old_wp" =~ ^[0-9]+$ ]] && command -v powershell.exe >/dev/null 2>&1; then
-    ps_killed=$(powershell.exe -NoProfile -NonInteractive -Command "\$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$old_wp\" -ErrorAction SilentlyContinue; if (\$p -and \$p.Name -eq 'bash.exe' -and \$p.CommandLine -notmatch '\s-c\s' -and \$p.CommandLine -match 'statusline-panel-daemon\.sh\"?\s*\$') { Stop-Process -Id $old_wp -Force -ErrorAction SilentlyContinue; 'KILLED' }" 2>/dev/null | tr -d '\r\n')
+    ps_killed=$(powershell.exe -NoProfile -NonInteractive -Command "\$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$old_wp\" -ErrorAction SilentlyContinue; if (\$p -and \$p.Name -eq 'bash.exe' -and \$p.CommandLine -notmatch '\s-c\s' -and \$p.CommandLine -match 'bash(\.exe)?\"?\s+\"?[^\"]*statusline-panel-daemon\.sh(\s|\"|\$)') { Stop-Process -Id $old_wp -Force -ErrorAction SilentlyContinue; 'KILLED' }" 2>/dev/null | tr -d '\r\n')
     [ "$ps_killed" = "KILLED" ] && recycled=1
   fi
   [ "$recycled" -gt 0 ] && say "✓ 旧面板 daemon 已回收——下一拍钩子自动以新版拉起"

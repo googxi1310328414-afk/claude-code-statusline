@@ -43,13 +43,29 @@ once_sweep() {
   powershell.exe -NoProfile -NonInteractive -Command "\$c=(Get-Date).AddSeconds(-120); Get-CimInstance Win32_Process -Filter \"Name='bash.exe'\" | Where-Object { \$_.CommandLine -notmatch '\\s-c\\s' -and \$_.CommandLine -match 'statusline-panel-daemon\\.sh\\s+--once' -and \$_.CreationDate -lt \$c } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1
 }
 once_daemon() {
+  # -k, or the bound is not a bound (round-22): plain `timeout` sends
+  # ONE SIGTERM and then keeps waiting, and the wedge shape this whole
+  # guard exists for is precisely the signal-immune one (measured:
+  # `timeout 2 bash -c 'trap "" TERM; sleep 20'` returns after 20s).
+  # -k adds the follow-up KILL, which cygwin still may not deliver -
+  # so the trap sweep below remains the real backstop, and this is
+  # only here to keep the suite itself moving.
   if command -v timeout >/dev/null 2>&1; then
-    timeout 60 bash "$@"
+    timeout -k 5 60 bash "$@"
   else
     bash "$@"
   fi
 }
-trap 'once_sweep; rm -rf "$(dirname "$STATUSLINE_HISTORY_FILE")"' EXIT INT TERM
+# a signal handler that RETURNS resumes the script (round-22): the
+# round-21 version deleted the whole isolated state directory and then
+# let the remaining hundred-odd assertions run against a directory that
+# no longer exists - a screenful of failures unrelated to anything, a
+# second sweep from the EXIT trap, and exit code 0. Signals must clean
+# up AND leave.
+cleanup_all() { once_sweep; rm -rf "$(dirname "$STATUSLINE_HISTORY_FILE")"; }
+trap cleanup_all EXIT
+trap 'cleanup_all; trap - EXIT; exit 130' INT
+trap 'cleanup_all; trap - EXIT; exit 143' TERM
 
 strip() { perl -pe 's/\e\[[0-9;]*m//g; s/\e\]8;;[^\e]*\e\\//g'; }
 filter() { if [ "$1" = "--codes" ]; then sed 's/\x1b/\\e/g'; else cat; fi; }
@@ -974,6 +990,28 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-22 regression asserts (2026-08-16) ----
+  # R85: columns was the last host numeric without a digit cap and a 10#
+  # normalisation - and it feeds arithmetic INSIDE the per-task loop, so
+  # "089" took the whole panel down (zero rows, exit 0) while "0120" laid
+  # it out 40 cells narrow with no error at all
+  cw1=$(printf '{"columns":"089","tasks":[{"id":"cw1","label":"alpha","status":"running","tokenCount":5000,"description":"hello"}]}' | bash ./subagent-statusline.sh | jq -r .id | tr -d '\r')
+  [ "$cw1" = "cw1" ] && ok "a zero-padded columns cannot blank the panel" || bad "columns drift blanked the panel ($cw1)"
+  cw2=$(printf '{"columns":"0120","tasks":[{"id":"cw2","label":"alpha","status":"running","tokenCount":5000,"description":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  cw3=$(printf '{"columns":120,"tasks":[{"id":"cw2","label":"alpha","status":"running","tokenCount":5000,"description":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip)
+  [ "$cw2" = "$cw3" ] && ok "a zero-padded columns lays out like the decimal one" || bad "octal columns changed the layout"
+  # R86: the panel jq guarded the CONTAINER but not the ELEMENTS, so one
+  # scalar inside .tasks aborted the whole filter - and every task
+  # vanished, including the ones before it, with jq's error swallowed
+  ne2=$(printf '{"columns":120,"tasks":[{"id":"ne1","label":"y","tokenCount":1,"description":"dd"},"str",{"id":"ne2","label":"z","tokenCount":2,"description":"ee"}]}' | bash ./subagent-statusline.sh | jq -r .id | tr -d '\r' | tr '\n' ' ')
+  [ "$ne2" = "ne1 ne2 " ] && ok "a non-object task element only drops itself" || bad "one bad element took the whole panel ($ne2)"
+  # R87: a render child that outlives even the native kill must stay
+  # reachable - r_pid_pub is a single scalar the next render overwrites
+  # within one tick, so round-18's "stay published" lasted one frame
+  grep -q 'r_orphans' ./statusline-panel-daemon.sh && ok "surviving render children stay published" || bad "a survivor's pid is overwritten by the next render"
+  # R88: install's Windows-side reclaim must use the same argv anchor as
+  # the watchdog, or an argument-bearing daemon is invisible to it too
+  grep -qF 'bash(\.exe)?' ./install.sh && ok "installer uses the argv-anchored judgement" || bad "installer still tail-anchors its judgement"
   # ---- adversarial-review round-21 regression asserts (2026-08-15) ----
   # R81: round-20 normalised eight fields and left five. A zero-padded
   # percentage does not merely mis-read - bash aborts the WHOLE compound

@@ -349,7 +349,14 @@ jq_all_out=$(jq -r '
   def clean: tostring | gsub("[\t\n\r]"; " ") | gsub("[\u0001-\u001f]"; "");
   (.columns // "") as $columns
   | (.tasks // []) as $tasks_raw
-  | ($tasks_raw | if type == "array" then . else [] end) as $tasks
+  # NON-OBJECT ELEMENTS ARE DROPPED, NOT FATAL (round-22): the container
+  # was guarded but the ELEMENTS were not, so one scalar or array inside
+  # .tasks made jq abort the whole filter on "Cannot index number with
+  # string" - not just that row: the capture came back empty, the row
+  # count computed to 0, and EVERY task disappeared, including the ones
+  # BEFORE the bad element. jq stderr is swallowed here, so it left no
+  # trace at all, and the daemon read the empty output as a bad frame.
+  | ($tasks_raw | if type == "array" then map(select(type == "object")) else [] end) as $tasks
   | ($tasks | length) as $tcount
   | ([$tasks[]? | .model // empty | select(length>0)] | group_by(.) | max_by(length) | .[0] // "") as $majority_model
   | ([$tasks[]? | .tokenCount // 0 | select(type=="number")] | add // 0 | tostring) as $total_tokens
@@ -393,7 +400,21 @@ columns="${JL[0]}"
 majority_model="${JL[1]}"
 total_tokens="${JL[2]}"
 tokened_count="${JL[3]}"
-[[ "$columns" =~ ^[0-9]+$ ]] || columns=120
+# THE LAST ONE (round-22): rounds 20 and 21 gave every other host
+# numeric a digit cap and a 10# normalisation; columns kept a bare
+# ^[0-9]+$ - and it feeds TWO arithmetic sites, one of them inside
+# PASS 1's per-task loop. "0120" was read as octal 80 and the whole
+# panel silently laid itself out 40 cells narrow; "089" failed
+# arithmetic outright, and bash discards the enclosing compound
+# command - here the ENTIRE per-task loop, so the panel emitted zero
+# rows with exit 0, the daemon called it a bad frame, and three of
+# those blank the cache for as long as the host keeps sending it.
+if [[ "$columns" =~ ^[0-9]{1,6}$ ]]; then
+  printf -v columns '%s' "$(( 10#$columns ))"
+  [ "$columns" -lt 20 ] && columns=120
+else
+  columns=120
+fi
 [[ "$total_tokens" =~ ^[0-9]+$ ]] || total_tokens=0
 [[ "$tokened_count" =~ ^[0-9]+$ ]] || tokened_count=0
 

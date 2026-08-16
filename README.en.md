@@ -50,7 +50,7 @@ It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES s
 ```bash
 bash test.sh          # render all fixtures (see real colors in your terminal)
 bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
-bash test.sh --assert # 161 assertions (CI mode; perf gates + twenty-one adversarial-review regression groups + color asserts)
+bash test.sh --assert # 166 assertions (CI mode; perf gates + twenty-two adversarial-review regression groups + color asserts)
 ```
 
 ## Notable engineering notes

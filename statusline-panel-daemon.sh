@@ -159,6 +159,9 @@ r_pid_pub=""
 # capture file it may still be writing into is never reused
 raw_gen=0
 r_survived=0
+# render children that outlived even the native kill: they stay on
+# line 4 of the pid file (space separated) until they really die
+r_orphans=""
 last_hb=0
 [ "$once" -eq 0 ] && last_hb=$hb_now
 # WALL-CLOCK heartbeat (round-4 fix for a round-3 regression): the first
@@ -222,6 +225,22 @@ quit_with_child() {
 }
 hb_beat() {
   [ "$once" -eq 1 ] && return 0
+  # retry the survivors (see r_orphans) and drop the ones that died
+  if [ -n "$r_orphans" ]; then
+    _still=""
+    for _op in $r_orphans; do
+      kill -0 "$_op" 2>/dev/null || continue
+      kill -9 "$_op" 2>/dev/null
+      if kill -0 "$_op" 2>/dev/null && [ -r "/proc/$_op/winpid" ]; then
+        _owp=""
+        read -r _owp < "/proc/$_op/winpid" 2>/dev/null
+        [[ "$_owp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
+          taskkill //F //PID "$_owp" >/dev/null 2>&1
+      fi
+      kill -0 "$_op" 2>/dev/null && _still="${_still}${_still:+ }$_op"
+    done
+    r_orphans="$_still"
+  fi
   printf -v hb_t '%(%s)T' -1
   # CLOCK-ROLLBACK GUARD (round-9): a backwards clock step makes the
   # delta NEGATIVE, which is also "< 5" - the beat then froze for the
@@ -239,12 +258,12 @@ hb_beat() {
   hb_cur=""
   [ -r "$panel_dir/daemon.pid" ] && read -r hb_cur < "$panel_dir/daemon.pid"
   if [ "$hb_cur" = "$$" ]; then
-    printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "$r_pid_pub" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
+    printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "${r_pid_pub}${r_orphans:+ }${r_orphans}" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
   elif [ -n "$hb_cur" ] && kill -0 "$hb_cur" 2>/dev/null; then
     quit_with_child
   else
     rm -f "$panel_dir/daemon.pid" 2>/dev/null
-    ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "$r_pid_pub" > "$panel_dir/daemon.pid" ) 2>/dev/null || quit_with_child
+    ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "${r_pid_pub}${r_orphans:+ }${r_orphans}" > "$panel_dir/daemon.pid" ) 2>/dev/null || quit_with_child
   fi
 }
 # per-key consecutive bad-frame counter (round-3 fix): the -s keep-frame
@@ -364,6 +383,18 @@ while :; do
         # that file now belongs to a process we do not control, and a
         # late flush into a REUSED name would interleave itself into the
         # next frame, which the -s gate would then publish as good.
+        # KEEP IT PUBLISHED FOR GOOD (round-22): r_pid_pub is a single
+        # scalar that the NEXT render overwrites within one tick (~5s,
+        # or immediately when another key is in the same glob), so
+        # round-18's "stay reachable" lasted exactly one frame. A
+        # child that outlived even taskkill is precisely the one that
+        # must stay reachable, so survivors accumulate in a list that
+        # is published alongside the current child and retried on
+        # every beat until they are really gone.
+        case " $r_orphans " in
+          *" $r_pid "*) : ;;
+          *) r_orphans="${r_orphans}${r_orphans:+ }$r_pid" ;;
+        esac
         r_survived=1
         raw_gen=$(( raw_gen + 1 ))
       fi
