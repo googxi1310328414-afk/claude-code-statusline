@@ -20,7 +20,23 @@ panel_dir="${STATUSLINE_PANEL_DIR:-$HOME/.claude/statusline-panel.d}"
 # every ~5s tick). Its own fork-exhaustion retries would leak the same
 # way - during exactly the storm this architecture exists to survive.
 # Shares the daemon's log, which the daemon already rotates at startup.
-[ -d "$panel_dir" ] && exec 2>>"$panel_dir/daemon-err.log"
+# THE REDIRECT ITSELF MUST NOT LEAK (round-24): its OWN failure (a
+# directory sitting where the log goes, an unwritable file or dir) is
+# reported on the fd it is trying to replace - the very leak this line
+# exists to stop. It cannot be wrapped in a redirected group either:
+# bash restores fds when the group ends, which silently undoes the
+# exec. So the two realistic failure modes are pre-checked with pure
+# builtins, and the state-directory check moves up here so nothing
+# else runs while stderr still belongs to the host.
+[ -d "$panel_dir" ] || exit 0
+hook_log="$panel_dir/daemon-err.log"
+if [ ! -d "$hook_log" ]; then
+  if [ -e "$hook_log" ]; then
+    [ -w "$hook_log" ] && exec 2>>"$hook_log"
+  else
+    [ -w "$panel_dir" ] && exec 2>>"$hook_log"
+  fi
+fi
 panel_daemon="${STATUSLINE_PANEL_DAEMON:-$HOME/.claude/statusline-panel-daemon.sh}"
 
 # chunked zero-fork stdin slurp (see the render scripts' identical block)
@@ -83,7 +99,6 @@ if [ -n "$key" ]; then
   key=${key:0:24}
 fi
 [ -n "$key" ] || exit 0
-[ -d "$panel_dir" ] || exit 0
 
 # newest-wins spool handoff, ONE builtin direct write (round-3 fix): the
 # old tmp+mv pair spent a real fork+exec on mv (~50ms measured) inside
@@ -257,7 +272,16 @@ if [ "$daemon_alive" -eq 0 ]; then
   # so the branch was skipped entirely and NOTHING was reaped, not even
   # the current child. The one change made to keep survivors reachable
   # closed the only path that could reach them; iterate instead.
-  for _rp in $daemon_rpid; do
+  # ALSO THE PERSISTED LIST (round-24): a daemon that died of idleness
+  # or its lifetime cap takes the pid file with it, so line 4 is gone
+  # exactly when a survivor is least reachable. The daemon keeps the
+  # same list in a small file that outlives it; read both. (We do NOT
+  # gate the respawn below on these: the survivor is already tracked
+  # and retried by whatever daemon comes next, and refusing to spawn
+  # would trade a leaked renderer for a permanently dark panel.)
+  _rp_file=""
+  [ -r "$panel_dir/orphans" ] && read -r _rp_file < "$panel_dir/orphans" 2>/dev/null
+  for _rp in $daemon_rpid $_rp_file; do
     [[ "$_rp" =~ ^[0-9]{1,10}$ ]] || continue
     kill -0 "$_rp" 2>/dev/null || continue
     argv_identity "$_rp"

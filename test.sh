@@ -990,6 +990,29 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-24 regression asserts (2026-08-16) ----
+  # R92: the env knobs need the same cap+10# as payload fields. "09"
+  # passed the bare digit test, failed the arithmetic, left render_ticks
+  # EMPTY, and every later comparison errored to false - the render hard
+  # deadline was silently switched off, back to the single point of
+  # failure it exists to remove.
+  printf '#!/bin/bash\nsleep 60\n' > "$tmpd/oct_hang.sh"
+  printf '{"columns":120,"tasks":[{"id":"oc1","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.oc1.new"
+  oc_t0=$SECONDS
+  STATUSLINE_PANEL_RENDERER="$tmpd/oct_hang.sh" STATUSLINE_PANEL_RENDER_TIMEOUT=09 once_daemon ./statusline-panel-daemon.sh --once
+  oc_el=$(( SECONDS - oc_t0 ))
+  [ "$oc_el" -lt 25 ] && ok "a zero-padded render timeout still deadlines (${oc_el}s)" || bad "octal env knob disabled the render deadline (${oc_el}s)"
+  rm -f "$STATUSLINE_PANEL_DIR"/render.oc1 "$STATUSLINE_PANEL_DIR"/cache.oc1* 2>/dev/null
+  # R93: the identity check must follow the CONFIGURED renderer - with
+  # STATUSLINE_PANEL_RENDERER pointed at any other filename (which every
+  # daemon test here does) a hardcoded name made it return false for the
+  # daemon's own child, undoing rounds 22-23 by configuration alone
+  grep -q 'renderer##\*/' ./statusline-panel-daemon.sh && ok "identity check follows the configured renderer" || bad "identity check hardcodes the renderer name"
+  # R94: the survivor list must outlive the daemon - idle death, the
+  # lifetime cap and every concede used to throw it away along with the
+  # pid file, hiding the one process nothing else can reach
+  grep -q 'orphan_file' ./statusline-panel-daemon.sh && ok "survivors persist across daemon restarts" || bad "survivor list dies with the daemon"
+  grep -q 'panel_dir/orphans' ./statusline-panel-hook.sh && ok "the hook reads the persisted survivor list" || bad "hook only knows line 4"
   # ---- adversarial-review round-23 regression asserts (2026-08-16) ----
   # R89: line 4 of the pid file became a LIST in round-22, and both
   # consumers still matched the whole line against ^[0-9]+$ - a space

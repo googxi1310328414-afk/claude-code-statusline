@@ -71,10 +71,23 @@ renderer="${STATUSLINE_PANEL_RENDERER:-$HOME/.claude/subagent-statusline.sh}"
 once=0
 [ "$1" = "--once" ] && once=1
 
+# CAP + BASE 10 (round-24): hard requirement 2 applies to env knobs as
+# much as to payload fields. "09" passed the bare digit test, then
+# failed the arithmetic below - which left render_ticks EMPTY, made
+# the "-lt 1" fallback error out (false) too, and turned the wait
+# loop's deadline test into a per-tick error that is always false:
+# the render hard timeout was silently switched OFF, back to the
+# single point of failure it exists to remove, plus ~3 blackbox lines
+# a second. "015" was quietly read as octal 13.
 render_timeout="${STATUSLINE_PANEL_RENDER_TIMEOUT:-15}"
-[[ "$render_timeout" =~ ^[0-9]+$ ]] || render_timeout=15
+if [[ "$render_timeout" =~ ^[0-9]{1,5}$ ]]; then
+  printf -v render_timeout '%s' "$(( 10#$render_timeout ))"
+else
+  render_timeout=15
+fi
 # deadline in 0.3s ticks (integer ceil-ish; 15s -> 50 ticks)
 render_ticks=$(( render_timeout * 10 / 3 ))
+[[ "$render_ticks" =~ ^[0-9]+$ ]] || render_ticks=50
 [ "$render_ticks" -lt 1 ] && render_ticks=1
 
 err_log="$panel_dir/daemon-err.log"
@@ -148,7 +161,14 @@ tick_fifo="$panel_dir/.tick.$$.fifo"
 # exit; a live session simply gets a fresh instance from the next hook
 # tick (cold-missing one frame, the same cost as any respawn).
 daemon_max_life="${STATUSLINE_PANEL_DAEMON_MAX_LIFE:-3600}"
-[[ "$daemon_max_life" =~ ^[0-9]+$ ]] || daemon_max_life=3600
+# same cap+base-10 discipline: a 20-digit value made the SECONDS
+# comparison error out (always false) and the absolute lifetime cap
+# stopped existing (round-24)
+if [[ "$daemon_max_life" =~ ^[0-9]{1,7}$ ]]; then
+  printf -v daemon_max_life '%s' "$(( 10#$daemon_max_life ))"
+else
+  daemon_max_life=3600
+fi
 shopt -s nullglob
 idle=0
 render_seq=0
@@ -159,8 +179,25 @@ r_pid_pub=""
 # capture file it may still be writing into is never reused
 raw_gen=0
 # render children that outlived even the native kill: they stay on
-# line 4 of the pid file (space separated) until they really die
+# line 4 of the pid file (space separated) until they really die.
+# PERSISTED (round-24): the list used to be a plain local, so idle
+# death (~2min), the 1h lifetime cap and every concede threw it away
+# together with the pid file - and the survivor, which is by
+# definition a process nothing else can reach, went invisible to all
+# three consumers. A one-line file carries it across instances; each
+# new daemon loads it, prunes whatever has since died, and keeps
+# retrying. Written with a builtin redirect (no fork) on the beat.
+orphan_file="$panel_dir/orphans"
 r_orphans=""
+if [ -r "$orphan_file" ]; then
+  read -r r_orphans < "$orphan_file" 2>/dev/null
+  _kept=""
+  for _lp in $r_orphans; do
+    [[ "$_lp" =~ ^[0-9]{1,10}$ ]] || continue
+    kill -0 "$_lp" 2>/dev/null && _kept="${_kept}${_kept:+ }$_lp"
+  done
+  r_orphans="$_kept"
+fi
 last_hb=0
 [ "$once" -eq 0 ] && last_hb=$hb_now
 # WALL-CLOCK heartbeat (round-4 fix for a round-3 regression): the first
@@ -210,8 +247,14 @@ child_is_renderer() { # $1=pid
   done < "/proc/$1/cmdline" 2>/dev/null
   [ -n "$_ci_arg" ] && _ci_last=$_ci_arg
   [ "$_ci_isc" -eq 1 ] && return 1
+  # match the CONFIGURED renderer, not a hardcoded name (round-24):
+  # STATUSLINE_PANEL_RENDERER is a documented override that every
+  # daemon test uses, and with it set to any other filename this
+  # returned false for the daemon's own child - so the concede path
+  # stopped killing it and the survivor list dropped every entry on
+  # its first beat, which is all of rounds 22-23 undone by config.
   case "$_ci_last" in
-    *subagent-statusline.sh) return 0 ;;
+    *"${renderer##*/}") return 0 ;;
   esac
   return 1
 }
@@ -285,6 +328,7 @@ hb_beat() {
       kill -0 "$_op" 2>/dev/null && _still="${_still}${_still:+ }$_op"
     done
     r_orphans="$_still"
+    printf '%s\n' "$r_orphans" > "$orphan_file" 2>/dev/null
   fi
   hb_cur=""
   [ -r "$panel_dir/daemon.pid" ] && read -r hb_cur < "$panel_dir/daemon.pid"
@@ -430,6 +474,7 @@ while :; do
         # publish the same pid twice on line 4 and leave it dangling
         # there long after the survivor list has pruned it (round-23)
         r_pid_pub=""
+        printf '%s\n' "$r_orphans" > "$orphan_file" 2>/dev/null
         raw_gen=$(( raw_gen + 1 ))
       fi
       # no rm here (round-20): $cache_tmp is only ever CREATED in the

@@ -28,3 +28,5 @@ astral*
 payload_*.json
 trace_*.txt
 .tmp_*
+caught.txt
+trace*.txt
