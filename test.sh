@@ -990,6 +990,48 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-26 regression asserts (2026-08-17) ----
+  # R99: a render that cannot use the fifo AND cannot fork `sleep` used
+  # to break out of the wait loop at tick 0, and the branch after it
+  # asked only "is the child alive?" - so a perfectly healthy render was
+  # killed as if it had hung, the frame was marked bad, and three of
+  # those blank the cache. The deadline is wall-clock now.
+  nf_dir="$tmpd/nofork"
+  mkdir -p "$nf_dir/bin" "$nf_dir/panel"
+  printf '#!/bin/bash\nexit 1\n' > "$nf_dir/bin/sleep"
+  printf '#!/bin/bash\nexit 1\n' > "$nf_dir/bin/mkfifo"
+  chmod +x "$nf_dir/bin/sleep" "$nf_dir/bin/mkfifo"
+  printf '#!/bin/bash\n/usr/bin/sleep 2\nprintf "%%s\\n" "{\\\"id\\\":\\\"nf1\\\",\\\"content\\\":\\\"HELLO\\\"}"\n' > "$nf_dir/bin/render.sh"
+  chmod +x "$nf_dir/bin/render.sh"
+  printf '{"columns":120,"tasks":[{"id":"nf1","label":"x","tokenCount":5}]}' > "$nf_dir/panel/spool.nf1.new"
+  PATH="$nf_dir/bin:$PATH" STATUSLINE_PANEL_DIR="$nf_dir/panel" STATUSLINE_PANEL_RENDERER="$nf_dir/bin/render.sh" \
+    STATUSLINE_PANEL_RENDER_TIMEOUT=15 bash ./statusline-panel-daemon.sh --once >/dev/null 2>&1
+  grep -q HELLO "$nf_dir/panel/cache.nf1" 2>/dev/null && ok "a healthy render survives a fork-starved tick" || bad "healthy render killed as if it had timed out"
+  rm -rf "$nf_dir"
+  # R100: the render child must not open the blackbox a SECOND time - a
+  # log that cannot be opened then aborted the command before it ran, so
+  # the capture was empty, the frame bad, and the cache blanked, with
+  # nothing written anywhere
+  bl_dir="$tmpd/blocklog"
+  mkdir -p "$bl_dir/daemon-err.log"
+  printf '{"columns":120,"tasks":[{"id":"bl1","label":"x","tokenCount":5}]}' > "$bl_dir/spool.bl1.new"
+  STATUSLINE_PANEL_DIR="$bl_dir" STATUSLINE_PANEL_RENDERER="$PWD/subagent-statusline.sh" \
+    STATUSLINE_SUBAGENT_TREND_FILE="$tmpd/bl_trend" once_daemon ./statusline-panel-daemon.sh --once >/dev/null 2>&1
+  grep -q '"id":"bl1"' "$bl_dir/cache.bl1" 2>/dev/null && ok "an unopenable blackbox cannot stop the render" || bad "blocked log killed the render and the cache"
+  rm -rf "$bl_dir"
+  # R101: every identity judgement must follow the CONFIGURED filenames -
+  # both paths are documented overrides, and round-24 fixed only the
+  # daemon's own check
+  grep -q 'daemon_base' ./statusline-panel-hook.sh && grep -q 'renderer_base' ./statusline-panel-hook.sh && ok "hook judgements follow the configured names" || bad "hook still hardcodes the script names"
+  grep -q 'renderer_base' ./install.sh && ok "installer judgements follow the configured names" || bad "installer still hardcodes the script names"
+  # R102: the share numerator and denominator must use ONE type gate - a
+  # string-shaped tokenCount counted in the numerator only rendered
+  # Sigma-30000% in the bright-red tier
+  shr=$(jq -nc --argjson n "$now" '{columns:150,tasks:[{id:"s1",label:"a",status:"running",tokenCount:"900000",startTime:(($n-300)*1000),description:"d"},{id:"s2",label:"b",status:"running",tokenCount:1000,startTime:(($n-300)*1000),description:"d"}]}' | bash ./subagent-statusline.sh | jq -r .content | strip | grep -o 'Σ[0-9]*%' | tr -d '\r' | tr '\n' ' ')
+  case "$shr" in
+    *Σ[0-9][0-9][0-9][0-9]*) bad "a string tokenCount produced an impossible share ($shr)" ;;
+    *) ok "share stays within range for mixed-shape token counts ($shr)" ;;
+  esac
   # ---- adversarial-review round-25 regression asserts (2026-08-17) ----
   # R95: the blackbox redirect must never leave fd 2 with the host - not
   # even when it is the redirect itself that fails. The main bar had no

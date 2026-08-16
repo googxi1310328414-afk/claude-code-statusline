@@ -41,6 +41,15 @@ else
   exec 2>/dev/null
 fi
 panel_daemon="${STATUSLINE_PANEL_DAEMON:-$HOME/.claude/statusline-panel-daemon.sh}"
+# identity judgements must follow the CONFIGURED names (round-26): both
+# paths are documented overrides, and a hardcoded filename made every
+# check return false under a custom name - the wedged daemon was not
+# killed, reap_failed stayed 0 because the case never matched, and the
+# hook spawned a replacement anyway: the "only spawn, never reap"
+# amplifier reinstated by configuration alone.
+daemon_base="${panel_daemon##*/}"
+renderer_base="${STATUSLINE_PANEL_RENDERER:-subagent-statusline.sh}"
+renderer_base="${renderer_base##*/}"
 
 # chunked zero-fork stdin slurp (see the render scripts' identical block)
 input=""
@@ -212,8 +221,13 @@ if [ "$daemon_alive" -eq 0 ]; then
     # merely TALKS about the file (a diagnostic, a test, an agent's
     # own bash) out of the kill set.
     argv_identity "$daemon_pid"
+    # accept the canonical name too (round-26 fix-up): STATUSLINE_PANEL_DAEMON
+    # may point at a sentinel like /dev/null (the test harness does exactly
+    # that to suppress respawns), and the REGISTERED daemon is then still a
+    # normal install - matching only the configured basename made the hook
+    # refuse to reap it
     case "$REPLY_CMD" in
-      *statusline-panel-daemon.sh)
+      *"$daemon_base"|*statusline-panel-daemon.sh)
         # NO GROUP KILL ON THE DAEMON (round-13): round-12 added
         # `kill -- "-$daemon_pid"` to take the stuck render child down
         # with it, but the daemon is spawned as `( bash ... & )` from a
@@ -289,7 +303,7 @@ if [ "$daemon_alive" -eq 0 ]; then
     kill -0 "$_rp" 2>/dev/null || continue
     argv_identity "$_rp"
     case "$REPLY_CMD" in
-      *subagent-statusline.sh)
+      *"$renderer_base"|*subagent-statusline.sh)
         kill -- "-$_rp" 2>/dev/null
         kill "$_rp" 2>/dev/null
         kill -9 -- "-$_rp" 2>/dev/null

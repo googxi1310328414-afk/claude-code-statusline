@@ -15,7 +15,7 @@ $74.94 $79.8/h           | today $848.27     | week $3822.68             | +2005
 
 - **Line 1 — identity & location**: seconds clock · short model id (panel-style, keeps the `[1m]` tag) + effort heat + thinking marker · abbreviated directory · `⎇ worktree` · repo (OSC 8 hyperlink) · branch + dirty `*` · `⚑N` stash count (bright red at ≥5, hidden at zero) · PR (hyperlink + review state + CI badge)
 - **Line 2 — context engine**: `ctx` battery (occupancy = input + latest output tokens; the fifth cell renders as the `│` 80%-compaction marker, `k`/`M` units) · token sparkline (6 glyph levels capped at `▆`) + burn rate · cache hit rate (one decimal) + freshness (hot→countdown→cold) · `↻` compaction count + reclaimed tokens
-- **Line 3 — spend**: cost + `$X.X/h` rate · `today` cross-session total · `week` 7-day total · lines changed
+- **Line 3 — spend**: cost + `$X.X/h` rate · `today` cross-session total (shown **only when another session also spent today** - with a single session it would merely repeat the cost segment next to it, so the whole segment gives way; the same money still shows up under week) · `week` 7-day total · lines changed
 - **Line 4 — quota & session**: 5h/7d windows with `·t` pace cursor and reset times · `wk` per-model weekly quota · `»` session name
 
 The subagent panel row (via `subagentStatusLine`) renders every agent as an aligned table row (standalone model column; sparkline capped at `▆`):
@@ -50,7 +50,7 @@ It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES s
 ```bash
 bash test.sh          # render all fixtures (see real colors in your terminal)
 bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
-bash test.sh --assert # 179 assertions (CI mode; perf gates + twenty-five adversarial-review regression groups + color asserts)
+bash test.sh --assert # 184 assertions (CI mode; perf gates + twenty-six adversarial-review regression groups + color asserts)
 ```
 
 ## Notable engineering notes

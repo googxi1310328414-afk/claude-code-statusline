@@ -359,8 +359,14 @@ jq_all_out=$(jq -r '
   | ($tasks_raw | if type == "array" then map(select(type == "object")) else [] end) as $tasks
   | ($tasks | length) as $tcount
   | ([$tasks[]? | .model // empty | select(length>0)] | group_by(.) | max_by(length) | .[0] // "") as $majority_model
-  | ([$tasks[]? | .tokenCount // 0 | select(type=="number")] | add // 0 | tostring) as $total_tokens
-  | ([$tasks[]? | .tokenCount // empty | select(type=="number" and . > 0)] | length | tostring) as $tokened_count
+  # ONE GATE FOR ALL THREE (round-26): the per-row numerator goes
+  # through clean (tostring), so a string-shaped tokenCount - the drift
+  # shape this project has treated as real since round-6 - was counted
+  # in the numerator but dropped from the denominator, and that row
+  # rendered a share of 30000% in the bright-red tier while the other
+  # rows summed past 100. Accept the same values everywhere.
+  | ([$tasks[]? | .tokenCount // 0 | tostring | select(test("^[0-9]+$")) | tonumber] | add // 0 | tostring) as $total_tokens
+  | ([$tasks[]? | .tokenCount // empty | tostring | select(test("^[0-9]+$")) | tonumber | select(. > 0)] | length | tostring) as $tokened_count
   | ($columns | clean), ($majority_model | clean), $total_tokens, $tokened_count,
     (
       range(0; $tcount) as $i

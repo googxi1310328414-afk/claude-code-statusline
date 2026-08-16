@@ -73,6 +73,11 @@ done
 # 脚本(subagent-statusline.sh)不用重启——daemon 每帧都是新的子进程读盘。
 if [ "$daemon_updated" -eq 1 ]; then
   daemon_pid_file="$CLAUDE_DIR/statusline-panel.d/daemon.pid"
+  # 判据跟随配置名（round-26，与钩子/daemon 同款）
+  daemon_base="${STATUSLINE_PANEL_DAEMON:-statusline-panel-daemon.sh}"
+  daemon_base="${daemon_base##*/}"
+  renderer_base="${STATUSLINE_PANEL_RENDERER:-subagent-statusline.sh}"
+  renderer_base="${renderer_base##*/}"
   # 全量回收（round-9，事故驱动）：旧版只读 pid 文件里那一个、且只在
   # 「心跳新鲜」时才杀——恰好把真正该回收的卡死实例排除在外（它心跳
   # 必然陈旧），未注册的堆叠实例更是够不到。实测后果：本机曾累积 78 个
@@ -115,7 +120,7 @@ if [ "$daemon_updated" -eq 1 ]; then
     [ -n "$old_arg" ] && old_cmd=$old_arg
     [ "$old_isc" -eq 1 ] && old_cmd=""
     case "$old_cmd" in
-      *statusline-panel-daemon.sh) old_ok=1 ;;
+      *"${daemon_base}"|*statusline-panel-daemon.sh) old_ok=1 ;;
     esac
   fi
   if [ "$old_ok" -eq 1 ]; then
@@ -142,7 +147,7 @@ if [ "$daemon_updated" -eq 1 ]; then
     [ -n "$old_rarg" ] && old_rcmd=$old_rarg
     [ "$old_risc" -eq 1 ] && old_rcmd=""
     case "$old_rcmd" in
-      *subagent-statusline.sh)
+      *"${renderer_base}"|*subagent-statusline.sh)
         kill -- "-$one_rp" 2>/dev/null
         kill "$one_rp" 2>/dev/null
         kill -9 -- "-$one_rp" 2>/dev/null ;;

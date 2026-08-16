@@ -417,20 +417,40 @@ while :; do
     # own process group (job control) so the timeout path can signal
     # the renderer AND its grandchildren as one unit
     set -m 2>/dev/null
-    bash "$renderer" < "$panel_dir/render.$key" > "$raw_tmp" 2>>"$err_log" &
+    # NO SECOND REDIRECT ON THE CHILD (round-26): this used to append
+    # its stderr to the blackbox again, independently of the round-25
+    # pre-check - so when the log could not be opened (a directory in
+    # its place, read-only, foreign owner) bash failed the redirection
+    # BEFORE running the command at all: no renderer, empty capture,
+    # bad frame, and three of those blank the cache for good. The
+    # daemon's own fd 2 is already the same (safely opened) log, and
+    # the child inherits it.
+    bash "$renderer" < "$panel_dir/render.$key" > "$raw_tmp" &
     r_pid=$!
     set +m 2>/dev/null
     # publish for external reapers; the next beat (<=5s, and beats run
     # on every wait tick) writes it to line 4 of the pid file, so any
     # render long enough to wedge this daemon is always reachable
     r_pid_pub=$r_pid
+    # WALL-CLOCK DEADLINE (round-26): the loop used to count TICKS and
+    # `break` when the fallback `sleep` could not fork - and the test
+    # after the loop asked only "is the child still alive?", so a
+    # perfectly healthy render that had run for 0 ticks was treated as
+    # a hung one: killed, frame marked bad, and three such frames blank
+    # the cache. Both halves are fixed here: the deadline is measured
+    # in SECONDS (a bash builtin, no clock dependency, no fork), and a
+    # sleep that cannot fork now spins instead of bailing out. The spin
+    # is bounded by the deadline and only happens when the machine
+    # cannot fork at all - which is exactly when killing a working
+    # render and blanking every panel is the worst possible answer.
+    r_deadline=$(( SECONDS + render_timeout ))
     r_waited=0
     while kill -0 "$r_pid" 2>/dev/null; do
-      [ "$r_waited" -ge "$render_ticks" ] && break
+      [ "$SECONDS" -ge "$r_deadline" ] && break
       if [ -p "$tick_fifo" ]; then
         read -t 0.3 -r _tick <> "$tick_fifo" 2>/dev/null
       else
-        sleep 0.3 2>/dev/null || break
+        sleep 0.3 2>/dev/null
       fi
       r_waited=$(( r_waited + 1 ))
       # keep the wall-clock heartbeat alive DURING renders too - a hung
@@ -439,7 +459,8 @@ while :; do
       hb_beat
     done
     frame_bad=0
-    if kill -0 "$r_pid" 2>/dev/null; then
+    # only a REAL deadline expiry may take the kill path
+    if [ "$SECONDS" -ge "$r_deadline" ] && kill -0 "$r_pid" 2>/dev/null; then
       # deadline expired: kill the hung child, skip this frame (the
       # cache keeps serving the previous good frame; the next spool
       # retries with a fresh payload)
