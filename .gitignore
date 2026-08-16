@@ -27,3 +27,4 @@ test_payload*.json
 astral*
 payload_*.json
 trace_*.txt
+.tmp_*
