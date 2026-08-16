@@ -316,6 +316,19 @@ quit_with_child() {
       [[ "$q_wp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
         taskkill //F //PID "$q_wp" >/dev/null 2>&1
     fi
+    # REGISTER A SURVIVOR BEFORE LEAVING (round-28): this was the only
+    # kill path that never added an unkillable child to r_orphans nor
+    # wrote the file - and conceding almost always happens WITH a child
+    # in flight, while the winning instance overwrites line 4 within one
+    # beat. The one process nothing else can reach went invisible to all
+    # four reclaim paths at exactly the moment it was created.
+    if kill -0 "$r_pid_pub" 2>/dev/null && [ -r "/proc/$r_pid_pub/winpid" ]; then
+      case " $r_orphans " in
+        *" $r_pid_pub "*) : ;;
+        *) r_orphans="${r_orphans}${r_orphans:+ }$r_pid_pub" ;;
+      esac
+      printf '%s\n' "$r_orphans" > "$orphan_file" 2>/dev/null
+    fi
     # the aborted render's tmp pair has no other sweeper on this path
     # (cache.* is only age-swept after a day)
     [ -n "${cache_tmp:-}" ] && rm -f "$cache_tmp" "${raw_tmp:-}" 2>/dev/null
@@ -338,6 +351,26 @@ hb_beat() {
     return 0
   fi
   last_hb=$hb_t
+  # THE BEAT GOES OUT FIRST (round-28): the survivor retry used to run
+  # between "sample the timestamp" and "write it", and each surviving pid
+  # costs a taskkill exec (~200ms normally, ~31s when bash cannot fork).
+  # The heartbeat therefore landed ALREADY STALE by the whole retry
+  # duration - measured 41s with three survivors, and past the hook's 60s
+  # liveness gate with two under fork exhaustion. The hook then killed a
+  # perfectly healthy daemon, its replacement inherited the same orphan
+  # list from disk, and the next beat wedged in exactly the same place:
+  # one healthy daemon killed per minute, with the survivors untouched.
+  # round-27's checkpoints could not help - the block is INSIDE hb_beat.
+  hb_cur=""
+  [ -r "$panel_dir/daemon.pid" ] && read -r hb_cur < "$panel_dir/daemon.pid"
+  if [ "$hb_cur" = "$$" ]; then
+    printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "${r_pid_pub}${r_orphans:+ }${r_orphans}" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
+  elif [ -n "$hb_cur" ] && kill -0 "$hb_cur" 2>/dev/null; then
+    quit_with_child
+  else
+    rm -f "$panel_dir/daemon.pid" 2>/dev/null
+    ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "${r_pid_pub}${r_orphans:+ }${r_orphans}" > "$panel_dir/daemon.pid" ) 2>/dev/null || quit_with_child
+  fi
   # SURVIVOR RETRY, BELOW THE THROTTLE (round-23): this block used to sit
   # ABOVE the 5s gate, and hb_beat runs on every 0.3s tick - so a single
   # survivor meant a taskkill exec ~3x a second (measured ~180-260ms
@@ -364,16 +397,6 @@ hb_beat() {
     done
     r_orphans="$_still"
     printf '%s\n' "$r_orphans" > "$orphan_file" 2>/dev/null
-  fi
-  hb_cur=""
-  [ -r "$panel_dir/daemon.pid" ] && read -r hb_cur < "$panel_dir/daemon.pid"
-  if [ "$hb_cur" = "$$" ]; then
-    printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "${r_pid_pub}${r_orphans:+ }${r_orphans}" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
-  elif [ -n "$hb_cur" ] && kill -0 "$hb_cur" 2>/dev/null; then
-    quit_with_child
-  else
-    rm -f "$panel_dir/daemon.pid" 2>/dev/null
-    ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "${r_pid_pub}${r_orphans:+ }${r_orphans}" > "$panel_dir/daemon.pid" ) 2>/dev/null || quit_with_child
   fi
 }
 # per-key consecutive bad-frame counter (round-3 fix): the -s keep-frame

@@ -25,6 +25,10 @@ export STATUSLINE_CI_CACHE_PREFIX="$(dirname "$STATUSLINE_HISTORY_FILE")/test-ci
 export STATUSLINE_USAGE_CACHE_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-usage-cache"
 export STATUSLINE_USAGE_BACKOFF_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-usage-backoff"
 export STATUSLINE_CRED_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/no-such-credentials.json"
+# the blackbox is a state file too (round-28): without this every run
+# truncated the developer's real ~/.claude/statusline-err.log (the
+# rewrite path rotates it past 64k) and mixed test noise into it
+export STATUSLINE_ERR_LOG="$(dirname "$STATUSLINE_HISTORY_FILE")/test-statusline-err.log"
 # A --once daemon that wedges never registers, skips the heartbeat AND
 # the absolute lifetime cap, and therefore has no reaper inside the
 # project at all (round-20: two of them, left by earlier runs of THIS
@@ -990,6 +994,51 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-28 regression asserts (2026-08-17) ----
+  # R107: round-27's digit cap on the history tokens column guarded only
+  # the normalisation step; the gate that decides ADMISSION was still
+  # bare, so an over-long value skipped 10# and was pushed in anyway -
+  # int64 wrapped silently and the sparkline flattened.
+  : > "$STATUSLINE_DAILY_FILE"
+  S28=$''
+  {
+    printf '%s%sS28%s50000%s0.10
+' "$((now-300))" "$S28" "$S28" "$S28"
+    printf '%s%sS28%s60000%s0.20
+' "$((now-200))" "$S28" "$S28" "$S28"
+    printf '%s%sS28%s99999999999999999999%s0.30
+' "$((now-5))" "$S28" "$S28" "$S28"
+  } > "$STATUSLINE_HISTORY_FILE"
+  bigtok=$(jq -c '.session_id="S28"' fixtures/full.json | bash ./statusline-command.sh | strip | sed -n 2p)
+  case "$bigtok" in
+    *[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*k/m*) bad "an over-long tokens column produced a fake rate ($bigtok)" ;;
+    *) ok "an over-long tokens column cannot reach the arithmetic" ;;
+  esac
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R108: the MAIN bar sends .model as an object - one producer away - and
+  # the panel wrote that whole JSON into the model column, which pads every
+  # row and comes out of the one panel-wide description budget
+  om=$(jq -c '.columns=120 | .tasks[0].model={"display_name":"Fable 5","id":"claude-fable-5-20260101"}' fixtures/subagent-tasks.json | bash ./subagent-statusline.sh | jq -r .content | strip)
+  case "$om" in
+    *'display_name'*) bad "an object model was rendered verbatim into the column" ;;
+    *'Review the auth'*) ok "an object model drifts away without eating the description" ;;
+    *) bad "object model cost the panel its description column" ;;
+  esac
+  # R109: a trend sample past int64 made every comparison error out, left
+  # min == max, and divided by zero - bash then discarded the whole
+  # per-task loop and the panel emitted nothing at all
+  ts=$(jq -c '.tasks[0].tokenSamples=[99999999999999999999,5,3]' fixtures/subagent-tasks.json | bash ./subagent-statusline.sh | jq -r .id | grep -c '^t[123]')
+  [ "${ts:-0}" -eq 3 ] && ok "an over-large trend sample cannot blank the panel" || bad "trend sample divided by zero (${ts:-0}/3 rows)"
+  # R110: the heartbeat must be written BEFORE the survivor retry, or it
+  # lands already stale by the whole retry duration
+  awk '/^hb_beat\(\)/,/^}/' ./statusline-panel-daemon.sh | awk '/daemon.pid.tmp/{w=NR} /SURVIVOR RETRY/{r=NR} END{exit !(w && r && r > w)}' && ok "the beat is written before the survivor retry" || bad "survivor retry still runs before the heartbeat write"
+  # R111: the concede path must register an unkillable child, or the one
+  # process nothing else can reach goes invisible the moment it appears
+  awk '/^quit_with_child\(\)/,/^}/' ./statusline-panel-daemon.sh | grep -q 'orphan_file' && ok "conceding registers a surviving child" || bad "concede path loses the survivor"
+  # R112: the blackbox is a state file too - without an env override every
+  # assertion run truncated the developer's real ~/.claude blackbox
+  grep -q 'STATUSLINE_ERR_LOG' ./statusline-command.sh && ok "the blackbox path is env-overridable" || bad "blackbox path is hardcoded to the real HOME"
   # ---- adversarial-review round-27 regression asserts (2026-08-17) ----
   # R103: jq's `length` on a BOOLEAN is an error, and jq aborts the whole
   # filter - one task with "model": true emitted zero rows, exit 0, with

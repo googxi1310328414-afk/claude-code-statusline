@@ -389,7 +389,14 @@ jq_all_out=$(jq -r '
             ($task.id // "" | clean),
             ((if ($task.name != null and $task.name != "") then $task.name elif ($task.label != null and $task.label != "") then $task.label elif ($task.type != null and $task.type != "") then $task.type else "" end) | clean),
             ($task.type // "" | clean),
-            ($task.model // "" | clean),
+            # type-narrowed like effort (round-28): the MAIN bar sends
+            # .model as an OBJECT ({display_name, id}) - one producer
+            # away - and the tostring inside clean wrote that whole JSON
+            # into the model column, which pads every row and is taken
+            # out of the one panel-wide description budget: the description
+            # column vanished from every row. round-27 narrowed only the
+            # majority_model probe, which is not displayed at all.
+            ($task.model | if type=="string" or type=="number" then . else "" end | clean),
             # TYPE-NARROWED (round-16): clean starts with tostring, so an
             # OBJECT-shaped effort - the shape the MAIN bar payload uses
             # ({level:"max"}), one producer away from this one - was
@@ -849,7 +856,17 @@ for ((ti=0; ti<task_count_total; ti++)); do
   if [ "${#nums[@]}" -ge 1 ]; then
     n_ok=1
     for nv in "${nums[@]}"; do
-      [[ "$nv" =~ ^-?[0-9]+$ ]] || n_ok=0
+      # cap + base 10 here too (round-28): this was the last arithmetic
+    # input in the file with neither. An over-int64 sample turned every
+    # comparison below into "integer expected" (false), which left
+    # min_v == max_v, made range 0, and the bar index divided BY ZERO -
+    # bash then discarded the enclosing compound command, which here is
+    # the whole per-task loop: zero rows, exit 0, and three such frames
+    # blank the cache. A zero-padded sample from the trend file (whose
+    # column check deliberately allows them) failed arithmetic the same
+    # way, and since PASS 1 was discarded the bad row was never rewritten
+    # either - the panel stayed dead for the full 1800s read window.
+    [[ "$nv" =~ ^-?[0-9]{1,12}$ ]] || n_ok=0
     done
     n_count=${#nums[@]}
     if [ "$n_ok" -eq 1 ] && [ "$n_count" -ge 2 ]; then

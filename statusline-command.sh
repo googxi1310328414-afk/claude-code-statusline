@@ -24,7 +24,13 @@ export LC_ALL=C.UTF-8
 # immediately; checked every render rather than on any schedule, but
 # cheap either way since the file is kept capped at ~500 lines by this
 # same mechanism.
-statusline_err_log="$HOME/.claude/statusline-err.log"
+# OVERRIDABLE (round-28): every other state file is env-overridable
+# because the test suite must never touch the real ~/.claude - but this
+# one was hardcoded, so each `test.sh --assert` run TRUNCATED the
+# developer's real blackbox (the rewrite path rotates it at >64k) and
+# sprayed test noise into it in between. The sweep two lines below it
+# already carried a comment about staying inside the sandbox.
+statusline_err_log="${STATUSLINE_ERR_LOG:-$HOME/.claude/statusline-err.log}"
 # ROTATION MOVED OFF THE PER-FRAME PATH (round-6): this used to read up
 # to 501 log lines on EVERY frame just to decide whether to truncate.
 # After a fork storm leaves ~450 lines (~30KB) the file never crosses
@@ -273,9 +279,12 @@ fi
 #   max would undercount) - zero spawns, no transcript scanning, and no
 #   re-walk of days of rows every render; see the inline comment above
 #   their code for the algorithm, the watermark/concurrency story and
-#   caveats. TODAY only shows when it exceeds the current session's own
-#   cost by >=1 cent; WEEK (last 7 local calendar days incl today) has
-#   no such comparison.)
+#   caveats. TODAY only shows when it exceeds THIS session's own TODAY
+#   CONTRIBUTION (closed+peak-base for today, straight out of the rollup)
+#   by >=1 cent - NOT its raw .cost cumulative: comparing against that
+#   hid the segment for the whole day for any session that straddled
+#   midnight. WEEK (last 7 local calendar days incl today) has no such
+#   comparison.)
 #   12 lines changed +added/-removed - "+" green / "/" uncolored / "-" red.
 #      ZERO-HIDE: hidden when added and removed are both 0.
 #
@@ -1058,7 +1067,13 @@ for (( hi=hist_tail_start; hi<hist_count; hi++ )); do
     if [[ "$h_tok" =~ ^[0-9]{1,13}$ ]]; then
       printf -v h_tok '%s' "$(( 10#$h_tok ))"
     fi
-    if [[ "$h_tok" =~ ^[0-9]+$ ]]; then
+    # the cap has to guard ADMISSION, not just normalisation (round-28):
+    # round-27 wrapped only the 10# step in a capped test and left this
+    # gate bare, so an over-long value skipped normalisation and was
+    # pushed into the arrays anyway - int64 wrapped SILENTLY in the
+    # sparkline deltas (a 14-digit fake rate, exit 0, nothing in the
+    # blackbox) and flattened the whole trend to one level.
+    if [[ "$h_tok" =~ ^[0-9]{1,13}$ ]]; then
       tok_epochs+=("$h_epoch")
       tok_values+=("$h_tok")
     fi
@@ -1203,6 +1218,8 @@ fi
 # AND records it as that day's base, so a session that straddles midnight
 # contributes to each day only what it actually spent during that day.
 # TODAY only shows when it exceeds THIS session's OWN today contribution
+# taken FROM THE ROLLUP (not the raw .cost cumulative - comparing against
+# that hid the segment all day for any session that straddled midnight)
 # by >= 1 cent (avoids redundancy with the cost segment right before it -
 # and both sides must come from the rollup: comparing against the raw
 # .cost cumulative hid the segment all day for cross-midnight sessions);
