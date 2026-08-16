@@ -990,6 +990,38 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-23 regression asserts (2026-08-16) ----
+  # R89: line 4 of the pid file became a LIST in round-22, and both
+  # consumers still matched the whole line against ^[0-9]+$ - a space
+  # makes that false, so the reap branch was skipped entirely and not
+  # even the CURRENT child was collected. Functional: two live fake
+  # renderers, both listed on line 4, must both be reaped.
+  lr_dir="$tmpd/listreap"
+  mkdir -p "$lr_dir/bin"
+  printf '#!/bin/bash\nsleep 120\n' > "$lr_dir/bin/subagent-statusline.sh"
+  printf '#!/bin/bash\nsleep 120\n' > "$lr_dir/bin/statusline-panel-daemon.sh"
+  bash "$lr_dir/bin/subagent-statusline.sh" & lr_c1=$!
+  bash "$lr_dir/bin/subagent-statusline.sh" & lr_c2=$!
+  bash "$lr_dir/bin/statusline-panel-daemon.sh" & lr_d=$!
+  sleep 0.8
+  printf '%s\n%s\n%s\n%s\n' "$lr_d" "$((now-600))" "0" "$lr_c1 $lr_c2" > "$lr_dir/daemon.pid"
+  printf '{"columns":120,"tasks":[{"id":"lr1","label":"x","tokenCount":5}]}' |
+    STATUSLINE_PANEL_DIR="$lr_dir" STATUSLINE_PANEL_DAEMON=/dev/null bash ./statusline-panel-hook.sh >/dev/null 2>&1
+  sleep 1
+  lr_left=0
+  kill -0 "$lr_c1" 2>/dev/null && lr_left=$(( lr_left + 1 ))
+  kill -0 "$lr_c2" 2>/dev/null && lr_left=$(( lr_left + 1 ))
+  [ "$lr_left" -eq 0 ] && ok "every pid on line 4 is reaped, not just a lone one" || bad "$lr_left of 2 listed render children survived"
+  kill -9 "$lr_c1" "$lr_c2" "$lr_d" 2>/dev/null
+  rm -rf "$lr_dir"
+  # R90: the survivor retry must sit BELOW the 5s heartbeat throttle -
+  # above it, hb_beat's 0.3s cadence turned one survivor into a taskkill
+  # exec ~3x a second, on the one path that only runs under fork
+  # exhaustion, and stretched the tick that the render deadline counts
+  awk '/^hb_beat\(\)/,/^}/' ./statusline-panel-daemon.sh | awk '/hb_delta/{gate=NR} /r_orphans/{orph=NR} END{exit !(gate && orph && orph > gate)}' && ok "survivor retry runs on the beat, not on every tick" || bad "survivor retry sits above the heartbeat throttle"
+  # R91: quit_with_child group-kills, so it must confirm identity first -
+  # r_pid_pub can name a pid that has since died and been recycled
+  awk '/^quit_with_child\(\)/,/^}/' ./statusline-panel-daemon.sh | grep -q 'child_is_renderer' && ok "the concede path confirms identity before a group kill" || bad "concede path group-kills an unconfirmed pid"
   # ---- adversarial-review round-22 regression asserts (2026-08-16) ----
   # R85: columns was the last host numeric without a digit cap and a 10#
   # normalisation - and it feeds arithmetic INSIDE the per-task loop, so
@@ -1128,7 +1160,7 @@ sleep 300
   grep -q 'taskkill //F //PID "$r_wp"' ./statusline-panel-daemon.sh && ok "render deadline escalates to a native kill" || bad "render deadline only sends cygwin signals"
   # R75: a child that survives the deadline must STAY published on line 4,
   # or nothing outside the daemon can ever reach it
-  grep -q 'r_survived' ./statusline-panel-daemon.sh && ok "a surviving render child stays reachable" || bad "give-up clears the only handle on a leaked child"
+  grep -q 'r_orphans' ./statusline-panel-daemon.sh && ok "a surviving render child stays reachable" || bad "give-up clears the only handle on a leaked child"
   # ---- adversarial-review round-17 regression asserts (2026-08-15) ----
   # R67: MSYS bash counts UTF-16 units, so one astral character (emoji,
   # CJK ext-B) is TWO "characters" - the description cut could land

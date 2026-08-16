@@ -158,7 +158,6 @@ r_pid_pub=""
 # bumped only when a timed-out render child outlives its reap, so the
 # capture file it may still be writing into is never reused
 raw_gen=0
-r_survived=0
 # render children that outlived even the native kill: they stay on
 # line 4 of the pid file (space separated) until they really die
 r_orphans=""
@@ -194,8 +193,30 @@ last_hb=0
 # is the same leak the hook's REAP exists to stop, just minted from
 # the other side. The child IS a process-group leader (`set -m`), so
 # the group kill here is real, unlike the one on the daemon itself.
+# zero-fork argv confirmation, same discipline as the hook: the LAST
+# argv element must be the renderer, and any bare `-c` disqualifies.
+# Needed because r_pid_pub/r_orphans can name a pid that has since
+# died and been recycled - and these are GROUP kills, so a wrong pid
+# takes a whole unrelated group with it (the 2026-08-13/14 shape).
+child_is_renderer() { # $1=pid
+  [ -r "/proc/$1/cmdline" ] || return 1
+  _ci_arg=""
+  _ci_last=""
+  _ci_isc=0
+  while IFS= read -r -d '' _ci_arg; do
+    [ "$_ci_arg" = "-c" ] && _ci_isc=1
+    _ci_last=$_ci_arg
+    _ci_arg=""
+  done < "/proc/$1/cmdline" 2>/dev/null
+  [ -n "$_ci_arg" ] && _ci_last=$_ci_arg
+  [ "$_ci_isc" -eq 1 ] && return 1
+  case "$_ci_last" in
+    *subagent-statusline.sh) return 0 ;;
+  esac
+  return 1
+}
 quit_with_child() {
-  if [ -n "$r_pid_pub" ] && kill -0 "$r_pid_pub" 2>/dev/null; then
+  if [ -n "$r_pid_pub" ] && kill -0 "$r_pid_pub" 2>/dev/null && child_is_renderer "$r_pid_pub"; then
     kill -- "-$r_pid_pub" 2>/dev/null
     kill "$r_pid_pub" 2>/dev/null
     # no grace period: we are conceding this instant and will not be here
@@ -225,22 +246,6 @@ quit_with_child() {
 }
 hb_beat() {
   [ "$once" -eq 1 ] && return 0
-  # retry the survivors (see r_orphans) and drop the ones that died
-  if [ -n "$r_orphans" ]; then
-    _still=""
-    for _op in $r_orphans; do
-      kill -0 "$_op" 2>/dev/null || continue
-      kill -9 "$_op" 2>/dev/null
-      if kill -0 "$_op" 2>/dev/null && [ -r "/proc/$_op/winpid" ]; then
-        _owp=""
-        read -r _owp < "/proc/$_op/winpid" 2>/dev/null
-        [[ "$_owp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
-          taskkill //F //PID "$_owp" >/dev/null 2>&1
-      fi
-      kill -0 "$_op" 2>/dev/null && _still="${_still}${_still:+ }$_op"
-    done
-    r_orphans="$_still"
-  fi
   printf -v hb_t '%(%s)T' -1
   # CLOCK-ROLLBACK GUARD (round-9): a backwards clock step makes the
   # delta NEGATIVE, which is also "< 5" - the beat then froze for the
@@ -255,6 +260,32 @@ hb_beat() {
     return 0
   fi
   last_hb=$hb_t
+  # SURVIVOR RETRY, BELOW THE THROTTLE (round-23): this block used to sit
+  # ABOVE the 5s gate, and hb_beat runs on every 0.3s tick - so a single
+  # survivor meant a taskkill exec ~3x a second (measured ~180-260ms
+  # each), on the one code path whose entire reason for existing is fork
+  # exhaustion. It also stretched the tick itself, and both the render
+  # deadline and the 2-minute idle death are counted in TICKS, so a 15s
+  # timeout silently became ~25-40s. Retry on the beat, as the comment
+  # always claimed. Identity is re-confirmed before signalling, because a
+  # cygwin pid that has since been recycled would otherwise take an
+  # unrelated process group with it.
+  if [ -n "$r_orphans" ]; then
+    _still=""
+    for _op in $r_orphans; do
+      kill -0 "$_op" 2>/dev/null || continue
+      if ! child_is_renderer "$_op"; then continue; fi
+      kill -9 "$_op" 2>/dev/null
+      if kill -0 "$_op" 2>/dev/null && [ -r "/proc/$_op/winpid" ]; then
+        _owp=""
+        read -r _owp < "/proc/$_op/winpid" 2>/dev/null
+        [[ "$_owp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
+          taskkill //F //PID "$_owp" >/dev/null 2>&1
+      fi
+      kill -0 "$_op" 2>/dev/null && _still="${_still}${_still:+ }$_op"
+    done
+    r_orphans="$_still"
+  fi
   hb_cur=""
   [ -r "$panel_dir/daemon.pid" ] && read -r hb_cur < "$panel_dir/daemon.pid"
   if [ "$hb_cur" = "$$" ]; then
@@ -395,7 +426,10 @@ while :; do
           *" $r_pid "*) : ;;
           *) r_orphans="${r_orphans}${r_orphans:+ }$r_pid" ;;
         esac
-        r_survived=1
+        # tracked in the list now - keeping it in r_pid_pub too would
+        # publish the same pid twice on line 4 and leave it dangling
+        # there long after the survivor list has pruned it (round-23)
+        r_pid_pub=""
         raw_gen=$(( raw_gen + 1 ))
       fi
       # no rm here (round-20): $cache_tmp is only ever CREATED in the
@@ -439,9 +473,8 @@ while :; do
         bad_streak[$key]=0
       fi
     fi
-    # keep publishing a child that outlived its reap (see above)
-    [ "$r_survived" -eq 0 ] && r_pid_pub=""
-    r_survived=0
+    # a survivor already moved itself into r_orphans and cleared this
+    r_pid_pub=""
     rm -f "$panel_dir/render.$key" 2>/dev/null
     worked=1
   done

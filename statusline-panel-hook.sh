@@ -251,21 +251,29 @@ if [ "$daemon_alive" -eq 0 ]; then
   # daemon starts it under `set -m`, so it leads its own group and the
   # renderer's own jq goes down with it. Same cmdline-tail identity
   # check as the daemon, so a recycled pid is never signalled.
-  if [[ "$daemon_rpid" =~ ^[0-9]+$ ]] && kill -0 "$daemon_rpid" 2>/dev/null; then
-    argv_identity "$daemon_rpid"
+  # LINE 4 IS A LIST (round-23): round-22 started publishing survivors
+  # alongside the in-flight child, space separated, but this side still
+  # matched the whole line against ^[0-9]+$ - which a space makes false,
+  # so the branch was skipped entirely and NOTHING was reaped, not even
+  # the current child. The one change made to keep survivors reachable
+  # closed the only path that could reach them; iterate instead.
+  for _rp in $daemon_rpid; do
+    [[ "$_rp" =~ ^[0-9]{1,10}$ ]] || continue
+    kill -0 "$_rp" 2>/dev/null || continue
+    argv_identity "$_rp"
     case "$REPLY_CMD" in
       *subagent-statusline.sh)
-        kill -- "-$daemon_rpid" 2>/dev/null
-        kill "$daemon_rpid" 2>/dev/null
-        kill -9 -- "-$daemon_rpid" 2>/dev/null
-        if kill -0 "$daemon_rpid" 2>/dev/null; then
+        kill -- "-$_rp" 2>/dev/null
+        kill "$_rp" 2>/dev/null
+        kill -9 -- "-$_rp" 2>/dev/null
+        if kill -0 "$_rp" 2>/dev/null; then
           _rwp=""
-          [ -r "/proc/$daemon_rpid/winpid" ] && read -r _rwp < "/proc/$daemon_rpid/winpid" 2>/dev/null
+          [ -r "/proc/$_rp/winpid" ] && read -r _rwp < "/proc/$_rp/winpid" 2>/dev/null
           [[ "$_rwp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
             taskkill //F //PID "$_rwp" >/dev/null 2>&1
         fi ;;
     esac
-  fi
+  done
   # NEVER MINT A REPLACEMENT FOR SOMETHING WE COULD NOT KILL (round-17):
   # that is the whole amplifier. If even TerminateProcess did not get
   # rid of the old instance, the honest outcome is "no panel this tick"

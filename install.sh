@@ -127,22 +127,27 @@ if [ "$daemon_updated" -eq 1 ]; then
   # 继续跑并占着 tmp 名，而它的 pid 从外部无从推导——daemon 自己不是进程
   # 组长（`( bash ... & )` 无作业控制派生），杀「它的组」什么也够不着。
   # 渲染子进程则是在 `set -m` 下起的、自成一组，可以连它的 jq 一起收掉。
-  if [[ "$old_rp" =~ ^[0-9]+$ ]] && kill -0 "$old_rp" 2>/dev/null; then
+  # 第 4 行是**空格分隔的列表**（round-23）：除当前在途子进程外，还包含
+  # 连原生 taskkill 都没杀掉的幸存者。此前这里按单值匹配 `^[0-9]+$`，
+  # 一有空格就整体判负、一个都不收——恰恰在最需要它的那一刻失效。
+  for one_rp in $old_rp; do
+    [[ "$one_rp" =~ ^[0-9]{1,10}$ ]] || continue
+    kill -0 "$one_rp" 2>/dev/null || continue
     old_rcmd=""; old_rarg=""; old_risc=0
     while IFS= read -r -d '' old_rarg; do
       [ "$old_rarg" = "-c" ] && old_risc=1
       old_rcmd=$old_rarg
       old_rarg=""
-    done < "/proc/$old_rp/cmdline" 2>/dev/null
+    done < "/proc/$one_rp/cmdline" 2>/dev/null
     [ -n "$old_rarg" ] && old_rcmd=$old_rarg
     [ "$old_risc" -eq 1 ] && old_rcmd=""
     case "$old_rcmd" in
       *subagent-statusline.sh)
-        kill -- "-$old_rp" 2>/dev/null
-        kill "$old_rp" 2>/dev/null
-        kill -9 -- "-$old_rp" 2>/dev/null ;;
+        kill -- "-$one_rp" 2>/dev/null
+        kill "$one_rp" 2>/dev/null
+        kill -9 -- "-$one_rp" 2>/dev/null ;;
     esac
-  fi
+  done
   # Windows 侧兜底（cygwin 的 ps/kill 看不到全部实例）。判据必须与看门狗
   # 完全同款（round-14）：此前只有 `-match 'statusline-panel-daemon'`，
   # 既无 argv 位置尾锚也不排除 `-c` 外壳——正是 AI-GUIDE §4 明令「绝不可」
