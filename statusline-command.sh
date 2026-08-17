@@ -793,10 +793,23 @@ if [ -f "$daily_file" ]; then
     # digit caps (round-5): cents fields at 12 digits (multi-session
     # multi-day sums stay far below; keeps every later addition inside
     # bash integer range even summed), epoch at 13 (same as resets_at)
+    # BASE 10, not just a cap (round-29): every one of these columns is
+    # written straight back out by the fold below, so a single zero-padded
+    # cell is a PERMANENT lie inside the 9-day retention window rather
+    # than a one-frame glitch. 0120 cents renders $0.80 (silent fake
+    # money - exit 0, nothing in the blackbox) while 0890 fails arithmetic
+    # outright, and a failed $(( )) makes bash discard the whole enclosing
+    # compound command, which here takes TODAY and WEEK off the bar
+    # together until the row ages out. The two string tests further down
+    # (d_prev != "0", d_peak != "0") are fixed by the same line: "0000"
+    # is not string-equal to "0", so a padded all-zero row used to seed
+    # du_sidprev as if it carried real spend.
     [[ "$d_closed" =~ ^[0-9]{1,12}$ ]] || continue
     [[ "$d_peak" =~ ^[0-9]{1,12}$ ]] || continue
     [[ "$d_prev" =~ ^[0-9]{1,12}$ ]] || continue
     [[ "$d_epoch" =~ ^[0-9]{1,13}$ ]] || continue
+    d_closed=$(( 10#$d_closed )); d_peak=$(( 10#$d_peak ))
+    d_prev=$(( 10#$d_prev ));     d_epoch=$(( 10#$d_epoch ))
     # CLOCK-ROLLBACK GUARDS: state stamped in the FUTURE (wall clock
     # stepped back after it was persisted - NTP step correction, VM
     # snapshot restore) is untrustworthy rollback-era output, and it is
@@ -830,6 +843,7 @@ if [ -f "$daily_file" ]; then
     # (see above), so migration cannot move an old day's total.
     if [ -n "$d_base" ]; then
       [[ "$d_base" =~ ^[0-9]{1,12}$ ]] || d_base=0
+      d_base=$(( 10#$d_base ))   # base 10 for the same reason (round-29)
       du_base[$dkey]=$d_base
     fi
     # newest row per sid carries that session's last cumulative value,

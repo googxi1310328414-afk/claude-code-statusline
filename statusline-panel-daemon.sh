@@ -41,13 +41,26 @@
 # (a failure mode this project has hit for real) blocked this loop
 # forever while `kill -0` kept telling every hook tick the daemon was
 # "alive", freezing every session's panel on its last cached frame
-# indefinitely, with no recovery path at all on a default install (the
-# optional watchdog only reaps the RENDERER script by name, and never
-# this daemon - by design, since the daemon legitimately runs long).
+# indefinitely, with no recovery path at all on a DEFAULT install - the
+# watchdog is opt-in (--with-watchdog) and is the only thing that can
+# break this deadlock, which is why installing it is strongly advised.
+# (Correcting this header, which used to claim the watchdog reaps only
+# the renderer and leaves daemons alone: it has TWO daemon branches -
+# the registered instance whose line-2 heartbeat is >180s stale,
+# re-confirmed against the line-3 Windows pid before Stop-Process and
+# de-registration, and the unregistered orphan daemon older than 300s.
+# README section 7/8 and AI-GUIDE section 4 both specify them, and
+# README section 8 names the stale heartbeat branch as the ONLY unlock
+# for "hook refused to respawn after a failed reclaim" - the deadlock
+# above. A reimplementation that trusted this comment and
+# dropped both branches gets exactly the 38-orphan storm back.)
 # The render is now launched in the background and awaited on the same
 # zero-spawn fifo tick, with a hard deadline
-# ($STATUSLINE_PANEL_RENDER_TIMEOUT seconds, default 15, floor 1, measured on the WALL CLOCK, ~50x a normal
-# render): on expiry the child is killed, the frame is skipped, and the
+# ($STATUSLINE_PANEL_RENDER_TIMEOUT seconds, default 15, floor 1,
+# measured on the WALL CLOCK - ~50x a normal render - and granted as
+# `SECONDS + timeout + 1` because SECONDS is an integer and would
+# otherwise silently eat the partial second in progress): on expiry the
+# child is killed, the frame is skipped, and the
 # next spool retries - the daemon itself can no longer be wedged by its
 # child. The 0.3s idle tick uses the fifo `read -t` trick - zero spawns
 # per tick; if mkfifo is unavailable it falls back to one external
@@ -223,6 +236,27 @@ raw_gen=0
 # new daemon loads it, prunes whatever has since died, and keeps
 # retrying. Written with a builtin redirect (no fork) on the beat.
 orphan_file="$panel_dir/orphans"
+# MERGE, NEVER OVERWRITE (round-29): the file is shared by every
+# instance, and a plain rewrite let one daemon erase what another had
+# just registered - the conceding instance would record the child it
+# could not kill, and the winner (which only ever read the file once,
+# at startup) would blank that line on its very next beat. The lost pid
+# is then in no pid file, no orphan file and nobody in-memory: exactly
+# the process this whole list exists to keep reachable.
+orphans_save() {
+  _os_disk=""
+  [ -r "$orphan_file" ] && read -r _os_disk < "$orphan_file" 2>/dev/null
+  _os_all="$r_orphans"
+  for _os_p in $_os_disk; do
+    [[ "$_os_p" =~ ^[0-9]{1,10}$ ]] || continue
+    kill -0 "$_os_p" 2>/dev/null || continue
+    case " $_os_all " in
+      *" $_os_p "*) : ;;
+      *) _os_all="${_os_all}${_os_all:+ }$_os_p" ;;
+    esac
+  done
+  printf '%s\n' "$_os_all" > "$orphan_file" 2>/dev/null
+}
 r_orphans=""
 if [ -r "$orphan_file" ]; then
   read -r r_orphans < "$orphan_file" 2>/dev/null
@@ -327,7 +361,7 @@ quit_with_child() {
         *" $r_pid_pub "*) : ;;
         *) r_orphans="${r_orphans}${r_orphans:+ }$r_pid_pub" ;;
       esac
-      printf '%s\n' "$r_orphans" > "$orphan_file" 2>/dev/null
+      orphans_save
     fi
     # the aborted render's tmp pair has no other sweeper on this path
     # (cache.* is only age-swept after a day)
@@ -371,21 +405,24 @@ hb_beat() {
     rm -f "$panel_dir/daemon.pid" 2>/dev/null
     ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "${r_pid_pub}${r_orphans:+ }${r_orphans}" > "$panel_dir/daemon.pid" ) 2>/dev/null || quit_with_child
   fi
-  # SURVIVOR RETRY, BELOW THE THROTTLE (round-23): this block used to sit
-  # ABOVE the 5s gate, and hb_beat runs on every 0.3s tick - so a single
-  # survivor meant a taskkill exec ~3x a second (measured ~180-260ms
-  # each), on the one code path whose entire reason for existing is fork
-  # exhaustion. It also stretched the tick itself, and both the render
-  # deadline and the 2-minute idle death are counted in TICKS, so a 15s
-  # timeout silently became ~25-40s. Retry on the beat, as the comment
-  # always claimed. Identity is re-confirmed before signalling, because a
-  # cygwin pid that has since been recycled would otherwise take an
-  # unrelated process group with it.
+  # SURVIVOR RETRY, ONE PER BEAT (round-29): retrying the whole list in a
+  # single beat made the beat interval N x the cost of one taskkill, and
+  # under fork exhaustion one exec blocks ~31s in bash's make_child retry
+  # ladder - so two survivors already pushed the heartbeat past the hook's
+  # 60s liveness gate and a healthy daemon got killed and replaced, with
+  # the replacement inheriting the same list and wedging in the same
+  # place. Round-28 moved the write before the retry, which only halved
+  # the window. One pid per beat bounds it at ~31s no matter how long the
+  # list is; the list rotates, so every survivor is still retried, just
+  # every N beats instead of every beat.
   if [ -n "$r_orphans" ]; then
-    _still=""
-    for _op in $r_orphans; do
-      kill -0 "$_op" 2>/dev/null || continue
-      if ! child_is_renderer "$_op"; then continue; fi
+    _op="${r_orphans%% *}"
+    case "$r_orphans" in
+      *" "*) _rest="${r_orphans#* }" ;;
+      *)     _rest="" ;;
+    esac
+    _keep=""
+    if kill -0 "$_op" 2>/dev/null && child_is_renderer "$_op"; then
       kill -9 "$_op" 2>/dev/null
       if kill -0 "$_op" 2>/dev/null && [ -r "/proc/$_op/winpid" ]; then
         _owp=""
@@ -393,10 +430,11 @@ hb_beat() {
         [[ "$_owp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
           taskkill //F //PID "$_owp" >/dev/null 2>&1
       fi
-      kill -0 "$_op" 2>/dev/null && _still="${_still}${_still:+ }$_op"
-    done
-    r_orphans="$_still"
-    printf '%s\n' "$r_orphans" > "$orphan_file" 2>/dev/null
+      kill -0 "$_op" 2>/dev/null && _keep="$_op"
+    fi
+    r_orphans="${_rest}${_rest:+ }${_keep}"
+    r_orphans="${r_orphans% }"
+    orphans_save
   fi
 }
 # per-key consecutive bad-frame counter (round-3 fix): the -s keep-frame
@@ -471,7 +509,17 @@ while :; do
     # is bounded by the deadline and only happens when the machine
     # cannot fork at all - which is exactly when killing a working
     # render and blanking every panel is the worst possible answer.
-    r_deadline=$(( SECONDS + render_timeout ))
+    # +1 COMPENSATES THE TRUNCATED FIRST SECOND (round-29): SECONDS is
+    # an integer that ticks on the shell start boundary, so a bare
+    # `SECONDS + render_timeout` grants somewhere in (N-1, N] seconds
+    # depending on where in the current second the render begins. At
+    # the default 15 that is invisible; at the floor of 1 - which
+    # round-27 added believing it meant "at least one second" - it is
+    # 0 to 1 second against a render that measures 0.3-0.7s here, so
+    # RENDER_TIMEOUT=0 went from killing every frame to killing a
+    # random third of them (the assertion round-27 shipped with the
+    # floor has been flaky ever since, which is how this surfaced).
+    r_deadline=$(( SECONDS + render_timeout + 1 ))
     while kill -0 "$r_pid" 2>/dev/null; do
       [ "$SECONDS" -ge "$r_deadline" ] && break
       if [ -p "$tick_fifo" ]; then
@@ -569,7 +617,7 @@ while :; do
         # publish the same pid twice on line 4 and leave it dangling
         # there long after the survivor list has pruned it (round-23)
         r_pid_pub=""
-        printf '%s\n' "$r_orphans" > "$orphan_file" 2>/dev/null
+        orphans_save
         raw_gen=$(( raw_gen + 1 ))
       fi
       # no rm here (round-20): $cache_tmp is only ever CREATED in the

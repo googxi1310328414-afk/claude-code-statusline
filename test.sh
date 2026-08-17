@@ -994,6 +994,116 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-29 regression asserts (2026-08-17) ----
+  # R113: the orphans file is shared by every instance, and a plain
+  # rewrite let one daemon erase what another had just registered - the
+  # conceding instance recorded the child it could not kill and the
+  # winner, which only ever read the file once at startup, blanked that
+  # line on its very next beat. The pid was then in no pid file, no
+  # orphan file and nobody's memory: exactly what the list exists for.
+  awk '/^orphans_save\(\)/,/^}/' ./statusline-panel-daemon.sh | grep -q 'read -r _os_disk' &&
+    ok "the orphans file is merged, never overwritten" || bad "orphans file is a blind overwrite again"
+  [ "$(grep -c '> "$orphan_file"' ./statusline-panel-daemon.sh)" -eq 1 ] &&
+    ok "every orphan write goes through the merge" || bad "an orphan write bypasses the merge"
+  # R114: retrying every survivor inside ONE beat made the beat interval
+  # N x a taskkill (~31s each under fork exhaustion), so two survivors
+  # pushed the heartbeat past the hook's 60s gate and a healthy daemon
+  # was killed and replaced every minute while the survivors lived on.
+  # Round-28's "write the beat first" only halved that window.
+  r29blk=$(awk '/SURVIVOR RETRY, ONE PER BEAT/,/^  fi$/' ./statusline-panel-daemon.sh)
+  [ "$(printf '%s\n' "$r29blk" | grep -cE '^ *(for|while) ')" -eq 0 ] &&
+    ok "the survivor retry handles one pid per beat" || bad "survivor retry still loops the whole list in one beat"
+  printf '%s\n' "$r29blk" | grep -q 'taskkill' &&
+    printf '%s\n' "$r29blk" | grep -q '_rest}${_rest:+ }${_keep}' &&
+    ok "the survivor list rotates so every pid is still retried" || bad "survivor list does not rotate"
+  # R115: the trend samples got round-28's digit cap but never its 10# -
+  # a zero-padded sample reads DECIMAL to the -lt that decides
+  # monotonicity and OCTAL to the subtraction ten lines down, and one
+  # containing 8 or 9 fails arithmetic outright, which makes bash discard
+  # the whole per-task loop: zero rows, exit 0, cache blanked in 3 frames
+  printf 't1\x1f%s\x1f0189000,0190000,0191000\n' "$now" > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  zs=$(jq -c '.columns=140' fixtures/subagent-tasks.json |
+    bash ./subagent-statusline.sh | jq -r .id | grep -c '^t[123]')
+  [ "${zs:-0}" -eq 3 ] && ok "a zero-padded trend sample cannot blank the panel" ||
+    bad "octal trend sample discarded the panel (${zs:-0}/3 rows)"
+  printf 't1\x1f%s\x1f0189000,0190000,0191000\n' "$now" > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  zsp=$(jq -c '.columns=140' fixtures/subagent-tasks.json |
+    bash ./subagent-statusline.sh | head -1 | grep -c '[▁▂▃▄▅▆]')
+  [ "${zsp:-0}" -eq 1 ] && ok "and it still charts, rather than silently dropping the trend" ||
+    bad "a zero-padded sample lost its sparkline"
+  : > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  # R116: the trend FILE's epoch column needs the same pair - it is
+  # compared with -gt (decimal) and subtracted with $(( )) (octal) two
+  # lines apart, and the arithmetic error discards the whole load loop,
+  # dropping every trend row that had not been read yet
+  grep -q 't_epoch" =~ \^\[0-9\]{1,12}\$' ./subagent-statusline.sh &&
+    grep -q 't_epoch=\$(( 10#\$t_epoch ))' ./subagent-statusline.sh &&
+    ok "the trend epoch column is capped and base-10 normalised" || bad "trend epoch column can still be read as octal"
+  # R121: SECONDS is an INTEGER that ticks on the shell start boundary,
+  # so `SECONDS + render_timeout` grants somewhere in (N-1, N] seconds
+  # depending on where in the current second the render begins. Invisible
+  # at the default 15; at round-27's floor of 1 it meant 0 to 1 second
+  # against a render measured at 0.3-0.7s here, so RENDER_TIMEOUT=0 went
+  # from killing every frame to killing a random third of them - and the
+  # assertion round-27 shipped with that floor (R104) has been flaky ever
+  # since, which is how this surfaced. Run it 3x: one pass proves little
+  # when the failure is probabilistic.
+  grep -q 'SECONDS + render_timeout + 1' ./statusline-panel-daemon.sh &&
+    ok "the render deadline compensates the truncated first second" || bad "render deadline still truncates the partial second"
+  zt_ok=0
+  for zt_i in 1 2 3; do
+    zt="$tmpd/zerotmo$zt_i"
+    mkdir -p "$zt"
+    cp fixtures/subagent-tasks.json "$zt/spool.z1.new"
+    STATUSLINE_PANEL_DIR="$zt" STATUSLINE_PANEL_RENDERER="$PWD/subagent-statusline.sh" \
+      STATUSLINE_SUBAGENT_TREND_FILE="$tmpd/zttrend$zt_i" STATUSLINE_PANEL_RENDER_TIMEOUT=0 \
+      once_daemon ./statusline-panel-daemon.sh --once >/dev/null 2>&1
+    [ -s "$zt/cache.z1" ] && zt_ok=$(( zt_ok + 1 ))
+  done
+  [ "$zt_ok" -eq 3 ] && ok "a minimum render deadline is really a whole second (3/3)" ||
+    bad "the floored deadline still kills renders ($zt_ok/3)"
+  # R117: the daily rollup columns are written straight back out by the
+  # fold, so a zero-padded cell is a PERMANENT lie inside the 9-day
+  # window - 0120 cents rendered $0.80 with exit 0, nothing in the
+  # blackbox, and line 1320 copied the bad value back to disk
+  : > "$STATUSLINE_HISTORY_FILE"
+  printf '%s\x1fS29\x1f0120\x1f0\x1f0\x1f%s\x1f0\n' "$(date +%Y%m%d)" "$((now-100))" > "$STATUSLINE_DAILY_FILE"
+  oct=$(jq -c '.session_id="S29-other" | .cost.total_cost_usd=0' fixtures/full.json | bash ./statusline-command.sh | strip)
+  case "$oct" in
+    *'today $1.20'*) ok "a zero-padded daily cell keeps its decimal value" ;;
+    *'today $0.80'*) bad "a zero-padded daily cell was read as octal (fake money)" ;;
+    *) bad "zero-padded daily cell produced neither value ($oct)" ;;
+  esac
+  # R118: and a padded cell containing 8 or 9 fails arithmetic outright,
+  # which makes bash discard the enclosing compound command and takes
+  # TODAY and WEEK off the bar together until the row ages out
+  printf '%s\x1fS29\x1f0890\x1f0\x1f0\x1f%s\x1f0\n' "$(date +%Y%m%d)" "$((now-100))" > "$STATUSLINE_DAILY_FILE"
+  oct9=$(jq -c '.session_id="S29-other" | .cost.total_cost_usd=0' fixtures/full.json | bash ./statusline-command.sh | strip)
+  case "$oct9" in
+    *'today $8.90'*) ok "a padded cell with 8/9 cannot discard the daily fold" ;;
+    *) bad "octal-invalid daily cell took today+week off the bar ($oct9)" ;;
+  esac
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R119: the daemon header asserted the watchdog "never reaps this
+  # daemon - by design", the exact opposite of the ps1, README 7/8 and
+  # AI-GUIDE 4 - and it is the file the guide names as authoritative for
+  # the whole architecture, so a reimplementation would drop both
+  # branches and get the 38-orphan storm straight back
+  ! grep -q 'this daemon - by design' ./statusline-panel-daemon.sh &&
+    ok "the daemon header no longer denies the watchdog branches" || bad "daemon header still contradicts the watchdog"
+  grep -q 'Stop-Process' ./statusline-watchdog.ps1 &&
+    [ "$(grep -ci 'daemon' ./statusline-watchdog.ps1)" -ge 2 ] &&
+    ok "the watchdog really does carry daemon branches" || bad "watchdog lost its daemon branches"
+  # R120: AI-GUIDE 0c(b)(c) were filed under "both scripts", but the panel
+  # implements neither ON PURPOSE - a bare degraded text line there is
+  # judged a GOOD frame by the daemon -s gate and handed to the host as a
+  # panel row, so copying 0c into a panel reimplementation turns honest
+  # degradation into feeding the host garbage
+  ! grep -q 'statusline: degraded' ./subagent-statusline.sh &&
+    ok "the panel degrades by silence, not by a bad row" || bad "the panel emits a non-JSON degraded line"
+  grep -q '(b)(c)' ./AI-GUIDE.md &&
+    ok "the guide records the panel exemption from 0c(b)(c)" || bad "AI-GUIDE still claims 0c is universal"
   # ---- adversarial-review round-28 regression asserts (2026-08-17) ----
   # R107: round-27's digit cap on the history tokens column guarded only
   # the normalisation step; the gate that decides ADMISSION was still
@@ -1028,14 +1138,16 @@ sleep 300
   # R109: a trend sample past int64 made every comparison error out, left
   # min == max, and divided by zero - bash then discarded the whole
   # per-task loop and the panel emitted nothing at all
-  ts=$(jq -c '.tasks[0].tokenSamples=[99999999999999999999,5,3]' fixtures/subagent-tasks.json | bash ./subagent-statusline.sh | jq -r .id | grep -c '^t[123]')
+  printf 't1\x1f%s\x1f99999999999999999999,5,3\n' "$now" > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  ts=$(jq -c '.columns=140' fixtures/subagent-tasks.json | bash ./subagent-statusline.sh | jq -r .id | grep -c '^t[123]')
   [ "${ts:-0}" -eq 3 ] && ok "an over-large trend sample cannot blank the panel" || bad "trend sample divided by zero (${ts:-0}/3 rows)"
+  : > "$STATUSLINE_SUBAGENT_TREND_FILE"
   # R110: the heartbeat must be written BEFORE the survivor retry, or it
   # lands already stale by the whole retry duration
   awk '/^hb_beat\(\)/,/^}/' ./statusline-panel-daemon.sh | awk '/daemon.pid.tmp/{w=NR} /SURVIVOR RETRY/{r=NR} END{exit !(w && r && r > w)}' && ok "the beat is written before the survivor retry" || bad "survivor retry still runs before the heartbeat write"
   # R111: the concede path must register an unkillable child, or the one
   # process nothing else can reach goes invisible the moment it appears
-  awk '/^quit_with_child\(\)/,/^}/' ./statusline-panel-daemon.sh | grep -q 'orphan_file' && ok "conceding registers a surviving child" || bad "concede path loses the survivor"
+  awk '/^quit_with_child\(\)/,/^}/' ./statusline-panel-daemon.sh | grep -qE 'orphan_file|orphans_save' && ok "conceding registers a surviving child" || bad "concede path loses the survivor"
   # R112: the blackbox is a state file too - without an env override every
   # assertion run truncated the developer's real ~/.claude blackbox
   grep -q 'STATUSLINE_ERR_LOG' ./statusline-command.sh && ok "the blackbox path is env-overridable" || bad "blackbox path is hardcoded to the real HOME"

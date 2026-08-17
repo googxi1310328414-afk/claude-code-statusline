@@ -494,7 +494,12 @@ if [ -r "$subagent_trend_file" ]; then
     [[ "$trend_rest" != *$'\x1f'* ]] && continue
     [[ "$t_csv" == *$'\x1f'* ]] && continue
     [ -n "$t_id" ] || continue
-    [[ "$t_epoch" =~ ^[0-9]+$ ]] || continue
+    # capped + base 10 (round-29) for the same reason as the samples: the
+    # column is compared with -gt (decimal) AND subtracted with $(( ))
+    # (octal), and an arithmetic error here discards this whole for loop,
+    # dropping every trend row that had not been read yet.
+    [[ "$t_epoch" =~ ^[0-9]{1,12}$ ]] || continue
+    t_epoch=$(( 10#$t_epoch ))
     [ -n "$t_csv" ] || continue
     [[ "$t_csv" == *[!0-9,]* ]] && continue
     # CLOCK-ROLLBACK GUARD: a row stamped in the future (wall clock
@@ -855,18 +860,28 @@ for ((ti=0; ti<task_count_total; ti++)); do
   fi
   if [ "${#nums[@]}" -ge 1 ]; then
     n_ok=1
-    for nv in "${nums[@]}"; do
-      # cap + base 10 here too (round-28): this was the last arithmetic
-    # input in the file with neither. An over-int64 sample turned every
-    # comparison below into "integer expected" (false), which left
-    # min_v == max_v, made range 0, and the bar index divided BY ZERO -
-    # bash then discarded the enclosing compound command, which here is
-    # the whole per-task loop: zero rows, exit 0, and three such frames
-    # blank the cache. A zero-padded sample from the trend file (whose
-    # column check deliberately allows them) failed arithmetic the same
-    # way, and since PASS 1 was discarded the bad row was never rewritten
-    # either - the panel stayed dead for the full 1800s read window.
-    [[ "$nv" =~ ^-?[0-9]{1,12}$ ]] || n_ok=0
+    # CAP **AND** BASE 10 (round-28 wrote the comment, round-29 wrote the
+    # second half): an over-int64 sample turned every comparison below
+    # into "integer expected" (false), which left min_v == max_v, made
+    # range 0, and the bar index divided BY ZERO - bash then discards the
+    # enclosing compound command, which here is the whole per-task loop:
+    # zero rows, exit 0, and three such frames blank the cache. A
+    # zero-padded sample from the trend file (whose column check
+    # deliberately allows digits with any padding) is worse than that: it
+    # reads DECIMAL to the -lt that decides monotonicity and OCTAL to the
+    # subtraction ten lines down, so 0189000 is either a bogus delta or a
+    # hard arithmetic error - and since PASS 1 was discarded the bad row
+    # was never rewritten either, so the panel stayed dead for the full
+    # 1800s read window rather than self-healing on the next frame.
+    for ((ni=0; ni<${#nums[@]}; ni++)); do
+      nv="${nums[$ni]}"
+      if [[ "$nv" =~ ^-?[0-9]{1,12}$ ]]; then
+        n_sgn=""
+        case "$nv" in -*) n_sgn="-"; nv="${nv#-}" ;; esac
+        nums[$ni]="${n_sgn}$(( 10#$nv ))"
+      else
+        n_ok=0
+      fi
     done
     n_count=${#nums[@]}
     if [ "$n_ok" -eq 1 ] && [ "$n_count" -ge 2 ]; then
