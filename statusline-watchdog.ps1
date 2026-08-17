@@ -34,13 +34,20 @@ $cutoff = (Get-Date).AddSeconds(-90)
 # 「排除含裸 -c 的外壳」共同挡住提及型误杀。
 # ARGV-POSITION ONLY（round-10 实锤）：`-like '*name*'` 只要求命令行里
 # 出现该文件名，于是 `bash -c "... # subagent-statusline.sh"` 这类**提及型**
+# 【第 30 轮订正】旧式 `"?[^"]*名字\.sh(\s|"|$)` 并不是位置锚定：`[^"]`
+# 包含空格，所以 `[^"]*` 会一路吃掉中间所有 argv，判据实际退化成「命令行
+# 里提到过该名字」——比它要取代的尾锚还松，而这一支是无差别 Stop-Process
+# -Force。现改为两分支显式区分「带引号的单个 argv（路径里可以有空格）」与
+# 「不带引号的单个 argv（禁止空格）」，实测：`bash /usr/bin/diag.sh
+# /home/u/.claude/statusline-panel-daemon.sh` 旧式 True、新式 False，而
+# 真实的四种形态（裸路径 / 带引号 / 家目录含空格 / 带 --once）全部仍为 True。
 # 外壳（诊断命令、测试脚本、AI 代理自己的 bash）同样命中并被 -Force 杀掉。
 # 判据收窄为「bash 的参数位就是该脚本」：命令行以脚本名（可带引号）结尾，
 # 且不含 ` -c `（-c 形态一律是外壳，真渲染永远是 `bash <script>`）。
 Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
   Where-Object {
     $_.CommandLine -notmatch '\s-c\s' -and
-    $_.CommandLine -match 'bash(\.exe)?"?\s+"?[^"]*(statusline-command|subagent-statusline)\.sh(\s|"|$)' -and
+    $_.CommandLine -match 'bash(\.exe)?"?\s+(?:"[^"]*(statusline-command|subagent-statusline)\.sh"|[^" ]*(statusline-command|subagent-statusline)\.sh(\s|$))' -and
     $_.CreationDate -lt $cutoff
   } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -58,7 +65,7 @@ if (Test-Path $pidFile) {
       # 二次确认：该 Windows pid 现在确实是一个执行 daemon 脚本的 bash
       # （pid 可能已被系统回收给别的进程）——参数位匹配，排除 `-c` 外壳。
       $p = Get-CimInstance Win32_Process -Filter "ProcessId=$wpid" -ErrorAction SilentlyContinue
-      if ($p -and $p.Name -eq 'bash.exe' -and $p.CommandLine -notmatch '\s-c\s' -and $p.CommandLine -match 'bash(\.exe)?"?\s+"?[^"]*statusline-panel-daemon\.sh(\s|"|$)') {
+      if ($p -and $p.Name -eq 'bash.exe' -and $p.CommandLine -notmatch '\s-c\s' -and $p.CommandLine -match 'bash(\.exe)?"?\s+(?:"[^"]*statusline-panel-daemon\.sh"|[^" ]*statusline-panel-daemon\.sh(\s|$))') {
         Stop-Process -Id $wpid -Force -ErrorAction SilentlyContinue
       }
       # 注册已确认陈旧：无论进程是否还在，都清掉它，下一拍钩子会重建
@@ -91,7 +98,7 @@ $orphanCutoff = (Get-Date).AddSeconds(-300)
 Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
   Where-Object {
     $_.CommandLine -notmatch '\s-c\s' -and
-    $_.CommandLine -match 'bash(\.exe)?"?\s+"?[^"]*statusline-panel-daemon\.sh(\s|"|$)' -and
+    $_.CommandLine -match 'bash(\.exe)?"?\s+(?:"[^"]*statusline-panel-daemon\.sh"|[^" ]*statusline-panel-daemon\.sh(\s|$))' -and
     $_.ProcessId -ne $regWpid -and
     $_.CreationDate -lt $orphanCutoff
   } |

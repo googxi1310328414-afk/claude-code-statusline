@@ -174,18 +174,38 @@ fi
 # test, an agent's own bash) carries the whole command as one -c argument
 # and must never enter a kill set.
 argv_identity() { # $1=pid -> REPLY_CMD ("" = unknown/not confirmable)
+  # FIRST ARGV AFTER BASH, NEVER THE LAST (round-30 - the law round-20
+  # wrote for the watchdog, never applied to the three bash walks): this
+  # loop kept overwriting until the end of cmdline, so the identity of
+  # `bash <script> --once` came out as "--once" and every reclaim path
+  # failed to recognise it. That exact shape is what test.sh spawns, and
+  # it is how round-20's 14-CPU-hour leak happened. Options before the
+  # script are skipped; a bare -c anywhere still voids the identity,
+  # because then the "script" is an inline command string.
   REPLY_CMD=""
   [ -r "/proc/$1/cmdline" ] || return 0
   _ai_arg=""
   _ai_isc=0
+  _ai_n=0
   while IFS= read -r -d '' _ai_arg; do
+    _ai_n=$(( _ai_n + 1 ))
     [ "$_ai_arg" = "-c" ] && _ai_isc=1
-    REPLY_CMD=$_ai_arg
+    if [ "$_ai_n" -gt 1 ] && [ -z "$REPLY_CMD" ]; then
+      case "$_ai_arg" in
+        -*) : ;;
+        *) REPLY_CMD=$_ai_arg ;;
+      esac
+    fi
     _ai_arg=""
   done < "/proc/$1/cmdline" 2>/dev/null
   # a cmdline whose tail lacks the trailing NUL leaves the last element
-  # in the loop variable instead of REPLY_CMD
-  [ -n "$_ai_arg" ] && REPLY_CMD=$_ai_arg
+  # in the loop variable instead of the loop body
+  if [ -n "$_ai_arg" ] && [ -z "$REPLY_CMD" ] && [ "$_ai_n" -ge 1 ]; then
+    case "$_ai_arg" in
+      -*) : ;;
+      *) REPLY_CMD=$_ai_arg ;;
+    esac
+  fi
   [ "$_ai_isc" -eq 1 ] && REPLY_CMD=""
   return 0
 }
@@ -265,8 +285,21 @@ if [ "$daemon_alive" -eq 0 ]; then
         # twice and never fires on a corpse.
         if kill -0 "$daemon_pid" 2>/dev/null; then
           argv_identity "$daemon_pid"
+          # THE CONFIGURED NAME BELONGS HERE TOO (round-30): the outer
+          # case accepts *"$daemon_base" as well, but this inner one -
+          # the gate in front of the native escalation and in front of
+          # reap_failed - listed only the canonical filename. With
+          # STATUSLINE_PANEL_DAEMON pointed at any other path (a
+          # documented override), a wedged instance was TERM/KILLed
+          # (which round-17 measured as a no-op on a process stuck inside
+          # the cygwin DLL), never escalated to taskkill, and left
+          # reap_failed at 0 - so the hook concluded the reclaim had
+          # worked and spawned a replacement. That is the "only spawn,
+          # never reap" amplifier reinstated by configuration alone,
+          # which the comment above says round-26 closed; it closed the
+          # outer case only.
           case "$REPLY_CMD" in
-            *statusline-panel-daemon.sh)
+            *"$daemon_base"|*statusline-panel-daemon.sh)
               _wp=""
               [ -r "/proc/$daemon_pid/winpid" ] && read -r _wp < "/proc/$daemon_pid/winpid" 2>/dev/null
               [[ "$_wp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
@@ -298,8 +331,28 @@ if [ "$daemon_alive" -eq 0 ]; then
   # would trade a leaked renderer for a permanently dark panel.)
   _rp_file=""
   [ -r "$panel_dir/orphans" ] && read -r _rp_file < "$panel_dir/orphans" 2>/dev/null
+  # DEDUP, AND ONE NATIVE ESCALATION PER TICK (round-30): line 4 is built
+  # from the daemon's own r_pid_pub PLUS r_orphans, and the orphans file
+  # is that same r_orphans - so concatenating the two lists hands every
+  # survivor to this loop TWICE, and each pass spends its own taskkill
+  # exec. Survivors are by definition the ones taskkill did not kill, so
+  # the cost is always paid in full: measured 4 taskkill calls and a 9s
+  # hook for 2 survivors with a stubbed 2s taskkill, which at the ~31s
+  # per exec this project has measured under fork exhaustion is about two
+  # minutes. That is catastrophic for a hook whose entire reason to exist
+  # is returning in milliseconds - the host re-invokes it every ~5s, the
+  # stalled copies stack, and each one holds a fork slot that pushes the
+  # exhaustion deeper. This is the same arithmetic round-29 removed on
+  # the daemon side; the hook still had it. One escalation per tick is
+  # enough: the next tick is 5 seconds away and the list is persistent.
+  _rp_seen=""
+  _rp_escalated=0
   for _rp in $daemon_rpid $_rp_file; do
     [[ "$_rp" =~ ^[0-9]{1,10}$ ]] || continue
+    case " $_rp_seen " in
+      *" $_rp "*) continue ;;
+    esac
+    _rp_seen="${_rp_seen}${_rp_seen:+ }$_rp"
     kill -0 "$_rp" 2>/dev/null || continue
     argv_identity "$_rp"
     case "$REPLY_CMD" in
@@ -307,7 +360,8 @@ if [ "$daemon_alive" -eq 0 ]; then
         kill -- "-$_rp" 2>/dev/null
         kill "$_rp" 2>/dev/null
         kill -9 -- "-$_rp" 2>/dev/null
-        if kill -0 "$_rp" 2>/dev/null; then
+        if kill -0 "$_rp" 2>/dev/null && [ "$_rp_escalated" -eq 0 ]; then
+          _rp_escalated=1
           _rwp=""
           [ -r "/proc/$_rp/winpid" ] && read -r _rwp < "/proc/$_rp/winpid" 2>/dev/null
           [[ "$_rwp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&

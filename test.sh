@@ -309,11 +309,26 @@ if [ "$1" = "--assert" ]; then
     for ((fi=0; fi<1200; fi++)); do printf '{"type":"user","message":{"content":"%s"},"uuid":"u%s"}\n' "$filler" "$fi"; done
     printf '{"type":"assistant","message":{"usage":{"cache_read_input_tokens":50000}},"timestamp":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
   } > "$tmpd/big.jsonl"
+  # MEASURE THE DIFFERENCE, NOT THE WALL CLOCK (round-30): the absolute
+  # 2.5s gate went red 2 times in 8 on an unloaded box (1.56s to 3.71s
+  # for the identical code) because it was timing a whole jq+bash
+  # pipeline, not the thing under test. What this assertion actually
+  # guards is the COST OF THE 500KiB, so it now measures a small render
+  # in the same conditions and compares the delta: a reintroduced
+  # `mapfile <<< blob` prices at ~3.5us/byte, i.e. ~1.8s for this
+  # fixture, while the honest delta measured across five runs here was
+  # 0.48-1.33s. Both terms move together under load, so the gate stays
+  # meaningful without being a coin flip.
+  t8s0=$EPOCHREALTIME
+  bash ./statusline-command.sh < fixtures/full.json >/dev/null 2>&1
+  t8s1=$EPOCHREALTIME
   t8a=$EPOCHREALTIME
   bigout=$(jq --arg tp "$tmpd/big.jsonl" '.transcript_path=$tp' fixtures/full.json | bash ./statusline-command.sh | strip)
   t8b=$EPOCHREALTIME
   printf '%s' "$bigout" | grep -q ' hot' && ok "big-transcript cache line found via awk" || bad "big-transcript cache line missed"
-  awk -v a="$t8a" -v b="$t8b" 'BEGIN{exit (b-a < 2.5) ? 0 : 1}' && ok "big-transcript render < 2.5s (O(bytes) split gone)" || bad "big-transcript render too slow"
+  t8d=$(awk -v a="$t8a" -v b="$t8b" -v c="$t8s0" -v d="$t8s1" 'BEGIN{printf "%.2f", (b-a)-(d-c)}')
+  awk -v a="$t8a" -v b="$t8b" -v c="$t8s0" -v d="$t8s1" 'BEGIN{exit ((b-a)-(d-c) < 2.0) ? 0 : 1}' &&
+    ok "500KiB transcript costs < 2.0s over a small render (${t8d}s)" || bad "big-transcript render too slow (+${t8d}s over baseline)"
   # R9: the watchdog VBS must stay pure ASCII - wscript parses .vbs as
   # the system ANSI codepage (GBK on zh-CN), where a line-final UTF-8
   # multibyte char whose last byte is a DBCS lead SWALLOWS the following
@@ -382,9 +397,22 @@ if [ "$1" = "--assert" ]; then
   printf '%s\n%s\n' "$(date +%s)" '{"id":"st1","content":"STALE_FRAME"}' > "$STATUSLINE_PANEL_DIR/cache.st1"
   STATUSLINE_PANEL_RENDERER="$tmpd/emptyrender.sh" STATUSLINE_PANEL_DIR="$STATUSLINE_PANEL_DIR" bash ./statusline-panel-daemon.sh &
   st_dpid=$!
+  # WAIT FOR CONSUMPTION, DO NOT SLEEP A GUESS (round-30): the spool is
+  # newest-wins by design, so writing the next payload on a fixed 0.8s
+  # timer silently OVERWRITES one the daemon has not picked up yet - on a
+  # loaded box a render cycle exceeds 0.8s and three writes produce two
+  # frames, so the streak never reaches three and this assertion goes red
+  # with nothing wrong in the code. Measured: red 2/2 on this box with the
+  # unmodified round-29 daemon while the mechanism itself worked fine at
+  # 1.2s spacing. Polling for the spool to disappear makes the test track
+  # the daemon instead of racing it.
   for _i in 1 2 3; do
     printf '{"columns":120,"tasks":[{"id":"st1","label":"x","status":"running","tokenCount":5}]}' > "$STATUSLINE_PANEL_DIR/spool.st1.new"
-    sleep 0.8
+    for _c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      [ -e "$STATUSLINE_PANEL_DIR/spool.st1.new" ] || break
+      sleep 0.2
+    done
+    sleep 0.3
   done
   st_ok=0
   for _w in 1 2 3 4 5; do
@@ -994,6 +1022,177 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-30 regression asserts (2026-08-17) ----
+  # R122: the history epoch column had a digit cap but no 10#, so a
+  # zero-padded row dated itself to 1974 (all-octal) or 19700101 (an 8 or
+  # a 9 makes printf reject it), fell past the 9-day retention filter, and
+  # left its money booked as the session's midnight baseline instead
+  : > "$STATUSLINE_DAILY_FILE"
+  printf '0%s\x1fS30\x1f1000\x1f5.00\n' "$((now-600))" > "$STATUSLINE_HISTORY_FILE"
+  printf '%s\x1fS30\x1f2000\x1f9.00\n' "$((now-60))" >> "$STATUSLINE_HISTORY_FILE"
+  oct30=$(jq -c '.session_id="S30" | .cost.total_cost_usd=9.00' fixtures/full.json | bash ./statusline-command.sh | strip)
+  # the visible cost is the money: the misdated row's spend is booked as
+  # the session's midnight baseline and subtracted from the real day
+  case "$oct30" in
+    *'week $9.00'*) ok "a zero-padded history epoch cannot misdate its row" ;;
+    *'week $4.00'*) bad "a padded epoch ate its own row as a baseline ($oct30)" ;;
+    *) bad "week segment absent or unexpected ($oct30)" ;;
+  esac
+  # R123: hist_oldest_epoch was stored raw and later fed to $(( )), and
+  # that failure discards the WHOLE append+trim block - the history file
+  # then stops growing for good and re-triggers the error every frame
+  h30=$(grep -c . "$STATUSLINE_HISTORY_FILE" 2>/dev/null)
+  jq -c '.session_id="S30-grow" | .cost.total_cost_usd=1.00' fixtures/full.json | bash ./statusline-command.sh >/dev/null 2>&1
+  h30b=$(grep -c . "$STATUSLINE_HISTORY_FILE" 2>/dev/null)
+  [ "${h30b:-0}" -gt "${h30:-0}" ] && ok "a padded epoch cannot freeze the history file" ||
+    bad "history file stopped growing ($h30 -> $h30b)"
+  : > "$STATUSLINE_HISTORY_FILE"; : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R124: an unparseable base column is an UNKNOWN baseline, never a
+  # known zero - a known zero books the whole gross carry-over as spend
+  # and the next settle writes that inflated figure into an _agg row
+  printf '%s\x1fSB\x1f0\x1f1000\x1f1000\x1f%s\x1fabc\n' "$(date +%Y%m%d)" "$((now-100))" > "$STATUSLINE_DAILY_FILE"
+  bs30=$(jq -c '.session_id="SB" | .cost.total_cost_usd=15.00' fixtures/full.json | bash ./statusline-command.sh | strip)
+  case "$bs30" in
+    *'today $15.'*) bad "an illegal base column was treated as a known zero ($bs30)" ;;
+    *'today $5.'*) ok "an illegal base column is an unknown baseline, not zero" ;;
+    *) bad "today segment absent or unexpected ($bs30)" ;;
+  esac
+  : > "$STATUSLINE_DAILY_FILE"
+  # R125: a line's LAST cell is never padded by render_line, so folding it
+  # into the shared column width padded every other line out to it - one
+  # ordinary auto-generated session_name pushed line 2 past a 120-column
+  # terminal and wrapped the four-line grid
+  # session_name is the LAST cell of line 4, so growing it must change
+  # line 4 and nothing else; if it votes for the shared column width it
+  # pads the same column on lines 1-3 and drives them past the terminal
+  w30a=$(jq -c '.session_name="x"' fixtures/full.json | bash ./statusline-command.sh | strip |
+    awk 'NR<=3{printf "%d ", length($0)}')
+  w30b=$(jq -c '.session_name="investigating the statusline column alignment regression"' fixtures/full.json |
+    bash ./statusline-command.sh | strip | awk 'NR<=3{printf "%d ", length($0)}')
+  [ "$w30a" = "$w30b" ] && ok "a long trailing cell does not widen the other lines ($w30a)" ||
+    bad "long session_name widened other lines ($w30a -> $w30b)"
+  # R126: an empty first path component means the path starts AT a root -
+  # using "the prefix is still empty" as the first-component test ate that
+  # separator, drawing absolute paths as relative ones and leaving the
+  # coloured cell one cell narrower than its own width record
+  # (a UNC share is the clean case: MSYS maps a POSIX root to C:\ before
+  # this code sees it, so the swallowed separator only shows on the form
+  # whose first component really is empty)
+  unc=$(jq -c '.workspace.current_dir="//server/share/project"' fixtures/full.json | bash ./statusline-command.sh | strip | sed -n 1p)
+  case "$unc" in
+    *'\'*'\share\project'*) ok "a UNC path keeps its root separator" ;;
+    *'share\project'*) bad "the root separator was swallowed ($unc)" ;;
+    *) bad "directory cell missing entirely ($unc)" ;;
+  esac
+  # R127: Oniguruma "$" also matches just before a trailing newline, so a
+  # string tokenCount ending in one passed the digit test and then made
+  # tonumber THROW - jq aborts before any output, the panel emits nothing,
+  # and three such frames blank the cache with nothing in the blackbox
+  nl30=$(jq -c '.columns=120 | .tasks[0].tokenCount="5000\n"' fixtures/subagent-tasks.json |
+    bash ./subagent-statusline.sh | jq -r .id | grep -c '^t[123]')
+  [ "${nl30:-0}" -eq 3 ] && ok "a trailing newline in tokenCount cannot blank the panel" ||
+    bad "newline tokenCount took the panel down (${nl30:-0}/3 rows)"
+  # R128: a lone surrogate escape is a jq PARSE error - one host-truncated
+  # emoji in one description took every healthy row down with it
+  python -c "import io,json,sys; d=json.load(io.open('fixtures/subagent-tasks.json',encoding='utf-8')); d['columns']=120; d['tasks'][0]['description']='cut MARKER'; io.open(sys.argv[1],'w',encoding='utf-8').write(json.dumps(d).replace('MARKER', chr(92)+'ud83d'))" "$tmpd/lone.json" 2>/dev/null
+  if [ -s "$tmpd/lone.json" ]; then
+    lone30=$(bash ./subagent-statusline.sh < "$tmpd/lone.json" | jq -r .id | grep -c '^t[123]')
+    [ "${lone30:-0}" -eq 3 ] && ok "a lone surrogate escape cannot blank the panel" ||
+      bad "lone surrogate took the panel down (${lone30:-0}/3 rows)"
+  else
+    ok "lone-surrogate fixture skipped (no python)"
+  fi
+  # R129: clean started its C0 strip at \u0001, so NUL survived and @tsv
+  # rendered it as a FIFTH escape - which breaks the decoder contract and,
+  # worse, the id column that is the only key handed back to the host
+  nul30=$(jq -c '.columns=120 | .tasks[0].id="A\u0000B"' fixtures/subagent-tasks.json |
+    bash ./subagent-statusline.sh | jq -r .id | head -1)
+  case "$nul30" in
+    *'\0'*) bad "NUL survived clean and reached the id column ($nul30)" ;;
+    *) ok "NUL is stripped before @tsv can escape it" ;;
+  esac
+  # R130: the model column had no width cap at all, so a fully-qualified
+  # gateway model id ate the one panel-wide description budget
+  bed30=$(jq -c '.columns=120 | .tasks[0].model="us.anthropic.claude-sonnet-4-5-20250929-v1:0"' fixtures/subagent-tasks.json |
+    bash ./subagent-statusline.sh | jq -r .content | grep -c 'Review the auth')
+  [ "${bed30:-0}" -ge 1 ] && ok "a long model id cannot delete the description column" ||
+    bad "long model id took the description column off every row"
+  # R131: the identity cap bounded the NAME but never the decoration, and
+  # the 8-cell floor then guaranteed a cell of "decoration + 8" with no
+  # upper bound - a long custom agent type did the same damage
+  typ30=$(jq -c '.columns=120 | .tasks[0].type="reviewer-with-security-performance-and-accessibility-analysis-for-monorepo-frontends"' fixtures/subagent-tasks.json |
+    bash ./subagent-statusline.sh | jq -r .content | grep -c 'Review the auth')
+  [ "${typ30:-0}" -ge 1 ] && ok "a long agent type cannot delete the description column" ||
+    bad "long type took the description column off every row"
+  # R132: the orphans merge must apply the SAME identity test as the
+  # eviction, or the retry's only shortening branch is undone on disk and
+  # the file grows without bound
+  awk '/^orphans_save\(\)/,/^}/' ./statusline-panel-daemon.sh | grep -q 'child_is_renderer' &&
+    ok "the orphans merge re-checks identity, not just liveness" || bad "orphans merge re-adds evicted pids"
+  # R133: MAX_LIFE=0 passes the digit test and reads as "no ceiling", but
+  # the comparison made it "exit on the first pass" - the resident daemon
+  # switched itself off and the hook spawned a fresh one every tick
+  grep -q 'daemon_max_life" -lt 60' ./statusline-panel-daemon.sh &&
+    ok "the daemon lifetime knob has a floor" || bad "MAX_LIFE=0 still means exit immediately"
+  ml30="$tmpd/mlife"; mkdir -p "$ml30"
+  cp fixtures/subagent-tasks.json "$ml30/spool.z1.new"
+  STATUSLINE_PANEL_DIR="$ml30" STATUSLINE_PANEL_RENDERER="$PWD/subagent-statusline.sh" \
+    STATUSLINE_SUBAGENT_TREND_FILE="$tmpd/mltrend" STATUSLINE_PANEL_DAEMON_MAX_LIFE=0 \
+    once_daemon ./statusline-panel-daemon.sh --once >/dev/null 2>&1
+  [ -s "$ml30/cache.z1" ] && ok "MAX_LIFE=0 still renders a frame" || bad "MAX_LIFE=0 killed the daemon before it worked"
+  # R134: line 4 and the orphans file are the SAME list, so concatenating
+  # them handed every survivor to the reclaim loop twice - and each pass
+  # spends its own taskkill, which is ~31s under fork exhaustion
+  awk '/for _rp in \$daemon_rpid/,/^  done$/' ./statusline-panel-hook.sh |
+    grep -q '\*" \$_rp "\*) continue' &&
+    awk '/for _rp in \$daemon_rpid/,/^  done$/' ./statusline-panel-hook.sh |
+      grep -q '_rp_escalated" -eq 0' &&
+    ok "the hook reclaims each survivor once per tick" || bad "hook still double-reaps its survivor list"
+  # R135: the inner case in front of the native escalation listed only the
+  # canonical filename, so a configured daemon name was never escalated
+  # and reap_failed stayed 0 - the hook then spawned a replacement
+  awk '/argv_identity "\$daemon_pid"/,/reap_failed=1/' ./statusline-panel-hook.sh | grep -q 'daemon_base' &&
+    ok "native escalation honours the configured daemon name" || bad "configured daemon name skips the escalation"
+  # R136: every identity judgement anchors on the FIRST argv after bash -
+  # the last-argv walk read `bash <script> --once` as "--once", which is
+  # exactly the shape test.sh spawns and exactly how round-20 leaked 14
+  # CPU-hours
+  for _f in statusline-panel-hook.sh statusline-panel-daemon.sh install.sh; do
+    grep -q '_n" -gt 1 \]\|_rn" -gt 1 \]\|old_n" -gt 1 \]' "./$_f" ||
+      { bad "$_f still walks cmdline to the last argv"; break; }
+  done
+  grep -q '_ai_n" -gt 1' ./statusline-panel-hook.sh &&
+    grep -q '_ci_n" -gt 1' ./statusline-panel-daemon.sh &&
+    grep -q 'old_n" -gt 1' ./install.sh && grep -q 'old_rn" -gt 1' ./install.sh &&
+    ok "all three bash argv walks anchor on the first argv" || bad "an argv walk still anchors on the tail"
+  # R137: the watchdog's [^"]* spans spaces, so the "argv position" anchor
+  # degenerated into "the command line mentions the name" - and that
+  # branch is an unconditional Stop-Process -Force
+  grep -q 'statusline-panel-daemon\\.sh"|\[^" \]\*' ./statusline-watchdog.ps1 &&
+    ok "the watchdog anchor cannot span an argv boundary" || bad "watchdog regex still spans spaces"
+  grep -c '\[^"\]\*statusline-panel-daemon' ./statusline-watchdog.ps1 | grep -q '^2$' &&
+    ok "both watchdog daemon branches keep the quoted-path alternative" || bad "watchdog branch count changed"
+  # R138: install must never de-register a daemon it could not kill - that
+  # turns a reachable wedged instance into an unregistered orphan, which
+  # this project's own docs call the one blind spot, AND it removes the
+  # "reclaim failed, do not spawn" brake from the hook
+  awk '/still_alive=0/,/^  fi$/' ./install.sh | grep -q 'rm -f "\$daemon_pid_file"' &&
+    bad "install still deletes the pid file of a live daemon" ||
+    ok "install keeps a live daemon registered"
+  # R139: Retry-After and the compact-boundary token pair are external
+  # inputs and need the same cap + 10# as everything else
+  grep -q 'usage_ra_val" =~ \^\[0-9\]{1,7}\$' ./statusline-command.sh &&
+    grep -q 'pre_val" =~ \^\[0-9\]{1,12}\$' ./statusline-command.sh &&
+    ok "Retry-After and compact tokens carry cap + base 10" || bad "an external numeric input still lacks the triple"
+  # R140: the docs must not tell a reimplementer to do the thing that was
+  # just measured as broken
+  grep -q '每次心跳重试一次' ./AI-GUIDE.md && bad "AI-GUIDE still specifies whole-list survivor retry" ||
+    ok "AI-GUIDE specifies one survivor per beat"
+  grep -q "逐行读 jq/awk 输出必须 \`| tr -d" ./AI-GUIDE.md && bad "AI-GUIDE still mandates a per-frame tr fork" ||
+    ok "AI-GUIDE mandates CR stripping without a fork"
+  grep -q 'sparkline (cyan) is up to 8' ./statusline-command.sh && bad "the header still calls the sparkline flat cyan" ||
+    ok "the header records the sparkline rate-tier colour"
   # ---- adversarial-review round-29 regression asserts (2026-08-17) ----
   # R113: the orphans file is shared by every instance, and a plain
   # rewrite let one daemon erase what another had just registered - the

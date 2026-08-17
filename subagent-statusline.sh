@@ -48,7 +48,15 @@ export LC_ALL=C.UTF-8
 # EXPECTED REMAINING SPAWN INVENTORY per render, after this pass: exactly
 # ONE jq invocation, full stop, regardless of task count - the 3+N
 # per-task jq exception from the prior de-spawn round is fully closed.
-# Nothing else in this script forks: every helper call, every %()T/%*s
+# Nothing else in this script forks on the ordinary frame; the ONE
+# exception is the trend state file, which costs a single `mv` on a
+# sampling frame (>=10s per task) because it is cross-process memory
+# and has to be written atomically - AI-GUIDE section 2.0(e) budgets
+# exactly that, and section 4.2.3 requires the $$-tmp+mv form. Do NOT
+# "optimise" it into a plain > redirect (round-30): concurrent panels
+# would then let a reader see a half-written row, the whole-row shape
+# check drops it, and that task silently loses its sparkline. Beyond
+# that one mv: every helper call, every %()T/%*s
 # format, every per-task/per-character loop is a bash builtin or
 # parameter expansion.
 #
@@ -186,6 +194,28 @@ export LC_ALL=C.UTF-8
 input=""
 while IFS= read -r -N 65536 slurp_chunk; do input+="$slurp_chunk"; done
 input+="$slurp_chunk"
+
+# LONE SURROGATE ESCAPES ARE A JQ PARSE ERROR (round-30): a JS host that
+# cuts a description by UTF-16 units and re-serialises it emits a
+# lone \udXXX escape - RFC 8259 allows it, and a well-formed
+# JSON.stringify produces exactly that shape. jq then fails in its PARSER,
+# before the program runs: exit 5, zero bytes out, stderr swallowed by the
+# 2>/dev/null on the call. One truncated emoji in one task therefore takes
+# the WHOLE panel down - every healthy row with it - and three such frames
+# make the daemon blank the cache, so the panel stays on the host default
+# for as long as the host keeps sending that description. Stripping the
+# escapes costs eight parameter expansions and no fork; a PAIRED surrogate
+# is never escaped by a conforming serialiser (astral characters go out as
+# raw UTF-8), so in practice only the broken ones are removed here.
+case "$input" in
+  *\\u[dD]*)
+    for _sg in d8 d9 dA dB dC dD dE dF; do
+      input="${input//\\u${_sg}??/}"
+      input="${input//\\u${_sg,,}??/}"
+      input="${input//\\u${_sg^^}??/}"
+    done
+    ;;
+esac
 
 # jq guard: if jq is missing, every row below is unusable - emit nothing
 # useful is impossible in this contract (no id to key a line on), so just
@@ -346,7 +376,16 @@ disp_width() {
 # IFS-whitespace, so empty fields survive exactly; every `read` below
 # uses IFS=$'\x1f' to match.
 jq_all_out=$(jq -r '
-  def clean: tostring | gsub("[\t\n\r]"; " ") | gsub("[\u0001-\u001f]"; "");
+  # the range starts at \u0000 (round-30): starting at \u0001 left NUL
+  # alive, and @tsv renders NUL as a FIFTH escape - the two characters
+  # backslash-zero - which breaks both the "the only escape left is a
+  # backslash" contract the decoder below relies on and, worse, the id
+  # column: id is the one key handed back to the host, and a mangled one
+  # leaves that agent silently on its default row while every other cell
+  # looks right. The four bare scalar lines are not @tsv at all, so a NUL
+  # there makes bash warn about an ignored null byte straight into the
+  # blackbox on every frame.
+  def clean: tostring | gsub("[\t\n\r]"; " ") | gsub("[\u0000-\u001f]"; "");
   (.columns // "") as $columns
   | (.tasks // []) as $tasks_raw
   # NON-OBJECT ELEMENTS ARE DROPPED, NOT FATAL (round-22): the container
@@ -378,8 +417,18 @@ jq_all_out=$(jq -r '
   # correctly dropped its own cells yet still entered the denominator and
   # still satisfied the "2 tasks with tokens" display gate, and every
   # OTHER row then rendered a fabricated 0%.
-  | ([$tasks[]? | .tokenCount // 0 | tostring | select(test("^[0-9]{1,12}$")) | tonumber] | add // 0 | tostring) as $total_tokens
-  | ([$tasks[]? | .tokenCount // empty | tostring | select(test("^[0-9]{1,12}$")) | tonumber | select(. > 0)] | length | tostring) as $tokened_count
+  # ANCHOR + BELT (round-30): Oniguruma "$" matches at the end of the
+  # string AND just before a trailing newline, so "5000\n" - a
+  # string-shaped tokenCount, the exact drift this gate was built for -
+  # passed the test and then made tonumber THROW. That abort happens
+  # inside the binding, before a single byte of output, so jq exits 5
+  # with an empty stdout and its stderr swallowed: the panel emits
+  # nothing, the daemon calls three such frames a dead cache, and every
+  # row falls back to the host default with nothing in the blackbox.
+  # The extra "no non-digit anywhere" clause closes the newline hole;
+  # tonumber? // empty is the belt for any shape not thought of yet.
+  | ([$tasks[]? | .tokenCount // 0 | tostring | select(test("^[0-9]{1,12}$") and (test("[^0-9]") | not)) | (tonumber? // empty)] | add // 0 | tostring) as $total_tokens
+  | ([$tasks[]? | .tokenCount // empty | tostring | select(test("^[0-9]{1,12}$") and (test("[^0-9]") | not)) | (tonumber? // empty) | select(. > 0)] | length | tostring) as $tokened_count
   | ($columns | clean), ($majority_model | clean), $total_tokens, $tokened_count,
     (
       range(0; $tcount) as $i
@@ -610,12 +659,39 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # row). One flag, decided once, used by both.
   ident_is_type=0
   [ -n "$task_type" ] && [ "$task_type" = "$identity_plain" ] && ident_is_type=1
-  ident_deco=4
-  [ -n "$task_type" ] && [ "$ident_is_type" -eq 0 ] && ident_deco=$(( ident_deco + ${#task_type} + 2 ))
-  [ -n "$effort" ] && ident_deco=$(( ident_deco + ${#effort} + 1 ))
+  # THE DECORATION HAS TO BE BOUNDED TOO (round-30): round-18 established
+  # that the cap must bound the whole CELL, but only the NAME was ever
+  # truncated - task_type and effort went in at full length and the
+  # 8-character floor below then guaranteed a cell of "decoration + 8"
+  # with no upper bound at all. An 84-character agent type (users name
+  # their own agents in .claude/agents/) produced a 95-cell identity
+  # against a 40-cell cap, which pushed the panel-wide description budget
+  # negative and took the description column off EVERY row - precisely
+  # the failure the cap was introduced to stop. Both fields are cut here,
+  # before they are measured or drawn, so the cell is bounded whatever
+  # the host sends.
   cell_cap=$(( columns / 3 ))
   [ "$cell_cap" -lt 16 ] && cell_cap=16
   [ "$cell_cap" -gt 60 ] && cell_cap=60
+  deco_cap=$(( cell_cap / 2 ))
+  [ "$deco_cap" -lt 6 ] && deco_cap=6
+  if [ -n "$task_type" ] && [ "$ident_is_type" -eq 0 ] && [ "${#task_type}" -gt "$deco_cap" ]; then
+    task_type="${task_type:0:$(( deco_cap - 1 ))}"
+    deco_cp=0
+    printf -v deco_cp '%d' "'${task_type: -1}" 2>/dev/null || deco_cp=0
+    [ "$deco_cp" -ge 55296 ] && [ "$deco_cp" -le 56319 ] && task_type="${task_type:0:$(( deco_cap - 2 ))}"
+    task_type="${task_type}…"
+  fi
+  if [ -n "$effort" ] && [ "${#effort}" -gt "$deco_cap" ]; then
+    effort="${effort:0:$(( deco_cap - 1 ))}"
+    deco_cp=0
+    printf -v deco_cp '%d' "'${effort: -1}" 2>/dev/null || deco_cp=0
+    [ "$deco_cp" -ge 55296 ] && [ "$deco_cp" -le 56319 ] && effort="${effort:0:$(( deco_cap - 2 ))}"
+    effort="${effort}…"
+  fi
+  ident_deco=4
+  [ -n "$task_type" ] && [ "$ident_is_type" -eq 0 ] && ident_deco=$(( ident_deco + ${#task_type} + 2 ))
+  [ -n "$effort" ] && ident_deco=$(( ident_deco + ${#effort} + 1 ))
   ident_cap=$(( cell_cap - ident_deco ))
   [ "$ident_cap" -lt 8 ] && ident_cap=8
   if [ -n "$identity_plain" ]; then
@@ -680,7 +756,11 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # one solid block of magenta - get a PER-AGENT hue instead, so several
   # agents in flight at once are told apart at a glance. The hue is a
   # stable hash of the task id (an agent keeps its color for its whole
-  # life, across frames and sessions), summed over at most 8 characters
+  # life, across frames and sessions), multiply-accumulated over the
+  # WHOLE id (round-30 corrected this line, which still described the
+  # abandoned prefix-sum: see the note on the loop below - truncating
+  # to a prefix clusters badly, and host task ids share long prefixes
+  # by construction, so two live agents landed on the same hue)
   # via printf's "'c" ordinal form: pure builtins, ~8 statements a row.
   case "$status" in
     pending|queued|starting)        ident_color="$YELLOW" ;;
@@ -798,6 +878,23 @@ for ((ti=0; ti<task_count_total; ti++)); do
   model_plain=""
   if [ -n "$model" ]; then
     short_model "$model"; model_short="$REPLY"
+    # WIDTH CAP (round-30): short_model only strips a "claude-" prefix
+    # and a trailing -YYYYMMDD, so a fully-qualified id from a gateway
+    # deployment (the Bedrock/Vertex form, 40+ chars, no such prefix and
+    # a -v1:0 tail) came through at full length. This column is measured
+    # into col_max and then subtracted from the ONE panel-wide
+    # description budget, so a single such task pushed that budget
+    # negative and the description column disappeared from EVERY row -
+    # the exact outcome round-28's type gate was added to prevent, which
+    # only handled the object shape and never the long-string one. Rows
+    # also overflowed the terminal width and wrapped.
+    if [ "${#model_short}" -gt 18 ]; then
+      model_short="${model_short:0:17}"
+      model_cp=0
+      printf -v model_cp '%d' "'${model_short: -1}" 2>/dev/null || model_cp=0
+      [ "$model_cp" -ge 55296 ] && [ "$model_cp" -le 56319 ] && model_short="${model_short:0:16}"
+      model_short="${model_short}…"
+    fi
     if [ -n "$model_short" ]; then
       model_seg="${CYAN}${model_short}${RESET}"
       model_plain="$model_short"
@@ -1024,11 +1121,13 @@ for ((ti=0; ti<task_count_total; ti++)); do
   [ "$dw5" -gt "${col_max[5]}" ] && col_max[5]=$dw5
 done
 
-# Persist the own-samples state (only when this render actually took at
-# least one new sample). Retention was already applied at read time, so
-# the in-memory rows ARE the post-trim file; the count cap is a runaway
-# backstop only. Per-PID tmp + atomic mv, same pattern as every other
-# state writer in this pair; all failure modes silenced.
+# (round-30 removed a stale paragraph that used to sit here: it said the
+# save happens "only when this render actually took a new sample" and
+# spoke of a row cap. Neither was true - trend_dirty is also set by the
+# two PURGE branches at read time (a future-stamped row, a row older than
+# the 1800s window), which is exactly how expired rows get swept, and the
+# writer below has no row cap at all. Following it would have dropped the
+# purge path, leaving stale rows in the file for good.)
 # Persist the trend state: one row per live task, so the file is tiny
 # (task count, not history length) and a plain rewrite IS the cheap
 # path - no append/rewrite split needed. Cross-session rows were loaded

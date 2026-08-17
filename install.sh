@@ -89,7 +89,11 @@ if [ "$daemon_updated" -eq 1 ]; then
   # 代理自己的 bash——它们的命令行同样以该文件名结尾）一并 -Force 杀掉，
   # 与 2026-08-13 的误杀事故同型。现改为读 pid 文件：第 1 行 cygwin pid
   # 用于 kill，第 3 行 Windows pid 交给 PowerShell 兜底（cygwin 的 ps 看
-  # 不到全部实例）。未注册的孤儿走看门狗的**300s 孤儿分支**（不是心跳陈旧
+  # 不到全部实例）。**本段只回收 pid 文件里注册的那一个**——未注册的实例
+  # 按定义不在这个文件里，old_dp 读不到它，整段对它是空转（第 30 轮订正：
+  # 此处曾写成「不装看门狗时未注册孤儿的唯一兑底就是这段回收」，那是错的，
+  # 而且会诱导复刻者为了兑现这句话而恢复「命令行提及脚本名」的模糊匹配，
+  # 那正是 2026-08-13 误杀事故的形态）。未注册的孤儿走看门狗的**300s 孤儿分支**（不是心跳陈旧
   # 分支——它根本不在 pid 文件里，心跳分支够不着它）；而 1 小时寿命闸只在循环
   # 还转得动时生效，卡死的那类它同样够不着。因此不装看门狗时，未注册孤儿
   # 的唯一兑底就是本次安装里这段回收——但两条路都不需要模糊匹配。
@@ -113,13 +117,28 @@ if [ "$daemon_updated" -eq 1 ]; then
   old_cmd=""
   old_ok=0
   if [[ "$old_dp" =~ ^[0-9]+$ ]] && kill -0 "$old_dp" 2>/dev/null && [ -r "/proc/$old_dp/cmdline" ]; then
-    old_arg=""; old_isc=0
+    # 判据锚在「bash 之后的第一个 argv」而不是末尾（第 30 轮）：原先每轮
+    # 覆写到 cmdline 结束，于是 `bash <脚本> --once` 的身份被读成 --once，
+    # 所有回收路径都认不出它——而那正是 test.sh 派生的形态，也正是第 20 轮
+    # 14 CPU 小时泄漏的成因。脚本前的选项跳过；出现裸 -c 一律判负。
+    old_arg=""; old_isc=0; old_n=0
     while IFS= read -r -d '' old_arg; do
+      old_n=$(( old_n + 1 ))
       [ "$old_arg" = "-c" ] && old_isc=1
-      old_cmd=$old_arg
+      if [ "$old_n" -gt 1 ] && [ -z "$old_cmd" ]; then
+        case "$old_arg" in
+          -*) : ;;
+          *) old_cmd=$old_arg ;;
+        esac
+      fi
       old_arg=""
     done < "/proc/$old_dp/cmdline" 2>/dev/null
-    [ -n "$old_arg" ] && old_cmd=$old_arg
+    if [ -n "$old_arg" ] && [ -z "$old_cmd" ] && [ "$old_n" -ge 1 ]; then
+      case "$old_arg" in
+        -*) : ;;
+        *) old_cmd=$old_arg ;;
+      esac
+    fi
     [ "$old_isc" -eq 1 ] && old_cmd=""
     case "$old_cmd" in
       *"${daemon_base}"|*statusline-panel-daemon.sh) old_ok=1 ;;
@@ -140,13 +159,24 @@ if [ "$daemon_updated" -eq 1 ]; then
   for one_rp in $old_rp; do
     [[ "$one_rp" =~ ^[0-9]{1,10}$ ]] || continue
     kill -0 "$one_rp" 2>/dev/null || continue
-    old_rcmd=""; old_rarg=""; old_risc=0
+    old_rcmd=""; old_rarg=""; old_risc=0; old_rn=0
     while IFS= read -r -d '' old_rarg; do
+      old_rn=$(( old_rn + 1 ))
       [ "$old_rarg" = "-c" ] && old_risc=1
-      old_rcmd=$old_rarg
+      if [ "$old_rn" -gt 1 ] && [ -z "$old_rcmd" ]; then
+        case "$old_rarg" in
+          -*) : ;;
+          *) old_rcmd=$old_rarg ;;
+        esac
+      fi
       old_rarg=""
     done < "/proc/$one_rp/cmdline" 2>/dev/null
-    [ -n "$old_rarg" ] && old_rcmd=$old_rarg
+    if [ -n "$old_rarg" ] && [ -z "$old_rcmd" ] && [ "$old_rn" -ge 1 ]; then
+      case "$old_rarg" in
+        -*) : ;;
+        *) old_rcmd=$old_rarg ;;
+      esac
+    fi
     [ "$old_risc" -eq 1 ] && old_rcmd=""
     case "$old_rcmd" in
       *"${renderer_base}"|*subagent-statusline.sh)
@@ -167,12 +197,30 @@ if [ "$daemon_updated" -eq 1 ]; then
   # 正是它存在的理由；安全性由这里自己这份同等严格的判据保证。
   # 且只有真的杀掉了才算「已回收」——原先无条件置位，什么都没杀也报成功。
   if [[ "$old_wp" =~ ^[0-9]+$ ]] && command -v powershell.exe >/dev/null 2>&1; then
-    ps_killed=$(powershell.exe -NoProfile -NonInteractive -Command "\$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$old_wp\" -ErrorAction SilentlyContinue; if (\$p -and \$p.Name -eq 'bash.exe' -and \$p.CommandLine -notmatch '\s-c\s' -and \$p.CommandLine -match 'bash(\.exe)?\"?\s+\"?[^\"]*statusline-panel-daemon\.sh(\s|\"|\$)') { Stop-Process -Id $old_wp -Force -ErrorAction SilentlyContinue; 'KILLED' }" 2>/dev/null | tr -d '\r\n')
+    ps_killed=$(powershell.exe -NoProfile -NonInteractive -Command "\$p = Get-CimInstance Win32_Process -Filter \"ProcessId=$old_wp\" -ErrorAction SilentlyContinue; if (\$p -and \$p.Name -eq 'bash.exe' -and \$p.CommandLine -notmatch '\s-c\s' -and \$p.CommandLine -match 'bash(\.exe)?\"?\s+(?:\"[^\"]*statusline-panel-daemon\.sh\"|[^\" ]*statusline-panel-daemon\.sh(\s|\$))') { Stop-Process -Id $old_wp -Force -ErrorAction SilentlyContinue; 'KILLED' }" 2>/dev/null | tr -d '\r\n')
     [ "$ps_killed" = "KILLED" ] && recycled=1
   fi
   [ "$recycled" -gt 0 ] && say "✓ 旧面板 daemon 已回收——下一拍钩子自动以新版拉起"
-  # pid 文件与在途渲染残骸一并清掉，避免新实例读到陈旧注册
-  rm -f "$daemon_pid_file" "$CLAUDE_DIR/statusline-panel.d"/render.* "$CLAUDE_DIR/statusline-panel.d"/*.raw 2>/dev/null
+  # 没杀死就不许注销（第 30 轮）：原先无条件删 pid 文件。用户往往正是在
+  # 面板卡死时来跑更新，而卡在 cygwin DLL 里的实例扛得住 kill -9、
+  # PowerShell 兜底也可能落空（第 3 行 winpid 为空 / 无 powershell.exe）。
+  # 一旦把它从 pid 文件里抹掉，它就从「注册在案、钩子够得着、且钩子会因
+  # 回收失败而拒绝拉新」变成「未注册孤儿」——本项目文档亲自认定的、四条
+  # 回收路径全都够不着的唯一盲区，而钩子下一拍读不到注册就畅通无阻地每
+  # 拍拉一个新实例。这段代码的注释自己写着「不装看门狗时未注册孤儿的唯一
+  # 兑底就是本次安装的这段回收」，无条件删 pid 文件恰好亲手造一个。
+  still_alive=0
+  if [[ "$old_dp" =~ ^[0-9]+$ ]] && kill -0 "$old_dp" 2>/dev/null && [ "$old_ok" -eq 1 ]; then
+    still_alive=1
+  fi
+  if [ "$still_alive" -eq 1 ]; then
+    say "⚠ 旧面板 daemon (pid $old_dp) 杀不掉——保留其注册，钩子会因此拒绝拉新实例（不会产生孤儿）"
+    say "  请重启终端，或安装自愈层：重新执行并加 --with-watchdog"
+    rm -f "$CLAUDE_DIR/statusline-panel.d"/render.* "$CLAUDE_DIR/statusline-panel.d"/*.raw 2>/dev/null
+  else
+    # pid 文件与在途渲染残骸一并清掉，避免新实例读到陈旧注册
+    rm -f "$daemon_pid_file" "$CLAUDE_DIR/statusline-panel.d"/render.* "$CLAUDE_DIR/statusline-panel.d"/*.raw 2>/dev/null
+  fi
 fi
 
 # ---------- settings.json 合并（保留既有键；失败不落地） ----------

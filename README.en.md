@@ -28,7 +28,7 @@ with a STATE-COLORED identity (pending yellow / completed green / failed bright 
 
 ## Install
 
-Requirements: Claude Code ≥ 2.1.221 (subagent effort field), Git Bash (bash ≥ 4.3 — `local -n` namerefs, UTF-8), `jq`, `git` (≥ 2.35 for the stash segment).
+Requirements: Claude Code >= 2.1.221 (the version this is verified against; the subagent `effort` field itself lands in 2.1.214 and `contextWindowSize` in 2.1.205 - older builds simply lose those two columns), Git Bash (bash ≥ 4.3 — `local -n` namerefs, UTF-8), `jq`, `git` (≥ 2.35 for the stash segment).
 
 One-liner (idempotent — re-running updates; offline when run inside a local clone):
 
@@ -50,7 +50,7 @@ It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES s
 ```bash
 bash test.sh          # render all fixtures (see real colors in your terminal)
 bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
-bash test.sh --assert # 209 assertions (CI mode; perf gates + twenty-nine adversarial-review regression groups + color asserts)
+bash test.sh --assert # 232 assertions (CI mode; perf gates + thirty adversarial-review regression groups + color asserts)
 ```
 
 ## Notable engineering notes

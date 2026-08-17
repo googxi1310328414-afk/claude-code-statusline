@@ -217,6 +217,16 @@ if [[ "$daemon_max_life" =~ ^[0-9]{1,7}$ ]]; then
 else
   daemon_max_life=3600
 fi
+# FLOOR, for the same reason render_timeout has one (round-30): 0 passes
+# the digit test and reads naturally as "no lifetime ceiling", but the
+# comparison is `SECONDS -ge daemon_max_life`, so it was true on the
+# first pass - the daemon ran one spool cycle and exited. Measured: 573ms
+# alive against 12s+ with a normal value, and with a real hook attached
+# every single tick found a dead pid and spawned a fresh daemon, each one
+# paying an rm + find + mkfifo on start and an rm on exit. The resident
+# architecture switched itself off through one knob, with no visible
+# error because the panel still rendered.
+[ "$daemon_max_life" -lt 60 ] && daemon_max_life=60
 shopt -s nullglob
 idle=0
 render_seq=0
@@ -250,6 +260,22 @@ orphans_save() {
   for _os_p in $_os_disk; do
     [[ "$_os_p" =~ ^[0-9]{1,10}$ ]] || continue
     kill -0 "$_os_p" 2>/dev/null || continue
+    # ...AND IT MUST APPLY THE SAME IDENTITY TEST AS THE EVICTION
+    # (round-30): merging on liveness alone undid the one branch that can
+    # ever shorten this list. The retry drops a pid the moment it stops
+    # being a renderer - which is what a recycled pid looks like, and
+    # cygwin recycles fast - but the save two lines later read the pid
+    # straight back off disk, found the unrelated process that now owns
+    # the number alive, and wrote it back. Measured: the in-memory list
+    # emptied within three beats while the file never changed across
+    # twelve. The file then only grows, every new daemon reloads the
+    # rubbish, and since round-29 retries ONE pid per beat, a real
+    # survivor waits K beats behind K corpses - on a daemon that idles
+    # out after two minutes, the one process actually burning CPU gets
+    # retried about once per instance instead of once per five seconds.
+    # Worse, a recycled number that lands on a genuine renderer makes
+    # this loop kill -9 someone else's healthy render child.
+    child_is_renderer "$_os_p" || continue
     case " $_os_all " in
       *" $_os_p "*) : ;;
       *) _os_all="${_os_all}${_os_all:+ }$_os_p" ;;
@@ -306,15 +332,35 @@ last_hb=0
 # takes a whole unrelated group with it (the 2026-08-13/14 shape).
 child_is_renderer() { # $1=pid
   [ -r "/proc/$1/cmdline" ] || return 1
+  # FIRST ARGV AFTER BASH, NEVER THE LAST (round-30 - the law round-20
+  # wrote for the watchdog, never applied to the three bash walks): this
+  # loop kept overwriting until the end of cmdline, so the identity of
+  # `bash <script> --once` came out as "--once" and every reclaim path
+  # failed to recognise it. That exact shape is what test.sh spawns, and
+  # it is how round-20's 14-CPU-hour leak happened. Options before the
+  # script are skipped; a bare -c anywhere still voids the identity,
+  # because then the "script" is an inline command string.
   _ci_arg=""
   _ci_last=""
   _ci_isc=0
+  _ci_n=0
   while IFS= read -r -d '' _ci_arg; do
+    _ci_n=$(( _ci_n + 1 ))
     [ "$_ci_arg" = "-c" ] && _ci_isc=1
-    _ci_last=$_ci_arg
+    if [ "$_ci_n" -gt 1 ] && [ -z "$_ci_last" ]; then
+      case "$_ci_arg" in
+        -*) : ;;
+        *) _ci_last=$_ci_arg ;;
+      esac
+    fi
     _ci_arg=""
   done < "/proc/$1/cmdline" 2>/dev/null
-  [ -n "$_ci_arg" ] && _ci_last=$_ci_arg
+  if [ -n "$_ci_arg" ] && [ -z "$_ci_last" ] && [ "$_ci_n" -ge 1 ]; then
+    case "$_ci_arg" in
+      -*) : ;;
+      *) _ci_last=$_ci_arg ;;
+    esac
+  fi
   [ "$_ci_isc" -eq 1 ] && return 1
   # match the CONFIGURED renderer, not a hardcoded name (round-24):
   # STATUSLINE_PANEL_RENDERER is a documented override that every

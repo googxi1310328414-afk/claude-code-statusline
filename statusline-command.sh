@@ -21,7 +21,12 @@ export LC_ALL=C.UTF-8
 # `cp`) once it passes ~500 lines, a rough proxy for ~64KB rather than an
 # exact one. Runs BEFORE the `exec` below opens the append redirect for
 # this render, so a rotation this render triggers starts the file fresh
-# immediately; checked every render rather than on any schedule, but
+# immediately. (HISTORICAL - see the round-6 note below: this is what
+# it used to do. Rotation now hangs off the ~30-minute history rewrite
+# and uses one `find -size +64k`; nothing on the per-frame path reads
+# the log at all, because re-reading ~500 lines every frame measured
+# 60-100ms of permanent tax after a fork storm.) It was checked every
+# render rather than on any schedule, but
 # cheap either way since the file is kept capped at ~500 lines by this
 # same mechanism.
 # OVERRIDABLE (round-28): every other state file is env-overridable
@@ -94,7 +99,9 @@ fi
 #     never render)
 #   - date: 0 or 1 (N4's ISO-8601 parse; only when the awk stage above
 #     actually selected a candidate cache-activity line to parse)
-#   - find: 0 or 1, ONLY on the rare (~30min) history full-rewrite path
+#   - find: 0 or 2, ONLY on the rare (~30min) history full-rewrite path
+#     (round-30: it is two - the orphan tmp sweep AND the blackbox
+#     rotation probe, the latter inside a command substitution)
 #     (orphaned .tmp.<pid> sweep) - never on an ordinary frame
 #   - cat: 0 - the stdin payload is slurped by the `read -N` chunk-loop
 #     builtin, never `$(cat)` (which cost a subshell + a cat exec)
@@ -114,11 +121,15 @@ fi
 # the wide grid) is skipped entirely. 100+ columns: the 4-line grid
 # described below, unchanged.
 #
-# TRUNCATION/OSC-8 SAFETY: this script itself never truncates a segment
-# mid-string (the directory abbreviation collapses whole path COMPONENTS,
-# never cuts inside one). The only character-level truncation anywhere in
-# this statusline pair is the SUBAGENT script's task-description cut, and
-# that field never carries an OSC 8 hyperlink - keep it that way: if a
+# TRUNCATION/OSC-8 SAFETY: this script truncates mid-string in exactly
+# ONE place - wk_label_for's 3-character fallback for an unrecognised
+# model name (round-30 corrected this note, which claimed there was none
+# here at all, and added that cut the surrogate-pair backstop every other
+# cut in the pair already had). The directory abbreviation collapses
+# whole path COMPONENTS and never cuts inside one. The other
+# character-level cuts in this pair are all in the SUBAGENT script (task
+# description, identity, the type/effort decorations, the model column),
+# and none of those fields carries an OSC 8 hyperlink - keep it that way: if a
 # future segment needs both truncation and a hyperlink, the cut must
 # happen only on text outside the OSC_OPEN..OSC_CLOSE span, never inside
 # it (an OSC 8 sequence split mid-escape can leave the terminal's
@@ -215,7 +226,11 @@ fi
 #      (The total_output_tokens read here is unrelated to and unaffected
 #      by the removal of the old standalone "out" segment - see below.)
 #   9  token rate + sparkline, derived from ~/.claude/statusline-history.tsv
-#      (see the history block below); sparkline (cyan) is up to 8
+#      (see the history block below); the sparkline takes the RATE
+#      tier colour when a rate half is present and falls back to cyan
+#      only when it is absent (round-30: this line said "cyan" flat,
+#      which is the one thing AI-GUIDE section 5 warns against - and
+#      the guide names THIS header as authoritative). It is up to 8
 #      consecutive token deltas over the last up-to-9 samples, normalized
 #      onto ▁▂▃▄▅▆ (capped at 6 levels, not 8 - ▇/█ are deliberately never
 #      used by any sparkline, only by single-line gauges like the ctx
@@ -841,10 +856,23 @@ if [ -f "$daily_file" ]; then
     # unset here, it is seeded by fold_daily_row when the first cents
     # actually arrive. A legacy 6-column row still reads as a KNOWN 0
     # (see above), so migration cannot move an old day's total.
+    # AN ILLEGAL BASE IS UNKNOWN, NOT ZERO (round-30): round-15 caught
+    # only the "base contains a separator" shape; every other malformed
+    # value (non-numeric, over 12 digits, signed, decimal) fell through
+    # to `|| d_base=0`, which is the one value the comment above calls
+    # the forbidden direction - a KNOWN zero makes the day book its full
+    # gross carry-over as spend, and once that day settles the inflated
+    # figure is written into an _agg row whose fine-grained evidence
+    # expired 90 minutes after it was written. Measured: base "abc"
+    # rendered week $10.00 and persisted it, where the honest value is a
+    # day contribution of 0. Left unset, it routes through the same
+    # "unknown baseline" path the loader already has for a missing column.
     if [ -n "$d_base" ]; then
-      [[ "$d_base" =~ ^[0-9]{1,12}$ ]] || d_base=0
-      d_base=$(( 10#$d_base ))   # base 10 for the same reason (round-29)
-      du_base[$dkey]=$d_base
+      if [[ "$d_base" =~ ^[0-9]{1,12}$ ]]; then
+        du_base[$dkey]=$(( 10#$d_base ))
+      else
+        unset 'du_base[$dkey]'
+      fi
     fi
     # newest row per sid carries that session's last cumulative value,
     # which is the midnight baseline for any later day it folds into.
@@ -1037,8 +1065,17 @@ hist_probe_failed=0
 for (( hi=0; hi<hist_count && hi<20; hi++ )); do
   h_epoch=${hist_all_lines[hi]%%[$'\x1f\t']*}
   h_epoch=${h_epoch//$'\r'/}
-  if [[ "$h_epoch" =~ ^[0-9]{1,13}$ ]] && [ "$h_epoch" -le "$hist_future_cutoff" ]; then
-    hist_oldest_epoch="$h_epoch"
+  # ...and the head probe needs it too (round-30): hist_oldest_epoch is
+  # fed straight into `$(( now_epoch - hist_oldest_epoch ))` far below,
+  # where a zero-padded value with an 8 or 9 in it fails arithmetic - and
+  # bash discards the enclosing compound command, which there is the
+  # ENTIRE append+trim block. Nothing is appended and, worse, the
+  # rewrite that is the only path able to delete the bad row never runs
+  # either: the history file stops growing permanently and re-triggers
+  # the same error every frame. Measured: 4 renders, file frozen at 2
+  # rows, sparkline/rate/$-per-hour stuck on stale samples for good.
+  if [[ "$h_epoch" =~ ^[0-9]{1,13}$ ]] && [ "$(( 10#$h_epoch ))" -le "$hist_future_cutoff" ]; then
+    hist_oldest_epoch=$(( 10#$h_epoch ))
     break
   fi
 done
@@ -1063,7 +1100,18 @@ for (( hi=hist_tail_start; hi<hist_count; hi++ )); do
   [[ "$h_rest" != *$'\x1f'* ]] && continue
   [[ "$h_rest2" != *$'\x1f'* ]] && continue
   [[ "$h_cost" == *$'\x1f'* ]] && continue
+  # BASE 10 (round-30): the cap landed in round-20, the normalisation
+  # never did - and this column feeds BOTH a `-le` (decimal) and a
+  # printf %(%Y%m%d)T plus three $(( )) sites (octal). A zero-padded
+  # epoch therefore dates the whole row to 1974 (all-octal digits) or to
+  # 19700101 (an 8 or 9 makes printf reject it outright), which drops the
+  # row past the 9-day retention filter so its money never reaches the
+  # rollup - while du_sidprev has ALREADY recorded that money as the
+  # session's previous cumulative, so the real day subtracts it as a
+  # midnight baseline. Measured: a day that should render $9.00 rendered
+  # $4.00, exit 0, one line in the blackbox.
   [[ "$h_epoch" =~ ^[0-9]{1,13}$ ]] || continue
+  h_epoch=$(( 10#$h_epoch ))
   # CLOCK-ROLLBACK GUARD: rows stamped >1h in the future (wall clock
   # stepped back since they were written) are dropped whole - folding
   # them would book their spend onto a future day and re-poison the
@@ -1586,7 +1634,7 @@ disp_width() {
     REPLY="${#s}"
     return
   fi
-  local len=${#s} i c cp w total=0
+  local len=${#s} i c cp ncp w total=0 zwj_skip=0
   for ((i=0; i<len; i++)); do
     c="${s:i:1}"
     if [[ "$c" == [[:ascii:]] ]]; then
@@ -1595,6 +1643,33 @@ disp_width() {
     fi
     printf -v cp '%d' "'$c"
     w=1
+    # ZERO-WIDTH JOINERS AND THE COMPONENT AFTER THEM (round-30): a ZWJ
+    # sequence draws as ONE glyph, but this loop charged full width for
+    # every component plus one for each joiner and variation selector -
+    # a two-person family emoji measured 5 cells against the 2 the
+    # terminal draws, and everything after it on that line shifted
+    # against the other three lines. Variation selectors and combining
+    # marks are zero-width for the same reason.
+    if [ "$zwj_skip" -gt 0 ]; then
+      zwj_skip=$(( zwj_skip - 1 ))
+      continue
+    fi
+    if [ "$cp" -eq 8205 ]; then
+      # the joiner is zero-width AND so is the glyph it joins; an astral
+      # partner occupies TWO of this shell's string units, so look ahead
+      # once to find out how many to swallow (this runs only on the rare
+      # frame that actually contains a joined emoji)
+      zwj_skip=1
+      if [ $(( i + 1 )) -lt "$len" ]; then
+        printf -v ncp '%d' "'${s:i+1:1}" 2>/dev/null || ncp=0
+        [ "$ncp" -ge 55296 ] && [ "$ncp" -le 56319 ] && zwj_skip=2
+      fi
+      continue
+    fi
+    if [ "$cp" -eq 65039 ] || [ "$cp" -eq 65038 ] ||
+       { [ "$cp" -ge 768 ] && [ "$cp" -le 879 ]; }; then
+      continue
+    fi
     if   [ "$cp" -ge 4352 ]   && [ "$cp" -le 4447 ]; then w=2    # 1100-115F
     elif [ "$cp" -ge 11904 ]  && [ "$cp" -le 12350 ]; then w=2   # 2E80-303E
     elif [ "$cp" -ge 12353 ]  && [ "$cp" -le 13311 ]; then w=2   # 3041-33FF
@@ -1606,6 +1681,37 @@ disp_width() {
     elif [ "$cp" -ge 65072 ]  && [ "$cp" -le 65103 ]; then w=2   # FE30-FE4F
     elif [ "$cp" -ge 65280 ]  && [ "$cp" -le 65376 ]; then w=2   # FF00-FF60
     elif [ "$cp" -ge 65504 ]  && [ "$cp" -le 65510 ]; then w=2   # FFE0-FFE6
+    # the EAW=Wide emoji that live BELOW U+1F300 (round-30): the table
+    # jumped straight from FFE6 to 1F300, so a directory or branch name
+    # holding one of the very common ones - the numbers below are all
+    # EastAsianWidth=W and all render as 2 cells in Windows Terminal -
+    # was measured one cell short, and every separator after that cell
+    # on its line shifted against the other three lines. Only the W
+    # subranges are listed; the Ambiguous glyphs this script draws
+    # itself (see the header) stay at 1 cell deliberately.
+    elif [ "$cp" -ge 8986 ]   && [ "$cp" -le 8987 ]; then w=2    # 231A-231B
+    elif [ "$cp" -ge 9193 ]   && [ "$cp" -le 9196 ]; then w=2    # 23E9-23EC
+    elif [ "$cp" -eq 9200 ]   || [ "$cp" -eq 9203 ]; then w=2    # 23F0, 23F3
+    elif [ "$cp" -ge 9725 ]   && [ "$cp" -le 9726 ]; then w=2    # 25FD-25FE
+    elif [ "$cp" -ge 9748 ]   && [ "$cp" -le 9749 ]; then w=2    # 2614-2615
+    elif [ "$cp" -ge 9800 ]   && [ "$cp" -le 9811 ]; then w=2    # 2648-2653
+    elif [ "$cp" -eq 9855 ]   || [ "$cp" -eq 9875 ]; then w=2    # 267F, 2693
+    elif [ "$cp" -eq 9889 ]   || [ "$cp" -eq 9898 ]; then w=2    # 26A1, 26AA
+    elif [ "$cp" -eq 9899 ]   || [ "$cp" -eq 9917 ]; then w=2    # 26AB, 26BD
+    elif [ "$cp" -eq 9918 ]   || [ "$cp" -eq 9924 ]; then w=2    # 26BE, 26C4
+    elif [ "$cp" -eq 9925 ]   || [ "$cp" -eq 9934 ]; then w=2    # 26C5, 26CE
+    elif [ "$cp" -eq 9940 ]   || [ "$cp" -eq 9962 ]; then w=2    # 26D4, 26EA
+    elif [ "$cp" -ge 9970 ]   && [ "$cp" -le 9971 ]; then w=2    # 26F2-26F3
+    elif [ "$cp" -eq 9973 ]   || [ "$cp" -eq 9978 ]; then w=2    # 26F5, 26FA
+    elif [ "$cp" -eq 9981 ]   || [ "$cp" -eq 9989 ]; then w=2    # 26FD, 2705
+    elif [ "$cp" -ge 9994 ]   && [ "$cp" -le 9995 ]; then w=2    # 270A-270B
+    elif [ "$cp" -eq 10024 ]  || [ "$cp" -eq 10060 ]; then w=2   # 2728, 274C
+    elif [ "$cp" -eq 10062 ]  || [ "$cp" -eq 10071 ]; then w=2   # 274E, 2757
+    elif [ "$cp" -ge 10067 ]  && [ "$cp" -le 10069 ]; then w=2   # 2753-2755
+    elif [ "$cp" -ge 10133 ]  && [ "$cp" -le 10135 ]; then w=2   # 2795-2797
+    elif [ "$cp" -eq 10160 ]  || [ "$cp" -eq 10175 ]; then w=2   # 27B0, 27BF
+    elif [ "$cp" -ge 11035 ]  && [ "$cp" -le 11036 ]; then w=2   # 2B1B-2B1C
+    elif [ "$cp" -eq 11088 ]  || [ "$cp" -eq 11093 ]; then w=2   # 2B50, 2B55
     elif [ "$cp" -ge 127744 ] && [ "$cp" -le 129791 ]; then w=2  # 1F300-1FAFF
     elif [ "$cp" -ge 131072 ]; then w=2                          # >= 20000
     fi
@@ -1687,9 +1793,20 @@ if [ -n "$dir_display" ]; then
     dir_display="${BLUE_BRIGHT}${dir_display}${RESET}"
   else
     dir_last="${dir_final_comps[$((dfc-1))]}"
+    # JOIN ON THE INDEX, NOT ON EMPTINESS (round-30): using "the prefix
+    # is still empty" as the stand-in for "this is the first component"
+    # swallows the separator whenever the FIRST component is itself
+    # empty - which is every path beginning at a root the display did not
+    # rewrite: a UNC share, or any absolute POSIX path outside $HOME. The
+    # root vanished from the display (/opt/myproject drawn as
+    # opt\myproject) and, because the plain twin used for measurement is
+    # copied BEFORE colouring, the coloured cell came out exactly one
+    # cell narrower than its own width record - shifting every separator
+    # on line 1 against lines 2-4, which is the vertical alignment this
+    # file has a dedicated assertion for.
     dir_prefix=""
     for ((di=0; di<dfc-1; di++)); do
-      if [ -z "$dir_prefix" ]; then
+      if [ "$di" -eq 0 ]; then
         dir_prefix="${dir_final_comps[$di]}"
       else
         dir_prefix="${dir_prefix}\\${dir_final_comps[$di]}"
@@ -2390,8 +2507,16 @@ for tline in "${tail_lines[@]}"; do
     post_val="${post_val%%\}*}"
     post_val="${post_val# }"
   fi
-  if [[ "$pre_val" =~ ^[0-9]+$ ]] && [[ "$post_val" =~ ^[0-9]+$ ]] && [ "$pre_val" -ge "$post_val" ]; then
-    compact_reclaimed=$(( compact_reclaimed + (pre_val - post_val) ))
+  # cap + 10# like every other arithmetic input (round-30): these two
+  # come from the transcript, which external tooling also writes. A
+  # zero-padded pair is read decimal by -ge and octal by the subtraction
+  # (0123/0100 rendered a reclaim of 19 instead of 23), and an 8 or 9 in
+  # a padded value fails arithmetic outright - which discards this whole
+  # `for tline` loop and drops every compact boundary after it.
+  if [[ "$pre_val" =~ ^[0-9]{1,12}$ ]] && [[ "$post_val" =~ ^[0-9]{1,12}$ ]]; then
+    pre_val=$(( 10#$pre_val )); post_val=$(( 10#$post_val ))
+    [ "$pre_val" -ge "$post_val" ] &&
+      compact_reclaimed=$(( compact_reclaimed + (pre_val - post_val) ))
   fi
 done
 compact_seg=""
@@ -2745,8 +2870,21 @@ wk_label_for() {
     *fable*) REPLY="Fab" ;;
     *haiku*) REPLY="Hai" ;;
     *)
-      local raw="$1" first3 f rest
+      # SURROGATE GUARD (round-30): MSYS bash counts UTF-16 units, so
+      # this cut can land between the two halves of an astral character
+      # and emit a lone high surrogate - invalid UTF-8 that the host
+      # either drops the whole line for or renders as a replacement
+      # character of the wrong width. Every other character-level cut in
+      # this pair already backs off one unit; this one was missed
+      # (and the file header, which claimed the panel script held the
+      # only such cut, has been corrected).
+      local raw="$1" first3 f rest lastc lastcp
       first3="${raw:0:3}"
+      if [ -n "$first3" ]; then
+        lastc="${first3: -1}"
+        printf -v lastcp '%d' "'$lastc" 2>/dev/null || lastcp=0
+        [ "$lastcp" -ge 55296 ] && [ "$lastcp" -le 56319 ] && first3="${first3:0:2}"
+      fi
       f="${first3:0:1}"
       rest="${first3:1}"
       REPLY="${f^}${rest,,}"
@@ -2811,15 +2949,38 @@ if [ -f "$usage_cache_file" ]; then
       # ...): case-insensitive SUBSTRING match, either direction, since
       # the session's display name ("Fable 5") and the usage API's own
       # model key ("fable") are unlikely to match exactly.
+      # MATCH ON THE FAMILY (round-30): round-21 switched $model from the
+      # display name to the short form of model.id ("sonnet-4-5"), and
+      # the substring probe below silently stopped matching the cache,
+      # whose model column is written from the API's display_name
+      # ("Claude Sonnet 4.5") - neither string contains the other once
+      # the dashes and the version formatting differ. The current
+      # session's own row then failed the "current model" test, and the
+      # >=50% floor that applies to OTHER models dropped it, so the wk
+      # segment - whose whole promise is that the running model is
+      # ALWAYS shown - vanished for any host that sends model.id, which
+      # is every current one. Measured: `wk Son30%` present with
+      # model.id removed, gone with it present. The family word is the
+      # one token both spellings always share.
       current_model_idx=-1
       current_model_pct=""
       if [ -n "$model" ]; then
         model_lc="${model,,}"
+        # the family word, if this is a known one - compared on BOTH
+        # sides so "sonnet-4-5" still finds "Claude Sonnet 4.5"
+        model_fam=""
+        case "$model_lc" in
+          *sonnet*) model_fam="sonnet" ;;
+          *opus*)   model_fam="opus" ;;
+          *fable*)  model_fam="fable" ;;
+          *haiku*)  model_fam="haiku" ;;
+        esac
         for ((fi=4; fi<usage_field_count; fi+=2)); do
           m_name="${usage_fields[$fi]}"
           [ -z "$m_name" ] && continue
           m_name_lc="${m_name,,}"
-          if [[ "$model_lc" == *"$m_name_lc"* ]] || [[ "$m_name_lc" == *"$model_lc"* ]]; then
+          if [[ "$model_lc" == *"$m_name_lc"* ]] || [[ "$m_name_lc" == *"$model_lc"* ]] ||
+             { [ -n "$model_fam" ] && [[ "$m_name_lc" == *"$model_fam"* ]]; }; then
             current_model_idx=$fi
             current_model_pct="${usage_fields[$((fi+1))]}"
             break
@@ -2993,7 +3154,16 @@ if [ "$usage_needs_refresh" -eq 1 ] && command -v curl >/dev/null 2>&1; then
               usage_ra_line=$(grep -i '^Retry-After:' "$usage_hdr_tmp" 2>/dev/null | tail -n1)
               usage_ra_val="${usage_ra_line#*:}"
               usage_ra_val="${usage_ra_val//[$'\r\n\t ']/}"
-              [[ "$usage_ra_val" =~ ^[0-9]+$ ]] && usage_retry_secs="$usage_ra_val"
+              # cap + 10# (round-30): this value is chosen by the remote
+              # server. A padded "0189" fails arithmetic two lines down,
+              # and that unwinds the whole background subshell - so the
+              # backoff row is never written (the very thing that makes
+              # the respawn loop converge), the in-flight marker is never
+              # removed, and the hdr/body tmp pair is left behind. Net
+              # effect: we keep re-forking curl at an endpoint that just
+              # rate-limited us, while the usage segment stays blank.
+              [[ "$usage_ra_val" =~ ^[0-9]{1,7}$ ]] &&
+                usage_retry_secs=$(( 10#$usage_ra_val ))
             fi
             printf -v usage_bo_now '%(%s)T' -1
             usage_bo_epoch=$(( usage_bo_now + usage_retry_secs ))
@@ -3162,25 +3332,36 @@ else
   # holding the battery/sparkline/arrow glyphs costs real time - the
   # second measurement pass was a measured ~13ms of pure duplicate work
   # per frame.
+  # A LINE'S LAST CELL MUST NOT SET THE SHARED COLUMN WIDTH (round-30):
+  # render_line deliberately leaves the last cell of every line bare -
+  # nothing follows it, so padding it aligns with nothing. But this loop
+  # folded it into col_widths anyway, so one long trailing cell padded
+  # the SAME column on every other line out to its width. A 57-cell
+  # session_name (an ordinary auto-generated one) pushed line 2 from its
+  # 74 cells of content to 125 - past a 120-column terminal, wrapping the
+  # four-line grid into five or more rows and destroying the very column
+  # alignment the padding exists for. Measured on the same payload:
+  # 116/125/107/96 before, 76/84/61/95 after. The widths are still
+  # RECORDED per line (render_line needs them); they just no longer vote.
   col_widths=()
   parts1_w=(); parts2_w=(); parts3_w=(); parts4_w=()
   for ((ci=0; ci<max_cols; ci++)); do
     w=0
     if [ "$ci" -lt "${#parts1_plain[@]}" ]; then
       disp_width "${parts1_plain[$ci]}"; l="$REPLY"; parts1_w+=("$l")
-      [ "$l" -gt "$w" ] && w=$l
+      [ "$ci" -lt "$(( ${#parts1_plain[@]} - 1 ))" ] && [ "$l" -gt "$w" ] && w=$l
     fi
     if [ "$ci" -lt "${#parts2_plain[@]}" ]; then
       disp_width "${parts2_plain[$ci]}"; l="$REPLY"; parts2_w+=("$l")
-      [ "$l" -gt "$w" ] && w=$l
+      [ "$ci" -lt "$(( ${#parts2_plain[@]} - 1 ))" ] && [ "$l" -gt "$w" ] && w=$l
     fi
     if [ "$ci" -lt "${#parts3_plain[@]}" ]; then
       disp_width "${parts3_plain[$ci]}"; l="$REPLY"; parts3_w+=("$l")
-      [ "$l" -gt "$w" ] && w=$l
+      [ "$ci" -lt "$(( ${#parts3_plain[@]} - 1 ))" ] && [ "$l" -gt "$w" ] && w=$l
     fi
     if [ "$ci" -lt "${#parts4_plain[@]}" ]; then
       disp_width "${parts4_plain[$ci]}"; l="$REPLY"; parts4_w+=("$l")
-      [ "$l" -gt "$w" ] && w=$l
+      [ "$ci" -lt "$(( ${#parts4_plain[@]} - 1 ))" ] && [ "$l" -gt "$w" ] && w=$l
     fi
     col_widths+=("$w")
   done
