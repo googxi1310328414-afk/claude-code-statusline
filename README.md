@@ -45,7 +45,7 @@ $0.42 $4.8/h                        | today $55.97      | week $89.20           
 
 ## 依赖与安装
 
-Claude Code ≥ 2.1.221（实测验证过的版本；子代理 `effort` 字段本身自 2.1.214 起有，`contextWindowSize` 自 2.1.205 起有，更旧的版本只是少这两列，其余功能不受影响）、Git Bash（bash ≥ 4.3，UTF-8）、`jq`、`git`（stash 段需 ≥2.35，更旧仅少这一段）；`gh` 可选（CI 徽记）。
+Claude Code ≥ 2.1.221（实测验证过的版本；子代理 `effort` 字段本身自 2.1.214 起有，更旧的版本只是没有 `effort` 那半格装饰；`contextWindowSize` 本实现**从不读取**（面板拒绝伪装成「窗口占用」的电池，见上），所以它缺不缺都不影响任何一列，其余功能不受影响）、Git Bash（bash ≥ 4.3，UTF-8）、`jq`、`git`（stash 段需 ≥2.35，更旧仅少这一段）；`gh` 可选（CI 徽记）。
 
 **一行命令**（推荐，幂等：重复执行=更新；在本地 clone 里执行则离线用本地文件）：
 
@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/googxi1310328414-afk/claude-code-st
 ```bash
 bash test.sh            # 渲染演示（终端看真色彩）
 bash test.sh --codes    # ANSI 码可视化
-bash test.sh --assert   # 232 项断言（CI 用，含性能门槛与三十轮对抗审查回归组+配色断言）
+bash test.sh --assert   # 250 项断言（CI 用，含性能门槛与三十一轮对抗审查回归组+配色断言）
 ```
 
 GitHub Actions 在每次 push 自动跑断言套件。

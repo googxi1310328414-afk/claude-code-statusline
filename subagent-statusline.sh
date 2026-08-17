@@ -61,7 +61,7 @@ export LC_ALL=C.UTF-8
 # parameter expansion.
 #
 # Per-task fields consumed: id, name, type, status, description, label,
-# startTime (unix seconds or milliseconds), tokenCount, contextWindowSize,
+# startTime (unix seconds or milliseconds), tokenCount,
 # effort, model, tokenSamples (undocumented structure, defensively parsed).
 # cwd is part of the contract but unused here.
 #
@@ -195,26 +195,89 @@ input=""
 while IFS= read -r -N 65536 slurp_chunk; do input+="$slurp_chunk"; done
 input+="$slurp_chunk"
 
-# LONE SURROGATE ESCAPES ARE A JQ PARSE ERROR (round-30): a JS host that
-# cuts a description by UTF-16 units and re-serialises it emits a
-# lone \udXXX escape - RFC 8259 allows it, and a well-formed
-# JSON.stringify produces exactly that shape. jq then fails in its PARSER,
-# before the program runs: exit 5, zero bytes out, stderr swallowed by the
-# 2>/dev/null on the call. One truncated emoji in one task therefore takes
-# the WHOLE panel down - every healthy row with it - and three such frames
-# make the daemon blank the cache, so the panel stays on the host default
-# for as long as the host keeps sending that description. Stripping the
-# escapes costs eight parameter expansions and no fork; a PAIRED surrogate
-# is never escaped by a conforming serialiser (astral characters go out as
-# raw UTF-8), so in practice only the broken ones are removed here.
+# LONE SURROGATE ESCAPES ARE A JQ PARSE ERROR: a host that cuts a string
+# by UTF-16 units and re-serialises it emits a lone \udXXX escape - RFC
+# 8259 allows it and a well-formed JSON.stringify produces exactly that -
+# and jq then fails in its PARSER, before the program runs: exit 5, zero
+# bytes out, stderr swallowed by the 2>/dev/null on the call. One
+# truncated emoji in one description takes the WHOLE panel down, every
+# healthy row with it, and three such frames make the daemon blank the
+# cache.
+#
+# ROUND-30 DID THIS WITH EIGHT BLIND GLOB DELETIONS AND MADE IT WORSE
+# (round-31). A glob cannot tell a real escape from anything that merely
+# reads like one, and it broke three separate ways, all measured:
+#   1. Text that only CONTAINS the characters - a description ABOUT
+#      surrogate handling, on the wire as the perfectly legal
+#      "fix \\ud83d escape handling" - had six bytes cut from its
+#      middle, leaving the first backslash dangling. A backslash followed
+#      by a space is not a legal JSON escape, so jq died in the parser and
+#      the panel went dark: exactly the failure this code exists to
+#      prevent, now self-inflicted.
+#   2. The ?? was a glob, not a hex test, so a truncated escape at the end
+#      of a string ate the closing quote and the comma after it.
+#   3. PAIRED surrogates were deleted too. The old note claimed a
+#      conforming serialiser never escapes a pair - true of JavaScript,
+#      false of Python json.dumps (ensure_ascii defaults to True) and of
+#      Jackson with ESCAPE_NON_ASCII, both ordinary things to find
+#      between a host and this hook. Emoji silently vanished.
+# It also enumerated d8..dF in three casings but generated only dA/da/DA,
+# never the mixed Da/Db a real serialiser can emit - so even the one shape
+# it was written to catch still got through.
+#
+# The replacement is an escape-aware walk: it tracks backslash parity, so
+# an escaped backslash is never mistaken for an escape introducer; it
+# requires four real hex digits before consuming anything; and it keeps a
+# high surrogate whose low partner follows. Still zero forks, and still
+# only entered when the payload actually contains such an escape.
+# escape-aware removal of LONE surrogate escapes; everything else is left
+# byte-for-byte alone. REPLY-return, no fork.
+strip_lone_surrogates() {   # $1 = payload -> REPLY
+  local rest="$1" out="" seg hex lo
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *\\*) : ;;
+      *) out+="$rest"; rest=""; break ;;
+    esac
+    seg="${rest%%\\*}"
+    out+="$seg"
+    rest="${rest:${#seg}+1}"        # drop the text and the backslash
+    case "$rest" in
+      # an escaped backslash consumes BOTH characters: emit them and move
+      # on, so text that merely talks about \uXXXX is never touched
+      \\*) out+='\\'; rest="${rest:1}"; continue ;;
+      [uU]*) : ;;
+      *) out+='\'; continue ;;
+    esac
+    hex="${rest:1:4}"
+    # a TRUNCATED escape is not ours to touch: `\ud8"` has no four hex
+    # digits, so consuming five characters would eat the closing quote
+    # and turn a payload that was already malformed into a different,
+    # more confusing kind of malformed. Leave it exactly as it arrived.
+    case "$hex" in
+      [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) : ;;
+      *) out+='\'; continue ;;
+    esac
+    case "$hex" in
+      [dD][89abAB]*)
+        lo="${rest:5:6}"
+        case "$lo" in
+          \\[uU][dD][c-fC-F]*)
+            out+="\\${rest:0:11}"   # a real pair: keep both halves
+            rest="${rest:11}"
+            ;;
+          *) rest="${rest:5}" ;;    # lone high surrogate: drop it
+        esac
+        ;;
+      [dD][c-fC-F]*) rest="${rest:5}" ;;   # lone low surrogate: drop it
+      *) out+="\\${rest:0:5}"; rest="${rest:5}" ;;
+    esac
+  done
+  REPLY="$out"
+}
+
 case "$input" in
-  *\\u[dD]*)
-    for _sg in d8 d9 dA dB dC dD dE dF; do
-      input="${input//\\u${_sg}??/}"
-      input="${input//\\u${_sg,,}??/}"
-      input="${input//\\u${_sg^^}??/}"
-    done
-    ;;
+  *\\u[dD]*) strip_lone_surrogates "$input"; input="$REPLY" ;;
 esac
 
 # jq guard: if jq is missing, every row below is unusable - emit nothing
@@ -320,6 +383,49 @@ disp_width() {
     total=$(( total + w ))
   done
   REPLY="$total"
+}
+# CAPS ARE IN DISPLAY CELLS, NEVER IN CHARACTERS (round-31): round-30
+# added caps to the type/effort decorations and to the model column, but
+# compared ${#s} - a CHARACTER count - against a budget expressed in
+# terminal cells. Every one of those budgets is later spent as cells: the
+# widths go into col_max and come straight out of the single panel-wide
+# description budget. So a CJK agent type (users name their own agents,
+# and a Chinese-language user naming one in Chinese is ordinary) passed a
+# 20-character cap while occupying 39 cells. Measured at columns=120: a
+# 24-character CJK type gave col0 = 59 cells against a 40-cell cap and
+# desc_budget = -1, which takes the description column off EVERY row -
+# the precise failure round-30's cap was introduced to stop; a 25-char
+# ASCII type in the same payload gave col0 = 40 and desc_budget = 18. The
+# model column behaved the same way: 18 full-width characters measured 35
+# cells and quietly ate 17 cells of everyone's description.
+#
+# This is the identity cell's own truncation logic, lifted into one place
+# so all four callers share it (and so the next one added cannot get it
+# wrong): measure in cells, cut on a cell budget, and never split a
+# surrogate pair.
+cut_cells() {   # $1=text $2=cap in cells -> REPLY
+  local _cc_t="$1" _cc_cap="$2" _cc_w _cc_acc=0 _cc_cut=0 _cc_i _cc_c _cc_cw _cc_last
+  if [ -z "$_cc_t" ] || [ "$_cc_cap" -lt 2 ]; then REPLY="$_cc_t"; return 0; fi
+  # bounded measure: display width is always >= character count, so a
+  # string with more characters than the cap must overflow it
+  if [ "${#_cc_t}" -gt "$_cc_cap" ]; then
+    _cc_w=$(( _cc_cap + 1 ))
+  else
+    disp_width "$_cc_t"; _cc_w="$REPLY"
+  fi
+  if [ "$_cc_w" -le "$_cc_cap" ]; then REPLY="$_cc_t"; return 0; fi
+  for ((_cc_i=0; _cc_i<${#_cc_t}; _cc_i++)); do
+    _cc_c="${_cc_t:_cc_i:1}"
+    disp_width "$_cc_c"; _cc_cw="$REPLY"
+    [ "$(( _cc_acc + _cc_cw ))" -gt "$(( _cc_cap - 1 ))" ] && break
+    _cc_acc=$(( _cc_acc + _cc_cw ))
+    _cc_cut=$(( _cc_i + 1 ))
+  done
+  if [ "$_cc_cut" -gt 0 ]; then
+    printf -v _cc_last '%d' "'${_cc_t:_cc_cut-1:1}" 2>/dev/null || _cc_last=0
+    [ "$_cc_last" -ge 55296 ] && [ "$_cc_last" -le 56319 ] && _cc_cut=$(( _cc_cut - 1 ))
+  fi
+  REPLY="${_cc_t:0:$_cc_cut}…"
 }
 
 # PERF: ONE jq invocation for the ENTIRE payload - the four payload-wide
@@ -427,8 +533,19 @@ jq_all_out=$(jq -r '
   # row falls back to the host default with nothing in the blackbox.
   # The extra "no non-digit anywhere" clause closes the newline hole;
   # tonumber? // empty is the belt for any shape not thought of yet.
-  | ([$tasks[]? | .tokenCount // 0 | tostring | select(test("^[0-9]{1,12}$") and (test("[^0-9]") | not)) | (tonumber? // empty)] | add // 0 | tostring) as $total_tokens
-  | ([$tasks[]? | .tokenCount // empty | tostring | select(test("^[0-9]{1,12}$") and (test("[^0-9]") | not)) | (tonumber? // empty) | select(. > 0)] | length | tostring) as $tokened_count
+  # THE SAME STRING THE ROW SEES (round-31): the row takes tokenCount
+  # through clean, which STRIPS C0 characters, while these two gates
+  # tested the raw tostring. A tokenCount of "900000" with a stray 0x01
+  # in it - a string-shaped count is drift this file has handled since
+  # round-6, and bare C0 is the reason clean exists at all - therefore
+  # failed the gate and stayed OUT of the denominator, while the row
+  # itself got the cleaned 900000 and passed its own check. Share came
+  # out as value/other-tasks-only: measured Sigma 30000% on that row,
+  # with the three rows summing to 30099%. Round-26 unified the type
+  # gate and round-27 the digit cap across these two places; clean was
+  # the third thing that had to match and did not.
+  | ([$tasks[]? | .tokenCount // 0 | clean | select(test("^[0-9]{1,12}$") and (test("[^0-9]") | not)) | (tonumber? // empty)] | add // 0 | tostring) as $total_tokens
+  | ([$tasks[]? | .tokenCount // empty | clean | select(test("^[0-9]{1,12}$") and (test("[^0-9]") | not)) | (tonumber? // empty) | select(. > 0)] | length | tostring) as $tokened_count
   | ($columns | clean), ($majority_model | clean), $total_tokens, $tokened_count,
     (
       range(0; $tcount) as $i
@@ -675,23 +792,24 @@ for ((ti=0; ti<task_count_total; ti++)); do
   [ "$cell_cap" -gt 60 ] && cell_cap=60
   deco_cap=$(( cell_cap / 2 ))
   [ "$deco_cap" -lt 6 ] && deco_cap=6
-  if [ -n "$task_type" ] && [ "$ident_is_type" -eq 0 ] && [ "${#task_type}" -gt "$deco_cap" ]; then
-    task_type="${task_type:0:$(( deco_cap - 1 ))}"
-    deco_cp=0
-    printf -v deco_cp '%d' "'${task_type: -1}" 2>/dev/null || deco_cp=0
-    [ "$deco_cp" -ge 55296 ] && [ "$deco_cp" -le 56319 ] && task_type="${task_type:0:$(( deco_cap - 2 ))}"
-    task_type="${task_type}…"
+  if [ -n "$task_type" ] && [ "$ident_is_type" -eq 0 ]; then
+    cut_cells "$task_type" "$deco_cap"; task_type="$REPLY"
   fi
-  if [ -n "$effort" ] && [ "${#effort}" -gt "$deco_cap" ]; then
-    effort="${effort:0:$(( deco_cap - 1 ))}"
-    deco_cp=0
-    printf -v deco_cp '%d' "'${effort: -1}" 2>/dev/null || deco_cp=0
-    [ "$deco_cp" -ge 55296 ] && [ "$deco_cp" -le 56319 ] && effort="${effort:0:$(( deco_cap - 2 ))}"
-    effort="${effort}…"
+  if [ -n "$effort" ]; then
+    cut_cells "$effort" "$deco_cap"; effort="$REPLY"
   fi
+  # the decoration budget is spent in CELLS too (round-31): it used to be
+  # charged at ${#s}, so a full-width decoration was under-billed here by
+  # the same factor it was under-cut above, and ident_cap came out too
+  # generous - the identity text then overflowed the cell it was supposed
+  # to fit inside even when its own cut was correct.
   ident_deco=4
-  [ -n "$task_type" ] && [ "$ident_is_type" -eq 0 ] && ident_deco=$(( ident_deco + ${#task_type} + 2 ))
-  [ -n "$effort" ] && ident_deco=$(( ident_deco + ${#effort} + 1 ))
+  if [ -n "$task_type" ] && [ "$ident_is_type" -eq 0 ]; then
+    disp_width "$task_type"; ident_deco=$(( ident_deco + REPLY + 2 ))
+  fi
+  if [ -n "$effort" ]; then
+    disp_width "$effort"; ident_deco=$(( ident_deco + REPLY + 1 ))
+  fi
   ident_cap=$(( cell_cap - ident_deco ))
   [ "$ident_cap" -lt 8 ] && ident_cap=8
   if [ -n "$identity_plain" ]; then
@@ -761,7 +879,13 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # abandoned prefix-sum: see the note on the loop below - truncating
   # to a prefix clusters badly, and host task ids share long prefixes
   # by construction, so two live agents landed on the same hue)
-  # via printf's "'c" ordinal form: pure builtins, ~8 statements a row.
+  # via printf's "'c" ordinal form: pure builtins, but ~2 statements per
+  # ID CHARACTER - round-30 corrected the algorithm above and left this
+  # number describing the abandoned 4-character-prefix version. Host task
+  # ids are UUID-shaped (36 chars), so it is ~72 statements a row, about
+  # 3.6ms measured here, ~22ms a frame on a six-row panel. Anyone budgeting
+  # from the old "~8" would be out by a factor of nine, and this file's
+  # whole performance discipline is written in statements per row.
   case "$status" in
     pending|queued|starting)        ident_color="$YELLOW" ;;
     completed|done|finished)        ident_color="$GREEN" ;;
@@ -888,13 +1012,7 @@ for ((ti=0; ti<task_count_total; ti++)); do
     # the exact outcome round-28's type gate was added to prevent, which
     # only handled the object shape and never the long-string one. Rows
     # also overflowed the terminal width and wrapped.
-    if [ "${#model_short}" -gt 18 ]; then
-      model_short="${model_short:0:17}"
-      model_cp=0
-      printf -v model_cp '%d' "'${model_short: -1}" 2>/dev/null || model_cp=0
-      [ "$model_cp" -ge 55296 ] && [ "$model_cp" -le 56319 ] && model_short="${model_short:0:16}"
-      model_short="${model_short}…"
-    fi
+    cut_cells "$model_short" 18; model_short="$REPLY"
     if [ -n "$model_short" ]; then
       model_seg="${CYAN}${model_short}${RESET}"
       model_plain="$model_short"

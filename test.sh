@@ -155,7 +155,23 @@ if [ "$1" = "--assert" ]; then
   done <<< "$plain"
   [ -n "$col" ] || aligned=0
   [ "$aligned" -eq 1 ] && ok "first separator aligned (char-wise)" || bad "first separator misaligned"
-  awk -v a="$t0" -v b="$t1" 'BEGIN{exit (b-a < 3.0) ? 0 : 1}' && ok "render < 3s" || bad "render too slow"
+  # the measured value goes in the message (round-31): an absolute
+  # wall-clock gate that fails without telling you by how much is
+  # unusable for deciding whether it was a regression or the box being
+  # busy - which is what happened to the two gates fixed in round-30.
+  # BEST OF TWO (round-31): this is the third absolute wall-clock gate in
+  # the suite, and it went red at 3.0s on a box where the same render
+  # measures 1.0-1.3s idle - the first one also pays cold caches. Take two
+  # attempts and keep the faster: a real regression is slow every time, a
+  # busy moment is not.
+  t2a=$EPOCHREALTIME
+  jq --argjson n "$now" --arg tp "$tmpd/tr.jsonl" \
+        '.rate_limits.five_hour.resets_at=($n+7200) | .rate_limits.seven_day.resets_at=($n+259200) | .transcript_path=$tp' \
+        fixtures/full.json | bash ./statusline-command.sh >/dev/null
+  t2b=$EPOCHREALTIME
+  t_r0=$(awk -v a="$t0" -v b="$t1" -v c="$t2a" -v d="$t2b" 'BEGIN{x=b-a; y=d-c; printf "%.2f", (y<x)?y:x}')
+  awk -v t="$t_r0" 'BEGIN{exit (t+0 < 3.0) ? 0 : 1}' &&
+    ok "render < 3s (best of 2: ${t_r0}s)" || bad "render too slow (best of 2: ${t_r0}s)"
   printf '%s' "$plain" | grep -q '·t60%' && ok "pace cursor value (t60%)" || bad "pace value wrong"
 
   narrow=$(COLUMNS=80 bash ./statusline-command.sh < fixtures/full.json | strip)
@@ -342,7 +358,14 @@ if [ "$1" = "--assert" ]; then
   printf '%s' "$rl_garb" | grep -q '5h' && bad "garbage 5h rendered fake data" || ok "garbage 5h segment dropped"
   # R11: raw ESC/BEL in session_name must NOT reach stdout (OSC-injection)
   escout=$(jq -n '{session_id:"esc",model:{display_name:"M"},workspace:{current_dir:"/x"},session_name:("evil"+"\u001b"+"]0;PWNED"+"\u0007"+"tail")}' | bash ./statusline-command.sh)
-  if printf '%s' "$escout" | LC_ALL=C grep -qP '\\x1b\\]0;PWNED'; then
+  # ONE BACKSLASH, NOT TWO (round-31): inside single quotes the shell
+  # hands PCRE a literal backslash followed by x1b, so this searched for
+  # the twelve visible characters \x1b\]0;PWNED and could never match a
+  # real ESC byte. The bad branch was unreachable and control always fell
+  # to the elif, which matches the letters PWNED whether or not the ESC
+  # survived - so the assertion printed PASS unconditionally and the one
+  # test guarding against terminal-title hijacking was watching nothing.
+  if printf '%s' "$escout" | LC_ALL=C grep -qP '\x1b\]0;PWNED'; then
     bad "session_name OSC injection reaches terminal"
   elif printf '%s' "$escout" | grep -q 'PWNED'; then
     ok "session_name C0 stripped (OSC text inert)"
@@ -449,7 +472,22 @@ if [ "$1" = "--assert" ]; then
   hb_now2=$(date +%s)
   hb_line2=""
   { read -r _hbpid; read -r hb_line2; } < "$STATUSLINE_PANEL_DIR/daemon.pid" 2>/dev/null
+  # TAKE THE RENDER CHILD WITH IT (round-31): this kills the daemon while
+  # its deliberately-hung render (a `sleep 300`) is still in flight. The
+  # daemon has no trap and the child is its own process group, so the
+  # signal never reached it - and the very next line deleted the pid file
+  # holding the only external handle to it. Every run of the suite left a
+  # hangrender + sleep pair burning for five minutes, which the sweeper
+  # cannot see because it only looks for --once daemons. Read line 4
+  # first, then kill the group.
+  hb2_rp=""
+  { read -r _x; read -r _x; read -r _x; read -r hb2_rp; } < "$STATUSLINE_PANEL_DIR/daemon.pid" 2>/dev/null
   kill "$hb2_dpid" 2>/dev/null; wait "$hb2_dpid" 2>/dev/null
+  for _hp in $hb2_rp; do
+    [[ "$_hp" =~ ^[0-9]{1,10}$ ]] || continue
+    kill -- "-$_hp" 2>/dev/null; kill -9 -- "-$_hp" 2>/dev/null
+    kill -9 "$_hp" 2>/dev/null
+  done
   rm -f "$STATUSLINE_PANEL_DIR/daemon.pid" "$STATUSLINE_PANEL_DIR"/spool.hb1.new "$STATUSLINE_PANEL_DIR"/render.hb1 2>/dev/null
   if [[ "$hb_line2" =~ ^[0-9]+$ ]] && [ $(( hb_now2 - hb_line2 )) -le 6 ]; then ok "heartbeat stays fresh during hung render (wall-clock)"; else bad "heartbeat starved by hung render (age=$(( hb_now2 - ${hb_line2:-0} ))s)"; fi
   # R21: giant remaining_percentage must not paint a full green battery
@@ -910,6 +948,14 @@ sleep 300
 %s
 %s
 ' "$rc_daemon" "$((now-600))" "0" "$rc_child" > "$rc_dir/daemon.pid"
+  # the side-channel beat has to be staled too (round-31): the daemon
+  # also stamps $panel_dir/hb with "<owner> <epoch>" using a builtin
+  # redirect, and the hook takes whichever of the two beats is newer. A
+  # daemon that has genuinely stopped beating leaves BOTH stale; forcing
+  # only line 2 describes a state that cannot happen, and the hook would
+  # be right to leave the daemon alone.
+  printf '%s %s
+' "$rc_daemon" "$((now-600))" > "$rc_dir/hb"
   printf '{"columns":120,"tasks":[{"id":"rk1","status":"running","tokenCount":5}]}' | STATUSLINE_PANEL_DIR="$rc_dir" STATUSLINE_PANEL_DAEMON=/dev/null bash ./statusline-panel-hook.sh >/dev/null 2>&1
   sleep 1
   kill -CONT "$rc_daemon" 2>/dev/null
@@ -1022,6 +1068,156 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-31 regression asserts (2026-08-18) ----
+  # R141: the lone-surrogate strip was eight blind glob deletions, which
+  # cut six bytes out of anything that merely LOOKED like an escape. Text
+  # that talks ABOUT surrogates (legal JSON: an ESCAPED backslash) came
+  # out with a dangling backslash and jq died in its parser - the panel
+  # went dark from the very code meant to keep it up. Paired surrogates
+  # were deleted outright (Python json.dumps and Jackson both emit them),
+  # and the casing table generated dA/da/DA but never the mixed Da/Db a
+  # real serialiser can produce, so the one shape it targeted got
+  # through anyway.
+  #
+  # Fixtures are quoted heredocs on purpose: printf turns \u0001-style
+  # escapes into raw control bytes (illegal inside a JSON string) and
+  # python cannot open the MSYS $tmpd path, and either one silently
+  # produces a payload without the shape under test.
+  cat > "$tmpd/s31_lone.json" <<'S31A'
+{"columns":120,"tasks":[{"id":"t1","name":"code-reviewer","type":"general","status":"running","tokenCount":68000,"model":"fable-5","effort":"max","description":"cut \ud83d"},{"id":"t2","name":"researcher","status":"completed","tokenCount":12000,"model":"fable-5","description":"Find docs"},{"id":"t3","name":"verify","status":"failed","tokenCount":185000,"model":"haiku-4-5","description":"Adversarial verify"}]}
+S31A
+  cat > "$tmpd/s31_mixed.json" <<'S31B'
+{"columns":120,"tasks":[{"id":"t1","name":"code-reviewer","type":"general","status":"running","tokenCount":68000,"model":"fable-5","effort":"max","description":"cut \uDa3d"},{"id":"t2","name":"researcher","status":"completed","tokenCount":12000,"model":"fable-5","description":"Find docs"},{"id":"t3","name":"verify","status":"failed","tokenCount":185000,"model":"haiku-4-5","description":"Adversarial verify"}]}
+S31B
+  cat > "$tmpd/s31_esc.json" <<'S31C'
+{"columns":120,"tasks":[{"id":"t1","name":"code-reviewer","type":"general","status":"running","tokenCount":68000,"model":"fable-5","effort":"max","description":"fix \\ud83d escape handling"},{"id":"t2","name":"researcher","status":"completed","tokenCount":12000,"model":"fable-5","description":"Find docs"},{"id":"t3","name":"verify","status":"failed","tokenCount":185000,"model":"haiku-4-5","description":"Adversarial verify"}]}
+S31C
+  cat > "$tmpd/s31_pair.json" <<'S31D'
+{"columns":120,"tasks":[{"id":"t1","name":"code-reviewer","type":"general","status":"running","tokenCount":68000,"model":"fable-5","effort":"max","description":"ship \ud83d\ude00 it"},{"id":"t2","name":"researcher","status":"completed","tokenCount":12000,"model":"fable-5","description":"Find docs"},{"id":"t3","name":"verify","status":"failed","tokenCount":185000,"model":"haiku-4-5","description":"Adversarial verify"}]}
+S31D
+  _sn=0
+  for _sk in lone mixed esc pair; do
+    : > "$STATUSLINE_SUBAGENT_TREND_FILE"
+    _sn=$(bash ./subagent-statusline.sh < "$tmpd/s31_$_sk.json" | jq -r .id 2>/dev/null | grep -c '^t[123]')
+    [ "${_sn:-0}" -eq 3 ] || { bad "surrogate shape '$_sk' blanked the panel (${_sn:-0}/3)"; break; }
+  done
+  [ "${_sn:-0}" -eq 3 ] && ok "all four surrogate shapes keep the panel up"
+  # the escaped-backslash payload must still SAY what it said
+  : > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  bash ./subagent-statusline.sh < "$tmpd/s31_esc.json" | head -1 | jq -r .content | strip |
+    grep -q 'ud83d escape handling' &&
+    ok "text that merely mentions a surrogate escape is left alone" ||
+    bad "the strip corrupted ordinary text"
+  # a real PAIR decodes to its character instead of vanishing
+  : > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  bash ./subagent-statusline.sh < "$tmpd/s31_pair.json" | head -1 | jq -r .content | strip |
+    grep -q 'ship .* it' &&
+    ok "a paired surrogate survives the strip" || bad "paired surrogate was deleted"
+  # R142: the share denominator gate ran on the RAW tokenCount while the
+  # row ran on the cleaned one, so a C0 byte kept a task out of the
+  # denominator but not out of the numerator
+  # A QUOTED HEREDOC IS THE ONLY THING THAT LEAVES THIS ALONE: the six
+  # characters \u0001 have to reach jq intact so IT decodes them into a
+  # real C0 byte. printf eats the escape and emits the raw control
+  # character, which is illegal inside a JSON string, and python cannot
+  # open the MSYS $tmpd path at all - both of which quietly produced a
+  # payload without the shape this assertion is named after.
+  cat > "$tmpd/share31.json" <<'SHARE31'
+{"columns":120,"tasks":[{"id":"a","name":"alpha","status":"running","description":"A","tokenCount":"900000\u0001"},{"id":"b","name":"beta","status":"running","description":"B","tokenCount":1000},{"id":"c","name":"gamma","status":"running","description":"C","tokenCount":2000}]}
+SHARE31
+  : > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  sh31=$(bash ./subagent-statusline.sh < "$tmpd/share31.json" | jq -r .content | strip |
+    grep -o 'Σ[0-9]*%' | tr -d 'Σ%' | awk '{s+=$1} END{print s+0}')
+  [ "${sh31:-999}" -ge 1 ] && [ "${sh31:-999}" -le 100 ] &&
+    ok "a C0 byte cannot inflate the share (sums to ${sh31}%)" ||
+    bad "share sums to ${sh31}% (denominator and row disagree)"
+  # R143: the decoration and model caps must be spent in CELLS - a CJK
+  # agent type passed a 20-CHARACTER cap while occupying 39 cells and
+  # took the description column off every row
+  for _c31 in '.tasks[0].type="代码审查安全分析专家团队负责人助理甲乙丙丁戊己庚辛壬癸子丑"' '.tasks[0].model="克劳德最强模型一号机甲乙丙丁戊己庚辛壬癸"' '.tasks[0].effort="超级认真仔细审慎周密详尽彻底全面深入透彻"'; do
+    : > "$STATUSLINE_SUBAGENT_TREND_FILE"
+    _n31=$(jq -c ".columns=120 | $_c31" fixtures/subagent-tasks.json |
+      bash ./subagent-statusline.sh | jq -r .content | grep -c 'Review the auth')
+    [ "${_n31:-0}" -ge 1 ] || { bad "a full-width decoration deleted the description column"; break; }
+  done
+  [ "${_n31:-0}" -ge 1 ] && ok "full-width decorations are capped in cells, not characters"
+  # R144: the heartbeat must not need a fork. Under fork exhaustion the
+  # tmp+mv that carried it left a HEALTHY daemon looking 131s stale on
+  # cold start and 162s in steady state, against the hook's 60s gate -
+  # so half of all ticks killed a working daemon and spawned another.
+  grep -q 'hb_touch()' ./statusline-panel-daemon.sh &&
+    ! awk '/^hb_touch\(\)/,/^}/' ./statusline-panel-daemon.sh | grep -qE 'mv |rm |find |mkfifo|\$\(' &&
+    ok "the heartbeat side channel costs no fork" || bad "hb_touch forks"
+  [ "$(grep -c 'hb_touch' ./statusline-panel-daemon.sh)" -ge 10 ] &&
+    ok "beats are stamped either side of the exec sites" || bad "too few heartbeat checkpoints"
+  grep -q 'read -r _hbo daemon_hb2' ./statusline-panel-hook.sh &&
+    ok "the hook reads the side-channel beat, owner-checked" || bad "hook ignores the side-channel beat"
+  hb31="$tmpd/hb31"; mkdir -p "$hb31"
+  cp fixtures/subagent-tasks.json "$hb31/spool.z1.new"
+  STATUSLINE_PANEL_DIR="$hb31" STATUSLINE_PANEL_RENDERER="$PWD/subagent-statusline.sh" \
+    STATUSLINE_SUBAGENT_TREND_FILE="$tmpd/hb31trend" once_daemon ./statusline-panel-daemon.sh --once >/dev/null 2>&1
+  hb31o=""; hb31t=""
+  [ -r "$hb31/hb" ] && read -r hb31o hb31t < "$hb31/hb"
+  [[ "$hb31o" =~ ^[0-9]+$ ]] && [[ "$hb31t" =~ ^[0-9]{9,13}$ ]] &&
+    ok "the beat file carries owner and timestamp" || bad "hb file malformed ($hb31o/$hb31t)"
+  # R145: the in-flight render child must be reachable the instant it
+  # exists, not on the next successful mv - a hook that judged the daemon
+  # dead in that window left a renderer no reclaim path could see
+  grep -q 'rpid_publish' ./statusline-panel-daemon.sh &&
+    grep -q '_rp_live' ./statusline-panel-hook.sh &&
+    ok "the render child is published fork-free and read back" || bad "render child still waits for a mv"
+  # R146: orphans_save must write the merged list back to memory, or the
+  # running daemon never retries a survivor another instance registered
+  awk '/^orphans_save\(\)/,/^}/' ./statusline-panel-daemon.sh | grep -q 'r_orphans="\$_os_all"' &&
+    ok "the orphans merge is written back to memory" || bad "orphans merge is write-only"
+  awk '/RECONCILE EVERY BEAT/,/^  fi$/' ./statusline-panel-daemon.sh | grep -q 'orphans_save' &&
+    ok "the orphans file is reconciled even with an empty list" || bad "dead pids can never leave the orphans file"
+  # R147: one spawn in flight at a time - a replacement takes ~93s to
+  # register under fork exhaustion, and every tick in that window used to
+  # mint another daemon
+  grep -q 'panel_dir/spawning' ./statusline-panel-hook.sh &&
+    grep -q 'spawn_clear' ./statusline-panel-daemon.sh &&
+    ok "the hook will not mint a second daemon while one is starting" || bad "no spawn-in-flight brake"
+  # R148: an unknown midnight baseline is NOT zero at the CONSUMERS
+  # either - round-30 fixed only the loader, and reading it as 0 books
+  # the inherited cumulative as spend and freezes it into _agg
+  grep -q 'day_contrib()' ./statusline-command.sh &&
+    [ "$(grep -c 'du_base\[\$[a-z_]*\]:-0' ./statusline-command.sh)" -eq 0 ] &&
+    ok "no consumer reads an unknown baseline as zero" || bad "a consumer still defaults the baseline to 0"
+  : > "$STATUSLINE_DAILY_FILE"
+  printf '%s\x1fSB31\x1f0\x1f1000\x1f1000\x1f%s\x1fabc\n' "$(date +%Y%m%d)" "$((now-100))" > "$STATUSLINE_DAILY_FILE"
+  ub31=$(jq -c '.session_id="SB31" | .cost.total_cost_usd=15.00' fixtures/full.json | bash ./statusline-command.sh | strip)
+  case "$ub31" in
+    *'today $15.'*) bad "an unknown baseline was still read as zero ($ub31)" ;;
+    *) ok "an unknown baseline books only what was observed" ;;
+  esac
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R149: the colour tier must be decided from the number actually shown
+  for _p31 in 79.4:33 79.6:91 80.0:91; do
+    _pv="${_p31%%:*}"; _pc="${_p31##*:}"
+    # the 5h segment SPECIFICALLY - other segments also use bright red,
+    # so a bare colour grep passes whatever the tier does
+    _po=$(jq -c --argjson v "$_pv" '.rate_limits.five_hour.used_percentage=$v' fixtures/full.json |
+      bash ./statusline-command.sh | grep -c "5h.\[0m .\[${_pc}m")
+    [ "${_po:-0}" -ge 1 ] || { bad "used_percentage $_pv did not take colour $_pc"; break; }
+  done
+  [ "${_po:-0}" -ge 1 ] && ok "the percentage tier matches the rendered figure"
+  # R150: padding may never push a line past the terminal
+  w31=$(jq -c '.workspace.current_dir="C:/Users/Administrator/dev/claude-code-statusline/packages/statusline-renderer"' fixtures/full.json |
+    COLUMNS=100 bash ./statusline-command.sh | strip | awk '{ if (length($0) > m) m = length($0) } END { print m+0 }')
+  [ "${w31:-999}" -le 140 ] && ok "the grid stays inside a 100-column terminal (${w31} bytes)" ||
+    bad "padding overflowed a 100-column terminal (${w31} bytes)"
+  # R151: a zero-width joiner followed by an ASCII character must not
+  # steal a cell from the next wide character
+  zw31=$(printf 'a\u200db\u4e2dc')
+  dw31=$(bash -c 'source /dev/stdin <<'"'"'SRC'"'"'
+'"$(sed -n '/^disp_width() {/,/^}/p' ./statusline-command.sh)"'
+SRC
+export LC_ALL=C.UTF-8
+disp_width "$1"; echo "$REPLY"' _ "$zw31")
+  [ "${dw31:-0}" -eq 5 ] && ok "a joiner before ASCII costs nothing extra (${dw31} cells)" ||
+    bad "ZWJ+ASCII mis-measured (${dw31} cells, want 5)"
   # ---- adversarial-review round-30 regression asserts (2026-08-17) ----
   # R122: the history epoch column had a digit cap but no 10#, so a
   # zero-padded row dated itself to 1974 (all-octal) or 19700101 (an 8 or
@@ -1177,9 +1373,17 @@ sleep 300
   # turns a reachable wedged instance into an unregistered orphan, which
   # this project's own docs call the one blind spot, AND it removes the
   # "reclaim failed, do not spawn" brake from the hook
-  awk '/still_alive=0/,/^  fi$/' ./install.sh | grep -q 'rm -f "\$daemon_pid_file"' &&
-    bad "install still deletes the pid file of a live daemon" ||
-    ok "install keeps a live daemon registered"
+  # THE RANGE ENDED BEFORE THE CODE UNDER TEST (round-31): still_alive=0
+  # is followed immediately by a two-line if whose own `  fi` closed the
+  # awk range, so it only ever emitted four lines and the rm it was
+  # looking for - in the else branch further down - was never in them.
+  # The bad branch was unreachable and the ok printed unconditionally.
+  # Ask the question directly instead: the pid file may only be removed
+  # on the not-still-alive side.
+  awk '/^  if \[ "\$still_alive" -eq 1 \]; then$/,/^  fi$/' ./install.sh |
+    awk '/^  else$/{e=1} /rm -f "\$daemon_pid_file"/{if(!e) exit 1} END{exit 0}' &&
+    ok "install keeps a live daemon registered" ||
+    bad "install still deletes the pid file of a live daemon"
   # R139: Retry-After and the compact-boundary token pair are external
   # inputs and need the same cap + 10# as everything else
   grep -q 'usage_ra_val" =~ \^\[0-9\]{1,7}\$' ./statusline-command.sh &&
@@ -1424,8 +1628,19 @@ sleep 300
   # the redirect, so every later diagnostic (including bash's own
   # fork-retry storm) still went straight to the bar.
   bbh="$tmpd/bbhome"
+  # THE GLOBAL OVERRIDE HAS TO BE REMOVED FOR THIS ONE (round-31): the
+  # suite exports STATUSLINE_ERR_LOG at the top (correctly - it stops the
+  # tests truncating the developer's real blackbox), but this assertion
+  # exists to prove the FALLBACK path: when the configured log cannot be
+  # opened, fd 2 must go to /dev/null rather than stay pointed at the
+  # host. With the override in place the script never looked at the
+  # blocked path under $HOME, took the success branch, and the fallback
+  # was never executed. Proven by mutation: deleting the whole pre-check
+  # from statusline-command.sh still passed this assertion, and leaked
+  # 110 bytes of "Is a directory" to the host the moment the override
+  # was unset.
   mkdir -p "$bbh/.claude/statusline-err.log"
-  HOME="$bbh" bash ./statusline-command.sh < fixtures/full.json >/dev/null 2>"$tmpd/bb_host.txt"
+  HOME="$bbh" env -u STATUSLINE_ERR_LOG bash ./statusline-command.sh < fixtures/full.json >/dev/null 2>"$tmpd/bb_host.txt"
   [ -s "$tmpd/bb_host.txt" ] && bad "main bar leaked stderr when its log could not be opened ($(head -c 60 "$tmpd/bb_host.txt"))" || ok "main bar falls back instead of leaking to the host"
   bbp="$tmpd/bbpanel"
   mkdir -p "$bbp/daemon-err.log" "$bbp/spool.bb1.new"

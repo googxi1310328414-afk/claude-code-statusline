@@ -215,7 +215,9 @@ fi
 #      nearest fifth) with filled cells in the same dynamic tier as "N%"
 #      (>=50 green / 20-49 yellow / <20 bright red) and empty cells gray,
 #      "N%" dynamic. AUTO-COMPACT MARK (~80% community convention, not an
-#      official threshold): cell index 4 (floor(0.8*5), the last cell)
+#      official threshold; see the fuller note at the bar itself - the
+#      index is a fixed right-hand end-stop, NOT a computed 80% point,
+#      because this bar draws REMAINING context): cell index 4 (the last cell)
 #      renders as a fixed bright-white "│" instead of gray "░" whenever
 #      the bar hasn't filled past it yet (filled<=4); omitted once the
 #      bar is completely full (filled=5). Each of the two token numbers
@@ -1292,15 +1294,56 @@ fi
 today_total_cents=0
 week_total_cents=0
 printf -v week_first_str '%(%Y%m%d)T' "$(( now_epoch - 518400 ))"
+# A DAY'S CONTRIBUTION, WITH "BASELINE UNKNOWN" HONOURED (round-31):
+# round-30 taught the LOADER that a malformed base column means "we do
+# not know this day's midnight baseline" and left it unset - but all
+# three consumers went on reading it as ${du_base[...]:-0}, which is the
+# one value the whole design calls the forbidden direction. An unknown
+# baseline read as zero makes the day book the entire cumulative it
+# INHERITED as spend. Measured: a row whose honest contribution is 0
+# rendered today $10.00 / week $10.00, and once that day settles the
+# inflated figure is written into an _agg row while the fine-grained
+# evidence behind it expired ninety minutes after it was written - so it
+# is wrong for the rest of the nine-day window with no way back.
+#
+# When the baseline is genuinely unknown the honest answer is "this day
+# owns only what it was OBSERVED to spend": the closed segments, which
+# accrued during the day, and nothing from the open segment, whose
+# cumulative still contains the carry-over. That can understate, never
+# overstate - and understating self-corrects the moment a real
+# observation arrives, while overstating gets frozen into _agg.
+day_contrib() {   # $1 = dkey -> REPLY (cents, never negative)
+  if [ -z "${du_base[$1]+x}" ]; then
+    REPLY=${du_closed[$1]:-0}
+  else
+    REPLY=$(( ${du_closed[$1]:-0} + ${du_peak[$1]:-0} - ${du_base[$1]} ))
+  fi
+  [ "$REPLY" -lt 0 ] && REPLY=0
+  return 0
+}
 for dkey in "${!du_peak[@]}"; do
   d_day="${dkey%%$'\x1f'*}"
   # minus the midnight baseline (see fold_daily_row): a day owns only
   # the spend that happened DURING it, never the cumulative it inherited
-  d_total=$(( ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} - ${du_base[$dkey]:-0} ))
-  [ "$d_total" -lt 0 ] && d_total=0
+  day_contrib "$dkey"; d_total=$REPLY
   [ "$d_day" = "$today_str" ] && today_total_cents=$(( today_total_cents + d_total ))
   [ "$d_day" -ge "$week_first_str" ] && week_total_cents=$(( week_total_cents + d_total ))
 done
+# A DISPLAY CAP, SEPARATE FROM THE ARITHMETIC ONE (round-31): the daily
+# columns are admitted at up to 12 digits, which is what keeps every
+# later addition inside bash integer range - but that cap was never a
+# DISPLAY bound, and this path never passes through cost_to_cents, whose
+# own 9-digit cap the comment there claims "covers them all". A row with
+# a 12-digit cents column therefore rendered "today $9999999999.99", a
+# cell that is not this line's last one, so it votes in the shared column
+# width and pushed the four-line grid past the terminal - the wrapping
+# that round-30's column work exists to prevent. Anything past $999999.99
+# is a corrupt row, not a bill: drop the segment rather than draw it.
+if [ "$today_total_cents" -gt 99999999 ] || [ "$week_total_cents" -gt 99999999 ]; then
+  [ "$today_total_cents" -gt 99999999 ] && today_total_cents=0
+  [ "$week_total_cents" -gt 99999999 ] && week_total_cents=0
+fi
+
 # THIS session's share of today, on the SAME footing as today_total
 # (round-13): the today segment is hidden when it would merely restate
 # the cost segment beside it, and that test used to subtract
@@ -1313,8 +1356,7 @@ done
 today_self_cents=0
 if [ -n "$session_id" ]; then
   self_dkey="${today_str}"$'\x1f'"${session_id}"
-  today_self_cents=$(( ${du_closed[$self_dkey]:-0} + ${du_peak[$self_dkey]:-0} - ${du_base[$self_dkey]:-0} ))
-  [ "$today_self_cents" -lt 0 ] && today_self_cents=0
+  day_contrib "$self_dkey"; today_self_cents=$REPLY
 fi
 
 # Rollup rewrite - only on renders that actually folded something new.
@@ -1374,8 +1416,7 @@ if [ "$daily_persist_due" -eq 1 ]; then
       # later, when the day settles - and permanently, because the fine
       # rows behind it are 90 minutes gone and nothing can rebuild it
       # (measured: week $2.42 -> $10.42 on the frame that folded).
-      d_contrib=$(( ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} - ${du_base[$dkey]:-0} ))
-      [ "$d_contrib" -lt 0 ] && d_contrib=0
+      day_contrib "$dkey"; d_contrib=$REPLY
       daily_agg[$d_day]=$(( ${daily_agg[$d_day]:-0} + d_contrib ))
       continue
     fi
@@ -1634,9 +1675,22 @@ disp_width() {
     REPLY="${#s}"
     return
   fi
-  local len=${#s} i c cp ncp w total=0 zwj_skip=0
+  local len=${#s} i c nc cp ncp w total=0 zwj_skip=0
   for ((i=0; i<len; i++)); do
     c="${s:i:1}"
+    # THE PENDING-SKIP CHECK COMES FIRST (round-31): it used to sit
+    # below the ASCII fast path, which returns early - so when a joiner
+    # was followed by an ASCII character, that character was charged a
+    # full cell AND left the skip unconsumed. The stale credit then hit
+    # whatever wide character came next and zeroed it: measured
+    # disp_width on a CJK-joiner-ASCII-CJK string returned 7 against a
+    # true 9, and the line 1 separator landed two columns off the other
+    # three lines - the same misalignment the joiner handling was added
+    # to fix, entered through the other door.
+    if [ "$zwj_skip" -gt 0 ]; then
+      zwj_skip=$(( zwj_skip - 1 ))
+      continue
+    fi
     if [[ "$c" == [[:ascii:]] ]]; then
       total=$(( total + 1 ))
       continue
@@ -1650,19 +1704,25 @@ disp_width() {
     # terminal draws, and everything after it on that line shifted
     # against the other three lines. Variation selectors and combining
     # marks are zero-width for the same reason.
-    if [ "$zwj_skip" -gt 0 ]; then
-      zwj_skip=$(( zwj_skip - 1 ))
-      continue
-    fi
     if [ "$cp" -eq 8205 ]; then
       # the joiner is zero-width AND so is the glyph it joins; an astral
       # partner occupies TWO of this shell's string units, so look ahead
       # once to find out how many to swallow (this runs only on the rare
       # frame that actually contains a joined emoji)
-      zwj_skip=1
+      # ...but ONLY when it actually joins something (round-31): a
+      # joiner between two ordinary characters forms no ligature -
+      # terminals draw both - so swallowing the next character
+      # regardless under-counted every such string by one cell.
+      # An ASCII character is never an emoji component, which is
+      # the cheap and correct discriminator here.
+      zwj_skip=0
       if [ $(( i + 1 )) -lt "$len" ]; then
-        printf -v ncp '%d' "'${s:i+1:1}" 2>/dev/null || ncp=0
-        [ "$ncp" -ge 55296 ] && [ "$ncp" -le 56319 ] && zwj_skip=2
+        nc="${s:i+1:1}"
+        if [[ "$nc" != [[:ascii:]] ]]; then
+          zwj_skip=1
+          printf -v ncp '%d' "'$nc" 2>/dev/null || ncp=0
+          [ "$ncp" -ge 55296 ] && [ "$ncp" -le 56319 ] && zwj_skip=2
+        fi
       fi
       continue
     fi
@@ -1785,6 +1845,16 @@ comp_count=${#dir_comps[@]}
 if [ "$comp_count" -gt 3 ]; then
   dir_display="${dir_comps[0]}\\…\\${dir_comps[$((comp_count-2))]}\\${dir_comps[$((comp_count-1))]}"
 fi
+# NORMALISE BEFORE THE PLAIN TWIN IS TAKEN (round-31): a current_dir
+# that ends in a separator kept it in the plain twin, while the
+# colouring below rebuilds the cell from components and drops it - so
+# the twin used for every width computation was one cell wider than
+# what got drawn, and line 1 shifted a column against lines 2-4.
+# (Only on the shallow path: three components or fewer, since the
+# deeper path rebuilds the whole string anyway.)
+while [ "${#dir_display}" -gt 1 ] && [ "${dir_display: -1}" = "\\" ]; do
+  dir_display="${dir_display%\\}"
+done
 dir_plain="$dir_display"
 if [ -n "$dir_display" ]; then
   IFS='\' read -ra dir_final_comps <<< "$dir_display"
@@ -2129,10 +2199,23 @@ if [[ "$in_tokens" =~ ^[0-9]+$ ]] && [ "$in_tokens" -gt 0 ] && [[ "$win_size" =~
   [ "$filled" -lt 0 ] && filled=0
   [ "$filled" -gt 5 ] && filled=5
   # N5: auto-compact mark (~80% community convention, not an official
-  # Claude Code threshold) - cell index 4 (floor(0.8*5)) renders as a
-  # fixed bright-white "|" whenever the bar hasn't reached that cell yet
-  # (filled<=4); once the bar is completely full (filled=5) the marker is
-  # omitted, since there's no "before autocompact" cell left to mark.
+  # Claude Code threshold) - cell index 4 renders as a fixed
+  # bright-white "|" whenever the bar has not reached that cell yet
+  # (filled<=4), and is omitted once the bar is completely full.
+  # ROUND-31 CORRECTED THE RATIONALE, NOT THE BEHAVIOUR: the old note
+  # called index 4 "floor(0.8*5), the ~80% auto-compact point", which
+  # would be true of a bar drawing USAGE. This bar draws REMAINING
+  # context (filled = (remaining+10)/20), so index 4 is the 90-100%
+  # REMAINING end - the furthest point from auto-compact, not the
+  # closest. What the marker actually is, and all it has ever been, is
+  # a fixed right-hand end-stop that shows up as soon as any context
+  # has been used; the project fixture recorded in the guide (12%
+  # remaining, marker still at the far right) is the same thing. Do not
+  # "fix" the index to chase the old wording: on a remaining-style bar
+  # the 80%-used point is index (20+10)/20 = 1, and moving it there
+  # would change a stable end-stop into a marker that walks left as the
+  # session fills, which is not what any of the fixtures or the README
+  # screenshots show.
   bar_plain=""
   bar_cells=""
   for ((bi=0; bi<5; bi++)); do
@@ -2739,7 +2822,16 @@ five_compact_seg=""
 # arithmetic range (a 21-digit number would otherwise blow it up).
 if [[ "$five" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]]; then
   if [ "${five:0:1}" = "-" ]; then five="0"; fi
-  five_int="${five%%.*}"
+  # THE TIER MUST MATCH THE NUMBER ON SCREEN (round-31): the colour was
+  # chosen from the TRUNCATED value while the text was printed with
+  # %.0f, which ROUNDS - so 79.6 drew a yellow "80%" while 80.0 drew a
+  # bright red "80%", two colours for the same rendered figure, and the
+  # header's own rule says >=80 is bright red. The band where they
+  # disagree, [79.5, 80), is exactly where a limit warning matters most,
+  # and the same split hit the 7d window (49.9 drew a green "50%") and
+  # the context battery. Deciding the tier from the value actually shown
+  # keeps the two in step whichever way the rounding falls.
+  printf -v five_int '%.0f' "$five" 2>/dev/null || five_int="${five%%.*}"
   [ "$five_int" -gt 100 ] && { five_int=100; five="100"; }
   five_color="$GREEN"
   if [ "$five_int" -ge 80 ]; then
@@ -2803,7 +2895,8 @@ fi
 # DOUBLE GUARD (hard-rule 2) - see the 5h window's comment above.
 if [[ "$week" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]]; then
   if [ "${week:0:1}" = "-" ]; then week="0"; fi
-  week_int="${week%%.*}"
+  # same rounding discipline as the 5h window above (round-31)
+  printf -v week_int '%.0f' "$week" 2>/dev/null || week_int="${week%%.*}"
   [ "$week_int" -gt 100 ] && { week_int=100; week="100"; }
   week_color="$GREEN"
   if [ "$week_int" -ge 80 ]; then
@@ -3008,7 +3101,7 @@ if [ -f "$usage_cache_file" ]; then
         # block's own "degrade to segment absent rather than show
         # garbage" promise.
         [[ "$m_pct" =~ ^[0-9]{1,3}(\.[0-9]+)?$ ]] || continue
-        m_pct_int="${m_pct%%.*}"
+        printf -v m_pct_int '%.0f' "$m_pct" 2>/dev/null || m_pct_int="${m_pct%%.*}"
         [ "$m_pct_int" -lt 50 ] && continue
         cand_names+=("$m_name")
         cand_pcts+=("$m_pct")
@@ -3058,7 +3151,7 @@ if [ -f "$usage_cache_file" ]; then
         m_name="${wk_names[$wi]}"
         m_pct="${wk_pcts[$wi]}"
         wk_label_for "$m_name"; wk_label="$REPLY"
-        m_pct_int="${m_pct%%.*}"
+        printf -v m_pct_int '%.0f' "$m_pct" 2>/dev/null || m_pct_int="${m_pct%%.*}"
         if [ "$m_pct_int" -ge 80 ]; then
           wk_color="$RED_BRIGHT"
         elif [ "$m_pct_int" -ge 50 ]; then
@@ -3345,6 +3438,8 @@ else
   # RECORDED per line (render_line needs them); they just no longer vote.
   col_widths=()
   parts1_w=(); parts2_w=(); parts3_w=(); parts4_w=()
+  # (the padding budget is applied after this loop - see the COLUMNS
+  # check below, round-31)
   for ((ci=0; ci<max_cols; ci++)); do
     w=0
     if [ "$ci" -lt "${#parts1_plain[@]}" ]; then
@@ -3365,6 +3460,42 @@ else
     fi
     col_widths+=("$w")
   done
+
+  # PAD ONLY IF THE RESULT STILL FITS (round-31): $COLUMNS was read in
+  # exactly one place - the choice between the four-line grid and the
+  # compact single line - and never reached this padding pass, which
+  # widened every cell to its column maximum unconditionally. At the
+  # grid's own 100-column threshold an entirely ordinary payload (a
+  # nested project path plus an org/repo) measured line 1 at 118 cells,
+  # 15 of them pure padding added because line 2's context battery is
+  # wider than the clock. The line wrapped, the four-line grid became
+  # five or more rows, and column alignment - the only reason the padding
+  # exists - was destroyed by the padding itself. Round-30 removed the
+  # last cell's vote for the same reason; this is the other half.
+  # Alignment is a nicety, staying inside the terminal is not, so when
+  # the padded width would not fit, this frame simply does not pad.
+  # each LINE is measured on its own: every cell but its last is padded
+  # to the shared column width, its last cell is drawn bare, and the
+  # separators are 3 cells each. Taking the widest of the four is what
+  # decides whether padding still fits.
+  grid_w=0
+  for _gl in 1 2 3 4; do
+    declare -n _gw="parts${_gl}_w"
+    _gn=${#_gw[@]}
+    [ "$_gn" -eq 0 ] && continue
+    _gsum=0
+    for ((ci=0; ci<_gn-1; ci++)); do
+      _gc=${col_widths[$ci]:-0}
+      [ "${_gw[$ci]}" -gt "$_gc" ] && _gc=${_gw[$ci]}
+      _gsum=$(( _gsum + _gc ))
+    done
+    _gsum=$(( _gsum + ${_gw[$((_gn-1))]} + (_gn - 1) * 3 ))
+    [ "$_gsum" -gt "$grid_w" ] && grid_w=$_gsum
+    unset -n _gw
+  done
+  if [ "$grid_w" -gt "$COLUMNS" ]; then
+    for ((ci=0; ci<max_cols; ci++)); do col_widths[$ci]=0; done
+  fi
 
   # Renders one line: $1/$2 are the NAMES of its colored/plain arrays
   # (nameref, bash 4.3+). Every cell but the last is right-padded with

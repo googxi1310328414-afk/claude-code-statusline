@@ -28,7 +28,7 @@ with a STATE-COLORED identity (pending yellow / completed green / failed bright 
 
 ## Install
 
-Requirements: Claude Code >= 2.1.221 (the version this is verified against; the subagent `effort` field itself lands in 2.1.214 and `contextWindowSize` in 2.1.205 - older builds simply lose those two columns), Git Bash (bash ≥ 4.3 — `local -n` namerefs, UTF-8), `jq`, `git` (≥ 2.35 for the stash segment).
+Requirements: Claude Code >= 2.1.221 (the version this is verified against; the subagent `effort` field itself lands in 2.1.214, so older builds simply lose that one piece of identity-cell decoration; `contextWindowSize` is never read by this implementation at all (the panel deliberately refuses to fake an occupancy battery), so its absence changes nothing), Git Bash (bash ≥ 4.3 — `local -n` namerefs, UTF-8), `jq`, `git` (≥ 2.35 for the stash segment).
 
 One-liner (idempotent — re-running updates; offline when run inside a local clone):
 
@@ -50,13 +50,13 @@ It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES s
 ```bash
 bash test.sh          # render all fixtures (see real colors in your terminal)
 bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
-bash test.sh --assert # 232 assertions (CI mode; perf gates + thirty adversarial-review regression groups + color asserts)
+bash test.sh --assert # 250 assertions (CI mode; perf gates + thirty-one adversarial-review regression groups + color asserts)
 ```
 
 ## Notable engineering notes
 
 - Auto-refresh = event-driven repaints (~300 ms debounce) + a `refreshInterval` timer (main 10s here; the subagent panel runs on the host's own fixed ~5s tick — a refreshInterval under subagentStatusLine is ignored, measured on 2.1.229) that re-runs the whole script with fresh stdin JSON even when idle. A new trigger CANCELS the in-flight render, so the interval must comfortably exceed worst-case render time (0.4–1.3 s measured) — undershooting it blanks the bar entirely. settings.json changes hot-reload by CONTENT (touching mtime does nothing), which is also the no-restart recovery path if the render loop ever wedges.
-- Windows `jq` emits CRLF: every line-wise read must pass through `tr -d '\r'` (MSYS bash strips trailing CRs in `$(...)` substitutions, `mapfile` does not).
+- Windows `jq` emits CRLF: every line-wise read must strip CR first (MSYS bash strips trailing CRs in `$(...)` substitutions, `mapfile` does not). Do it with a parameter expansion on the whole blob - `blob=${blob//$'\r'/}` - **not** with `| tr -d '\r'`, which costs a fork or two on every single frame and breaks the "~2 processes per render" budget this project treats as a survival line (AI-GUIDE section 2.6; the reference implementation has no `tr` anywhere).
 - Scripts export `LC_ALL=C.UTF-8` — column alignment depends on character-based (not byte-based) string measurement, plus a `disp_width()` that counts East-Asian wide characters as 2 terminal cells.
 - **Narrow-terminal fallback**: below 100 columns the four-line grid is skipped entirely and a single compact line is rendered (clock | model | leaf dir | branch | battery | $ | 5h%) - seeing one line in a split pane is the designed behaviour, not a broken install
 - Two-tier spend store: fine-grained history is kept for only 90 minutes (it only feeds sparkline/rate/$-per-hour); today/week read a tiny per-day rollup file maintained incrementally with a watermark (replay-safe, self-healing under concurrent sessions, and net of each day's midnight baseline - the per-session cost counter does not reset at midnight, so a day owns only what was spent during it) — renders never re-walk days of rows.

@@ -125,8 +125,59 @@ else
   exec 2>/dev/null
 fi
 
+# THE HEARTBEAT MUST NOT COST A FORK (round-31): every heartbeat write
+# goes out as tmp+mv, and the timestamp is sampled BEFORE that mv - so
+# under fork exhaustion, where one exec sits ~31s in bash's make_child
+# retry ladder, the value lands already stale by a whole exec. Measured
+# on this box with a shim charging 31s per exec: the registered
+# timestamp sat 131s untouched during cold start (rm + find + mkfifo all
+# run before the first beat) and 162s in steady state (mv spool, spawn
+# render, mv cache, rm render - four execs per key with no checkpoint
+# between them); across 330 samples, 164 of them - exactly half - showed
+# an age over 60s. The hook kills anything past 60s, so a PERFECTLY
+# HEALTHY daemon was killed roughly every other tick, its replacement
+# inherited the same work and stalled in the same place, and the machine
+# minted bash processes while already short of them. Round-29's "one pid
+# per beat bounds it at ~31s" only ever counted the taskkill.
+#
+# The fix is a side channel that costs nothing: a one-line file written
+# with a pure-builtin redirect, refreshed either side of every exec.
+# There is no atomicity problem to solve - a torn read yields a value
+# that fails the reader's digit test and is simply ignored, falling back
+# to the pid file's own line 2, which is exactly today's behaviour.
+hb_file="$panel_dir/hb"
+# OWNED, NOT MERELY TIMESTAMPED: the file has to say WHO beat, or a
+# leftover from an earlier instance keeps some unrelated pid looking
+# alive to the hook - which would suppress the reap of a genuinely
+# wedged daemon, the exact opposite of the point. The reader accepts
+# the value only when the owner matches line 1 of the pid file.
+hb_touch() {   # ZERO FORK: printf -v and > are both builtins
+  printf -v _ht '%(%s)T' -1
+  printf '%s %s\n' "$$" "$_ht" > "$hb_file" 2>/dev/null
+}
+# Same reasoning for the in-flight render child (round-31): it only
+# reached the pid file's line 4 on the next successful mv, so for at
+# least one exec - measured 31s, and up to a full beat more - it existed
+# in no file at all. A hook that judged the daemon dead in that window
+# killed the parent (no trap, so the child survives), and the child was
+# then invisible to line 4, to the orphans file, to install and to the
+# watchdog: precisely the permanent unkillable renderer that the whole
+# line-4 mechanism exists to prevent. Published here the instant it is
+# spawned, for free.
+rpid_file="$panel_dir/rpid"
+rpid_publish() {   # ZERO FORK
+  printf '%s\n' "$1" > "$rpid_file" 2>/dev/null
+}
+
 # pid file format: FOUR lines - cygwin_pid / heartbeat_epoch /
-# windows_pid / in-flight render child pid (empty when idle). Lines 3
+# windows_pid / a SPACE-SEPARATED LIST of render-child pids (empty when
+# idle): the one in flight, plus any survivor that even taskkill could
+# not remove. Round-31 corrected this line, which described it as a
+# single pid while README section 8 and AI-GUIDE section 4 both specify
+# the list AND require consumers to iterate it - a consumer written to
+# this header would match ^[0-9]+$ against the whole line, fail the
+# moment a space appears, and reclaim NOTHING exactly when a survivor
+# exists. install.sh records that as a round-23 field incident. Lines 3
 # and 4 exist for the two reapers that cannot see this process tree:
 # the PowerShell watchdog needs a NATIVE pid (cygwin pids mean nothing
 # to it), and the hook needs the render child's pid because it CANNOT
@@ -143,6 +194,9 @@ fi
 # (missing/old-format heartbeat counts as stale -> smooth migration).
 if [ "$once" -eq 0 ]; then
   printf -v hb_now '%(%s)T' -1
+  hb_touch   # before ANY exec on the startup path (round-31)
+  # clear the hook's "spawn in flight" brake as soon as we are real
+  spawn_clear() { echo 0 > "$panel_dir/spawning" 2>/dev/null; }   # builtin, zero fork
   if ! ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_now" "$daemon_winpid" "" > "$panel_dir/daemon.pid" ) 2>/dev/null; then
     holder=""
     holder_hb=""
@@ -166,7 +220,9 @@ if [ "$once" -eq 0 ]; then
   # predecessor, caches nothing has touched for a day, and orphaned
   # per-PID tmp files a killed hook/daemon left behind (age-gated so a
   # LIVE instance's in-flight tmp, seconds old, is never swept)
+  hb_touch   # ...and either side of each of them (round-31)
   rm -f "$panel_dir"/render.* 2>/dev/null
+  hb_touch
   find "$panel_dir" \( -name 'cache.*' -mmin +1440 -o -name 'spool.*.tmp.*' -mmin +10 -o -name 'daemon.pid.tmp.*' -mmin +10 -o -name 'cache.*.raw.*' -mmin +10 \) -delete 2>/dev/null
   # FIFOS ARE SWEPT BY LIVENESS, NOT AGE (round-25): a fifo's mtime
   # never advances, so an age gate deleted the tick fifo of any
@@ -190,7 +246,9 @@ fi
 # instance: no cross-instance contention, and a leftover one is swept
 # by the next start (below) instead of being inherited.
 tick_fifo="$panel_dir/.tick.$$.fifo"
+hb_touch
 [ -p "$tick_fifo" ] || mkfifo "$tick_fifo" 2>/dev/null
+hb_touch
 # RETRYABLE (round-25): mkfifo is itself a fork, run on the one path
 # that only happens when something is already wrong - so it is exactly
 # the step most likely to fail under fork exhaustion. It used to be
@@ -246,55 +304,11 @@ raw_gen=0
 # new daemon loads it, prunes whatever has since died, and keeps
 # retrying. Written with a builtin redirect (no fork) on the beat.
 orphan_file="$panel_dir/orphans"
-# MERGE, NEVER OVERWRITE (round-29): the file is shared by every
-# instance, and a plain rewrite let one daemon erase what another had
-# just registered - the conceding instance would record the child it
-# could not kill, and the winner (which only ever read the file once,
-# at startup) would blank that line on its very next beat. The lost pid
-# is then in no pid file, no orphan file and nobody in-memory: exactly
-# the process this whole list exists to keep reachable.
-orphans_save() {
-  _os_disk=""
-  [ -r "$orphan_file" ] && read -r _os_disk < "$orphan_file" 2>/dev/null
-  _os_all="$r_orphans"
-  for _os_p in $_os_disk; do
-    [[ "$_os_p" =~ ^[0-9]{1,10}$ ]] || continue
-    kill -0 "$_os_p" 2>/dev/null || continue
-    # ...AND IT MUST APPLY THE SAME IDENTITY TEST AS THE EVICTION
-    # (round-30): merging on liveness alone undid the one branch that can
-    # ever shorten this list. The retry drops a pid the moment it stops
-    # being a renderer - which is what a recycled pid looks like, and
-    # cygwin recycles fast - but the save two lines later read the pid
-    # straight back off disk, found the unrelated process that now owns
-    # the number alive, and wrote it back. Measured: the in-memory list
-    # emptied within three beats while the file never changed across
-    # twelve. The file then only grows, every new daemon reloads the
-    # rubbish, and since round-29 retries ONE pid per beat, a real
-    # survivor waits K beats behind K corpses - on a daemon that idles
-    # out after two minutes, the one process actually burning CPU gets
-    # retried about once per instance instead of once per five seconds.
-    # Worse, a recycled number that lands on a genuine renderer makes
-    # this loop kill -9 someone else's healthy render child.
-    child_is_renderer "$_os_p" || continue
-    case " $_os_all " in
-      *" $_os_p "*) : ;;
-      *) _os_all="${_os_all}${_os_all:+ }$_os_p" ;;
-    esac
-  done
-  printf '%s\n' "$_os_all" > "$orphan_file" 2>/dev/null
-}
-r_orphans=""
-if [ -r "$orphan_file" ]; then
-  read -r r_orphans < "$orphan_file" 2>/dev/null
-  _kept=""
-  for _lp in $r_orphans; do
-    [[ "$_lp" =~ ^[0-9]{1,10}$ ]] || continue
-    kill -0 "$_lp" 2>/dev/null && _kept="${_kept}${_kept:+ }$_lp"
-  done
-  r_orphans="$_kept"
-fi
-last_hb=0
-[ "$once" -eq 0 ] && last_hb=$hb_now
+# DEFINED BEFORE ITS FIRST USE (round-31): the startup load of the
+# orphans file now applies this same identity gate, and that load runs
+# at top level - a definition further down would have made every call
+# there a "command not found" whose false return dropped every
+# survivor on the floor.
 # WALL-CLOCK heartbeat (round-4 fix for a round-3 regression): the first
 # heartbeat implementation counted LOOP ITERATIONS (every 15th), but an
 # iteration's duration is unbounded - each spool's render wait adds up
@@ -318,15 +332,11 @@ last_hb=0
 # someone ELSE registered and alive -> concede (exit) on the spot;
 # dead/missing claim -> take over via the exclusive-create discipline.
 # This also folds the old separate ownership self-check into the beat.
-# never exit while a render child is still running (round-13): the
-# concede / lost-the-takeover paths below can fire from INSIDE the
-# render wait loop, and a bare `exit` left that child orphaned - still
-# running, still holding its tmp name, with no parent to reap it. That
-# is the same leak the hook's REAP exists to stop, just minted from
-# the other side. The child IS a process-group leader (`set -m`), so
-# the group kill here is real, unlike the one on the daemon itself.
-# zero-fork argv confirmation, same discipline as the hook: the LAST
-# argv element must be the renderer, and any bare `-c` disqualifies.
+# zero-fork argv confirmation, same discipline as the hook: the FIRST
+# non-option argv after bash must be the renderer, and any bare `-c`
+# disqualifies (round-31 fixed this leading note, which still described
+# the tail anchor the body itself replaced in round-30 - two mutually
+# exclusive rules on the same function is how a maintainer reverts one).
 # Needed because r_pid_pub/r_orphans can name a pid that has since
 # died and been recycled - and these are GROUP kills, so a wrong pid
 # takes a whole unrelated group with it (the 2026-08-13/14 shape).
@@ -373,6 +383,79 @@ child_is_renderer() { # $1=pid
   esac
   return 1
 }
+# MERGE, NEVER OVERWRITE (round-29): the file is shared by every
+# instance, and a plain rewrite let one daemon erase what another had
+# just registered - the conceding instance would record the child it
+# could not kill, and the winner (which only ever read the file once,
+# at startup) would blank that line on its very next beat. The lost pid
+# is then in no pid file, no orphan file and nobody in-memory: exactly
+# the process this whole list exists to keep reachable.
+orphans_save() {
+  _os_disk=""
+  [ -r "$orphan_file" ] && read -r _os_disk < "$orphan_file" 2>/dev/null
+  _os_all="$r_orphans"
+  for _os_p in $_os_disk; do
+    [[ "$_os_p" =~ ^[0-9]{1,10}$ ]] || continue
+    kill -0 "$_os_p" 2>/dev/null || continue
+    # ...AND IT MUST APPLY THE SAME IDENTITY TEST AS THE EVICTION
+    # (round-30): merging on liveness alone undid the one branch that can
+    # ever shorten this list. The retry drops a pid the moment it stops
+    # being a renderer - which is what a recycled pid looks like, and
+    # cygwin recycles fast - but the save two lines later read the pid
+    # straight back off disk, found the unrelated process that now owns
+    # the number alive, and wrote it back. Measured: the in-memory list
+    # emptied within three beats while the file never changed across
+    # twelve. The file then only grows, every new daemon reloads the
+    # rubbish, and since round-29 retries ONE pid per beat, a real
+    # survivor waits K beats behind K corpses - on a daemon that idles
+    # out after two minutes, the one process actually burning CPU gets
+    # retried about once per instance instead of once per five seconds.
+    # Worse, a recycled number that lands on a genuine renderer makes
+    # this loop kill -9 someone else's healthy render child.
+    child_is_renderer "$_os_p" || continue
+    case " $_os_all " in
+      *" $_os_p "*) : ;;
+      *) _os_all="${_os_all}${_os_all:+ }$_os_p" ;;
+    esac
+  done
+  printf '%s\n' "$_os_all" > "$orphan_file" 2>/dev/null
+  # ...AND BACK INTO MEMORY (round-31): the merge only ever went one
+  # way. A daemon that is healthy and has no survivors of its own
+  # reads this file exactly once, at startup, and the retry block that
+  # would reread it is itself gated on r_orphans being non-empty - so a
+  # survivor some OTHER instance registered on its way out was never
+  # retried by the daemon actually running. The hook cannot cover it
+  # either: its whole reclaim path sits behind "the daemon is dead".
+  # Measured: a live renderer pid written to the file sat untouched for
+  # the daemon's entire lifetime and never appeared on line 4. Nothing
+  # reached it until the next cold start, up to a full hour away.
+  r_orphans="$_os_all"
+}
+r_orphans=""
+if [ -r "$orphan_file" ]; then
+  read -r r_orphans < "$orphan_file" 2>/dev/null
+  _kept=""
+  for _lp in $r_orphans; do
+    [[ "$_lp" =~ ^[0-9]{1,10}$ ]] || continue
+    # the identity gate belongs on BOTH halves of this list (round-31):
+    # round-30 added it to the merge and left the startup load on
+    # liveness alone, so a recycled pid was still loaded here and killed
+    # on the first beat - and what a recycled pid most often is on this
+    # box is another session's healthy render child.
+    kill -0 "$_lp" 2>/dev/null && child_is_renderer "$_lp" &&
+      _kept="${_kept}${_kept:+ }$_lp"
+  done
+  r_orphans="$_kept"
+fi
+last_hb=0
+[ "$once" -eq 0 ] && last_hb=$hb_now
+# never exit while a render child is still running (round-13): the
+# concede / lost-the-takeover paths below can fire from INSIDE the
+# render wait loop, and a bare `exit` left that child orphaned - still
+# running, still holding its tmp name, with no parent to reap it. That
+# is the same leak the hook's REAP exists to stop, just minted from
+# the other side. The child IS a process-group leader (`set -m`), so
+# the group kill here is real, unlike the one on the daemon itself.
 quit_with_child() {
   if [ -n "$r_pid_pub" ] && kill -0 "$r_pid_pub" 2>/dev/null && child_is_renderer "$r_pid_pub"; then
     kill -- "-$r_pid_pub" 2>/dev/null
@@ -441,6 +524,7 @@ hb_beat() {
   # list from disk, and the next beat wedged in exactly the same place:
   # one healthy daemon killed per minute, with the survivors untouched.
   # round-27's checkpoints could not help - the block is INSIDE hb_beat.
+  hb_touch   # free, and BEFORE the mv that used to be the only beat
   hb_cur=""
   [ -r "$panel_dir/daemon.pid" ] && read -r hb_cur < "$panel_dir/daemon.pid"
   if [ "$hb_cur" = "$$" ]; then
@@ -450,6 +534,19 @@ hb_beat() {
   else
     rm -f "$panel_dir/daemon.pid" 2>/dev/null
     ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "${r_pid_pub}${r_orphans:+ }${r_orphans}" > "$panel_dir/daemon.pid" ) 2>/dev/null || quit_with_child
+  fi
+  hb_touch   # ...and after it, so the value reflects when it finished
+  # RECONCILE EVERY BEAT (round-31): this block used to be gated on "we
+  # already have survivors in memory", which made "the file holds only
+  # dead pids and memory is empty" an absorbing state - nothing else
+  # ever writes that file (the hook only reads it, install never touches
+  # it), so those entries stayed forever. cygwin recycles pids fast, so
+  # one of them eventually lands on another session's healthy render
+  # child, and the next daemon to start would load it and kill -9 that.
+  # The reconcile is builtins and /proc reads only - no fork - so doing
+  # it every beat is free.
+  if [ -z "$r_orphans" ] && [ -s "$orphan_file" ]; then
+    orphans_save
   fi
   # SURVIVOR RETRY, ONE PER BEAT (round-29): retrying the whole list in a
   # single beat made the beat interval N x the cost of one taskkill, and
@@ -510,7 +607,9 @@ while :; do
   for sp in "$panel_dir"/spool.*.new; do
     key=${sp##*/spool.}
     key=${key%.new}
+    hb_touch   # either side of every exec on the hot path (round-31)
     mv -f "$sp" "$panel_dir/render.$key" 2>/dev/null || continue
+    hb_touch
     # per-render tmp seq: on MSYS/NTFS an unlinked-but-still-open file
     # name stays reserved (delete pending) until the last fd closes, so
     # a killed child's tmp name may be briefly unreusable - a fresh seq
@@ -540,6 +639,9 @@ while :; do
     bash "$renderer" < "$panel_dir/render.$key" > "$raw_tmp" &
     r_pid=$!
     set +m 2>/dev/null
+    hb_touch
+    # ON DISK THE INSTANT IT EXISTS (round-31), not on the next mv
+    rpid_publish "$r_pid"
     # publish for external reapers; the next beat (<=5s, and beats run
     # on every wait tick) writes it to line 4 of the pid file, so any
     # render long enough to wedge this daemon is always reachable
@@ -692,7 +794,9 @@ while :; do
       { printf '%s
 ' "$_cache_ep"; printf '%s
 ' "${_rows[@]}"; } > "$cache_tmp" 2>/dev/null &&
+        hb_touch
         mv -f "$cache_tmp" "$panel_dir/cache.$key" 2>/dev/null
+        hb_touch
       bad_streak[$key]=0
     else
       : > "$raw_tmp" 2>/dev/null
@@ -709,7 +813,10 @@ while :; do
     fi
     # a survivor already moved itself into r_orphans and cleared this
     r_pid_pub=""
+    hb_touch
     rm -f "$panel_dir/render.$key" 2>/dev/null
+    hb_touch
+    rpid_publish ""   # the child is gone; stop advertising it
     worked=1
   done
   [ "$once" -eq 1 ] && break
@@ -737,7 +844,7 @@ if [ "$once" -eq 0 ]; then
   # startup housekeeping then trampled the survivor's in-flight render
   cur_holder=""
   [ -r "$panel_dir/daemon.pid" ] && read -r cur_holder < "$panel_dir/daemon.pid"
-  [ "$cur_holder" = "$$" ] && rm -f "$panel_dir/daemon.pid" 2>/dev/null
+  [ "$cur_holder" = "$$" ] && rm -f "$panel_dir/daemon.pid" "$hb_file" "$rpid_file" 2>/dev/null
   rm -f "$tick_fifo" "$panel_dir"/cache.*.raw.$$.* 2>/dev/null
 fi
 exit 0

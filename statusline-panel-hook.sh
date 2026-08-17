@@ -214,10 +214,38 @@ daemon_hb=""
 daemon_wpid=""
 daemon_rpid=""
 [ -r "$panel_dir/daemon.pid" ] && { read -r daemon_pid; read -r daemon_hb; read -r daemon_wpid; read -r daemon_rpid; } < "$panel_dir/daemon.pid" 2>/dev/null
+# THE SIDE-CHANNEL BEAT COUNTS TOO (round-31): line 2 can only be
+# refreshed by a tmp+mv, and under fork exhaustion that exec sits ~31s -
+# so a healthy daemon's registered timestamp was measured 131s stale on
+# cold start and 162s in steady state, against this 60s gate. Half of
+# all ticks therefore judged a working daemon dead and killed it, and
+# because the kill SUCCEEDED reap_failed stayed 0 and the hook minted a
+# replacement - the amplifier, driven entirely by false positives. The
+# daemon now also stamps a one-line file with a pure-builtin redirect
+# either side of every exec; whichever timestamp is newer wins. A torn
+# read fails the digit test and is ignored, which just falls back to
+# line 2 - i.e. exactly the old behaviour, never worse.
+daemon_hb2=""
+_hbo=""
+[ -r "$panel_dir/hb" ] && read -r _hbo daemon_hb2 < "$panel_dir/hb" 2>/dev/null
+# the beat counts only if its OWNER is the pid we are judging - a
+# leftover file must never vouch for somebody else
+if [ "$_hbo" = "$daemon_pid" ] && [[ "$daemon_hb2" =~ ^[0-9]{1,13}$ ]]; then
+  daemon_hb2=$(( 10#$daemon_hb2 ))
+else
+  daemon_hb2=""
+fi
 daemon_alive=0
-if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null && [[ "$daemon_hb" =~ ^[0-9]+$ ]]; then
-  hb_age=$(( hook_now - daemon_hb ))
-  [ "$hb_age" -ge -60 ] && [ "$hb_age" -le 60 ] && daemon_alive=1
+if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+  hb_best=""
+  [[ "$daemon_hb" =~ ^[0-9]{1,13}$ ]] && hb_best=$(( 10#$daemon_hb ))
+  if [ -n "$daemon_hb2" ] && { [ -z "$hb_best" ] || [ "$daemon_hb2" -gt "$hb_best" ]; }; then
+    hb_best=$daemon_hb2
+  fi
+  if [ -n "$hb_best" ]; then
+    hb_age=$(( hook_now - hb_best ))
+    [ "$hb_age" -ge -60 ] && [ "$hb_age" -le 60 ] && daemon_alive=1
+  fi
 fi
 if [ "$daemon_alive" -eq 0 ]; then
   # a reap that FAILED must not be followed by a spawn - see the
@@ -314,7 +342,7 @@ if [ "$daemon_alive" -eq 0 ]; then
   # from here - hence line 4 of the pid file, which the daemon rewrites
   # on its 5s beat (empty while idle). This one IS group-killable: the
   # daemon starts it under `set -m`, so it leads its own group and the
-  # renderer's own jq goes down with it. Same cmdline-tail identity
+  # renderer's own jq goes down with it. Same first-argv identity
   # check as the daemon, so a recycled pid is never signalled.
   # LINE 4 IS A LIST (round-23): round-22 started publishing survivors
   # alongside the in-flight child, space separated, but this side still
@@ -331,6 +359,15 @@ if [ "$daemon_alive" -eq 0 ]; then
   # would trade a leaked renderer for a permanently dark panel.)
   _rp_file=""
   [ -r "$panel_dir/orphans" ] && read -r _rp_file < "$panel_dir/orphans" 2>/dev/null
+  # ...and the child that has not reached line 4 yet (round-31): line 4
+  # only refreshes on a tmp+mv, so a render spawned inside the last exec
+  # existed in NO file - killing the daemon in that window (which has no
+  # trap, so the child outlives it) left a renderer that line 4, the
+  # orphans file, install and the watchdog were all blind to. The daemon
+  # now publishes it fork-free the instant it spawns.
+  _rp_live=""
+  [ -r "$panel_dir/rpid" ] && read -r _rp_live < "$panel_dir/rpid" 2>/dev/null
+  [[ "$_rp_live" =~ ^[0-9]{1,10}$ ]] || _rp_live=""
   # DEDUP, AND ONE NATIVE ESCALATION PER TICK (round-30): line 4 is built
   # from the daemon's own r_pid_pub PLUS r_orphans, and the orphans file
   # is that same r_orphans - so concatenating the two lists hands every
@@ -347,7 +384,7 @@ if [ "$daemon_alive" -eq 0 ]; then
   # enough: the next tick is 5 seconds away and the list is persistent.
   _rp_seen=""
   _rp_escalated=0
-  for _rp in $daemon_rpid $_rp_file; do
+  for _rp in $daemon_rpid $_rp_file $_rp_live; do
     [[ "$_rp" =~ ^[0-9]{1,10}$ ]] || continue
     case " $_rp_seen " in
       *" $_rp "*) continue ;;
@@ -369,6 +406,26 @@ if [ "$daemon_alive" -eq 0 ]; then
         fi ;;
     esac
   done
+  # ONE SPAWN IN FLIGHT AT A TIME (round-31): a fresh daemon does not
+  # appear in the pid file until it wins the noclobber claim, and under
+  # fork exhaustion the two forks of `( bash ... & )` plus that claim's
+  # own subshell measured ~93s. Every tick inside that window read the
+  # same dead registration and spawned again - with two sessions ticking
+  # at ~5s that is roughly 37 daemons minted from ONE death, all of them
+  # born on a machine already out of forks. They do converge (the losers
+  # concede), but each one pays a fork first, which is the opposite of
+  # what this hook exists for - its own header promises the steady state
+  # spawns NOTHING. The iron law below covers "reclaim failed"; it never
+  # covered "reclaim worked and the replacement is still on its way".
+  # Marker is written with a builtin redirect, so it costs nothing, and
+  # the daemon zeroes it once registered so a genuinely needed respawn
+  # is never blocked for the full window.
+  _sp_last=""
+  [ -r "$panel_dir/spawning" ] && read -r _sp_last < "$panel_dir/spawning" 2>/dev/null
+  [[ "$_sp_last" =~ ^[0-9]{1,13}$ ]] || _sp_last=0
+  if [ "$(( hook_now - 10#$_sp_last ))" -lt 120 ]; then
+    reap_failed=1   # reuse the "do not spawn" brake; the cache still serves
+  fi
   # NEVER MINT A REPLACEMENT FOR SOMETHING WE COULD NOT KILL (round-17):
   # that is the whole amplifier. If even TerminateProcess did not get
   # rid of the old instance, the honest outcome is "no panel this tick"
@@ -377,6 +434,8 @@ if [ "$daemon_alive" -eq 0 ]; then
   # now cost this machine 22, 3 and 3.9 CPU-hours in three separate
   # incidents.
   if [ "$reap_failed" -eq 0 ]; then
+    printf '%s
+' "$hook_now" > "$panel_dir/spawning" 2>/dev/null   # zero fork
     ( bash "$panel_daemon" </dev/null >/dev/null 2>&1 & )
   fi
 fi
