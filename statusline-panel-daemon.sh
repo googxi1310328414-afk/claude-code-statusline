@@ -295,6 +295,18 @@ if [ "$once" -eq 0 ]; then
   hb_touch   # ...and either side of each of them (round-31)
   rm -f "$panel_dir"/render.* 2>/dev/null
   hb_touch
+  # ...and around this one too (round-34): three beats were stamped
+  # BEFORE this find and the next one only after the fifo sweep, so the
+  # find plus one rm per dead-owner fifo all sat in a single silent
+  # window. A leftover fifo is not exotic - the concede path exits
+  # without removing its own, and every externally killed instance
+  # leaves one, since this file has no trap - and under fork exhaustion
+  # the window measured (N+1) x one exec: 62s with a single leftover,
+  # 186s with five. The daemon is ALREADY registered by then, so the
+  # hook judges it dead, kills it (successfully, because it is merely
+  # waiting on rm), keeps reap_failed at 0 and spawns a replacement -
+  # which walks the same stretch and dies the same way.
+  hb_touch
   find "$panel_dir" \( -name 'cache.*' -mmin +1440 -o -name 'spool.*.tmp.*' -mmin +10 -o -name 'daemon.pid.tmp.*' -mmin +10 -o -name 'cache.*.raw.*' -mmin +10 \) -delete 2>/dev/null
   # FIFOS ARE SWEPT BY LIVENESS, NOT AGE (round-25): a fifo's mtime
   # never advances, so an age gate deleted the tick fifo of any
@@ -305,7 +317,11 @@ if [ "$once" -eq 0 ]; then
     _tp=${_tf##*/.tick.}
     _tp=${_tp%.fifo}
     [[ "$_tp" =~ ^[0-9]{1,10}$ ]] || continue
+    # a beat around each rm (round-34): one exec per dead-owner fifo,
+    # all inside what used to be a single silent window
+    hb_touch
     kill -0 "$_tp" 2>/dev/null || rm -f "$_tf" 2>/dev/null
+    hb_touch
   done
 fi
 
@@ -334,7 +350,7 @@ fifo_retry_at=$(( SECONDS + 60 ))
 # ABSOLUTE LIFETIME CAP (round-9): a daemon that wedges ANYWHERE
 # outside the beat checkpoints can no longer be detected by its own
 # logic - and the 78-orphan incident proved nothing else reaps it
-# either. SECONDS is bash-internal (no clock dependency, no fork), so
+# either. SECONDS is bash-internal (no fork) - but it is NOT clock-independent (round-34 corrected this: bash computes it as time(NULL) minus the shell start time, so it moves with the system clock; a rollback during a wedged render holds the deadline off for the whole rollback span, and the absolute lifetime gate with it. The heartbeat comparison has carried a rollback guard since round-9; these two do not, which is why the note two hundred lines down claiming "every other clock comparison in this project already carries this guard" was false), so
 # even a fully wedged loop that still cycles will hit this ceiling and
 # exit; a live session simply gets a fresh instance from the next hook
 # tick (cold-missing one frame, the same cost as any respawn).
@@ -588,6 +604,12 @@ hb_beat() {
   # spawned a rival, and this instance could never reach the concede
   # branch below because it kept returning on this very line. Every
   # other clock comparison in this project already carries this guard.
+  # NOT TRUE (round-34): the render deadline and the lifetime cap are
+  # both SECONDS comparisons with no rollback guard, and SECONDS follows
+  # the system clock. They are stretched by the rollback span rather
+  # than broken, and guarding them needs a second clock source, so the
+  # honest thing is to record it here rather than keep claiming
+  # otherwise - a claim that also told reimplementers not to bother.
   hb_delta=$(( hb_t - last_hb ))
   if [ "$hb_delta" -lt 0 ]; then
     last_hb=$hb_t
@@ -754,7 +776,7 @@ while :; do
     # perfectly healthy render that had run for 0 ticks was treated as
     # a hung one: killed, frame marked bad, and three such frames blank
     # the cache. Both halves are fixed here: the deadline is measured
-    # in SECONDS (a bash builtin, no clock dependency, no fork), and a
+    # in SECONDS (a bash builtin, no fork - but see the note above: it follows the system clock, so a rollback stretches this deadline), and a
     # sleep that cannot fork now spins instead of bailing out. The spin
     # is bounded by the deadline and only happens when the machine
     # cannot fork at all - which is exactly when killing a working
@@ -947,11 +969,22 @@ while :; do
   if [ -p "$tick_fifo" ]; then
     read -t 0.3 -r _tick <> "$tick_fifo" 2>/dev/null
   else
+    # BEAT BETWEEN THESE TWO EXECS (round-34): in the documented
+    # no-fifo degradation the mkfifo retry and the fallback sleep run
+    # back to back with nothing between them, which under fork
+    # exhaustion is a 62s silence - past the hook liveness gate - and
+    # the retry timer makes it recur about every second tick. A daemon
+    # that is rendering perfectly and merely cannot get a fifo was
+    # therefore killed and replaced on a loop.
     if [ "$SECONDS" -ge "$fifo_retry_at" ]; then
       fifo_retry_at=$(( SECONDS + 60 ))
+      hb_touch
       mkfifo "$tick_fifo" 2>/dev/null
+      hb_touch
     fi
+    hb_touch
     sleep 0.3 2>/dev/null || break
+    hb_touch
   fi
 done
 if [ "$once" -eq 0 ]; then

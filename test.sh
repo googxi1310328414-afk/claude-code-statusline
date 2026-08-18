@@ -89,6 +89,17 @@ trap 'cleanup_all; trap - EXIT; exit 143' TERM
 strip() { perl -pe 's/\e\[[0-9;]*m//g; s/\e\]8;;[^\e]*\e\\//g'; }
 filter() { if [ "$1" = "--codes" ]; then sed 's/\x1b/\\e/g'; else cat; fi; }
 
+reap_children() {   # $1 = parent pid; kills its direct children
+  local _rc_p _rc_st _rc_ppid
+  for _rc_p in /proc/[0-9]*; do
+    [ -r "$_rc_p/stat" ] || continue
+    read -r _rc_st < "$_rc_p/stat" 2>/dev/null || continue
+    _rc_st=${_rc_st#*") "}
+    _rc_ppid=${_rc_st#* }
+    _rc_ppid=${_rc_ppid%% *}
+    [ "$_rc_ppid" = "$1" ] && kill -9 "${_rc_p##*/}" 2>/dev/null
+  done
+}
 make_history() {  # canonical 0x1f rows: 3 for session abc
   local now=$1 f=$2
   printf "%s\x1fabc\x1f%s\x1f%s\n" \
@@ -727,6 +738,15 @@ sleep 120
   else
     ok "hook reaps a wedged daemon (kill side covered)"
   fi
+  # TAKE THE STUB SLEEP WITH IT (round-34): bash does not exec the last
+  # command of a script file, so the stub and its `sleep 120` are two
+  # processes and the hook - which by design sends a bare pid to a daemon
+  # - only ever reaps the outer one. Every suite run left the sleep
+  # orphaned for two minutes, and the EXIT sweeper only looks for --once
+  # daemons. (Making the stub `exec` instead would strip the daemon
+  # filename from its cmdline, which is exactly what the assertion needs
+  # the hook to recognise.)
+  reap_children "$wedged"
   rm -f "$STATUSLINE_PANEL_DIR/daemon.pid" "$STATUSLINE_PANEL_DIR"/spool.kl1.new 2>/dev/null
   # R41: the daily row cap must never lose money - overflow merges
   # settled per-session rows into _agg instead of slicing in hash order
@@ -1113,6 +1133,88 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-34 regression asserts (2026-08-18) ----
+  # R172: the here-string deadlock band is measured in BYTES. Round-33
+  # guarded it with ${#var}, which counts CHARACTERS under this locale -
+  # so a 65600-BYTE CJK payload read as 21942 and sailed past the guard.
+  # Measured: it hung the renderer for the full 25s timeout.
+  awk "/^hs_pad\(\) \{/,/^}/" ./subagent-statusline.sh | grep -q "local LC_ALL=C" &&
+    awk "/^hs_pad\(\) \{/,/^}/" ./statusline-command.sh | grep -q "local LC_ALL=C" &&
+    ok "the deadlock band is measured in bytes" || bad "hs_pad still counts characters"
+  grep -q "_jqbytes" ./subagent-statusline.sh &&
+    ok "the jq-output band is measured in bytes too" || bad "the jq-output band still counts characters"
+  python - "$tmpd/cjk34.json" <<'CJK34'
+import io, json, sys
+d = {"columns": 120, "tasks": [{"id": "t1", "name": "a", "status": "running",
+     "tokenCount": 100, "description": "x"}]}
+def blen(o): return len(json.dumps(o, ensure_ascii=False).encode("utf-8"))
+while blen(d) < 65600:
+    d["tasks"][0]["description"] += "审"
+while blen(d) > 65600:
+    d["tasks"][0]["description"] = d["tasks"][0]["description"][:-1]
+while blen(d) < 65600:
+    d["tasks"][0]["description"] += "x"
+io.open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(d, ensure_ascii=False))
+CJK34
+  if [ -s "$tmpd/cjk34.json" ]; then
+    : > "$STATUSLINE_SUBAGENT_TREND_FILE"
+    cjk34=$(timeout 20 bash ./subagent-statusline.sh < "$tmpd/cjk34.json" | jq -r .id 2>/dev/null | grep -c "^t1")
+    [ "${cjk34:-0}" -eq 1 ] && ok "a CJK payload inside the byte band still renders" ||
+      bad "a CJK payload in the byte band hung or produced nothing"
+  else
+    bad "the CJK band fixture was not created"
+  fi
+  # R173: the baseline is resolved AFTER the segment update - computing
+  # it before means a fold that CLOSES a segment lets that whole peak
+  # escape the baseline, and the invented figure is then persisted as a
+  # KNOWN baseline.
+  grep -q "__DEFER__" ./statusline-command.sh &&
+    ok "the deferred baseline is resolved after the segment update" ||
+    bad "the baseline is still seeded before the segment closes"
+  : > "$STATUSLINE_DAILY_FILE"
+  printf '%s\x1fabc\x1f5000\x1f100\x1f100\x1f%s\x1f\n' "$(date +%Y%m%d)" "$((now-3600))" > "$STATUSLINE_DAILY_FILE"
+  fb34=$(jq -c '.session_id="abc" | .cost.total_cost_usd=0.50' fixtures/full.json | bash ./statusline-command.sh | strip)
+  case "$fb34" in
+    *'week $1.'*|*'week $5'*) bad "a closing segment escaped the baseline ($fb34)" ;;
+    *) ok "a closing segment cannot escape the baseline" ;;
+  esac
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R174: every exec on the startup path and in the no-fifo fallback tick
+  # is bracketed by beats - one leftover fifo made the window (N+1) execs
+  # long, which under fork exhaustion is past the hook gate, and the
+  # daemon is already REGISTERED by then so it gets killed and replaced.
+  [ "$(grep -c '^ *hb_touch$' ./statusline-panel-daemon.sh)" -ge 16 ] &&
+    ok "the startup and fallback paths are fully bracketed by beats" ||
+    bad "an exec on a startup or fallback path has no beat around it"
+  awk "/for _tf in/,/^  done$/" ./statusline-panel-daemon.sh | grep -q "hb_touch" &&
+    ok "the fifo sweep beats between removals" || bad "the fifo sweep is one silent window"
+  # R175: the spawn brake must outlast the registration window it covers
+  grep -q "10#\$_sp_last ))\" -lt 240" ./statusline-panel-hook.sh &&
+    ok "the spawn brake covers the measured registration window" ||
+    bad "the spawn brake is shorter than the window it guards"
+  # R176: the watchdog orphan sweep is skipped only when a registration
+  # exists that cannot be parsed - never merely because none exists,
+  # which is the one scenario that branch is documented to cover.
+  grep -q "regUnreadable" ./statusline-watchdog.ps1 &&
+    ! grep -q "haveReg" ./statusline-watchdog.ps1 &&
+    ok "the orphan sweep still runs when there is no registration" ||
+    bad "the orphan sweep is gated on a registration existing"
+  # R177: the cache timestamp scan must reach the entry timestamp even
+  # behind many nested ones (64 nested rendered hot, 65 rendered cold).
+  grep -q "_off > 4096" ./statusline-command.sh &&
+    ok "the timestamp scan reaches past deeply nested keys" ||
+    bad "the timestamp scan gives up before the entry timestamp"
+  # R178: a joiner only swallows an actual emoji component - CJK and
+  # Devanagari use U+200D as an ordinary character and must keep their
+  # width.
+  zw34=$(printf 'a‍中b')
+  awk "/^disp_width\(\) \{/,/^}/" ./statusline-command.sh > "$tmpd/dw34.sh"
+  # the -c program has to be single-quoted: in double quotes the outer
+  # shell expands $REPLY (to nothing) before bash -c ever runs it
+  dw34=$(LC_ALL=C.UTF-8 bash -c '. "$1"; disp_width "$2"; echo "$REPLY"' _ "$tmpd/dw34.sh" "$zw34")
+  [ "${dw34:-0}" -eq 4 ] && ok "a joiner before CJK keeps both widths (${dw34} cells)" ||
+    bad "ZWJ+CJK mis-measured (${dw34} cells, want 4)"
   # ---- adversarial-review round-33 regression asserts (2026-08-18) ----
   # R162: the survivor retry was the only path that killed a renderer
   # with a bare pid. The child is a process-group leader, so its jq lived
@@ -1131,7 +1233,13 @@ sleep 300
   # R164: both WRITERS of the orphans list must apply the identity gate
   # its two readers already apply - the timeout path was registering a
   # pid the line above had just judged NOT to be a renderer.
-  [ "$(grep -c 'child_is_renderer' ./statusline-panel-daemon.sh)" -ge 6 ] &&
+  # CHECK THE TWO WRITERS, NOT A FILE-WIDE COUNT (round-34): there are
+  # ten call sites, so deleting either gate under test still left nine
+  # and the assertion passed - proven by mutation on the timeout path.
+  awk '/never exit while a render child is still running/,/^}/' ./statusline-panel-daemon.sh |
+    grep -q 'child_is_renderer "\$r_pid_pub"' &&
+    awk '/KEEP IT PUBLISHED FOR GOOD/,/orphans_save/' ./statusline-panel-daemon.sh |
+      grep -q 'child_is_renderer "\$r_pid"' &&
     ok "the orphans writers check identity too" || bad "an orphans writer still registers on liveness alone"
   # R165: a here-string whose content lands in 65536..65663 bytes fills
   # the cygwin pipe with no reader and blocks FOREVER. Measured byte by
@@ -1180,14 +1288,34 @@ d = json.load(io.open("fixtures/full.json", encoding="utf-8"))
 d["session_name"] = "abc MARK"
 io.open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(d).replace("MARK", BS + "ud83d"))
 SUR33
-  sur33=$(bash ./statusline-command.sh < "$tmpd/sur33.json" | strip | grep -c "degraded")
-  [ "${sur33:-1}" -eq 0 ] && ok "a lone surrogate cannot collapse the main bar" ||
-    bad "one surrogate escape still degrades the whole bar"
+  # A POSITIVE JUDGEMENT (round-34): grep -c returns 0 for empty input
+  # too, so "the bar printed nothing at all" - this project's worst
+  # outcome - scored the same as "the bar rendered fine". And without a
+  # non-empty check on the fixture, a missing python made the assertion
+  # pass while testing nothing. Require real lines AND no degrade line.
+  if [ -s "$tmpd/sur33.json" ]; then
+    sur33_out=$(bash ./statusline-command.sh < "$tmpd/sur33.json" | strip)
+    sur33_lines=$(printf '%s\n' "$sur33_out" | grep -c .)
+    case "$sur33_out" in
+      *degraded*) bad "one surrogate escape still degrades the whole bar" ;;
+      *) [ "${sur33_lines:-0}" -ge 3 ] &&
+           ok "a lone surrogate cannot collapse the main bar (${sur33_lines} lines)" ||
+           bad "the bar printed ${sur33_lines} lines on a lone-surrogate payload" ;;
+    esac
+  else
+    bad "the lone-surrogate fixture was not created (python missing?)"
+  fi
   # R168: the spend tier follows the two-decimal amount that is printed.
+  # ANCHOR THE COLOUR TO THE AMOUNT (round-34): a bare colour grep looks
+  # at the WHOLE bar, and 90 and 91 appear on every frame from unrelated
+  # segments - so three of the four probes were true no matter what the
+  # spend tier did. Proven by mutation: forcing every sub-$1 amount to
+  # bright red still passed. R149 carries this exact warning in its own
+  # comment; this assertion repeated the mistake it warns about.
   for _c33 in 0.51:90 4.51:33 5.00:91 0.99:90; do
     _cv="${_c33%%:*}"; _cc="${_c33##*:}"
     _co=$(jq -c --argjson v "$_cv" '.cost.total_cost_usd=$v' fixtures/full.json |
-      bash ./statusline-command.sh | grep -c "\[${_cc}m")
+      bash ./statusline-command.sh | grep -c "\[${_cc}m${_cv}")
     [ "${_co:-0}" -ge 1 ] || { bad "spend tier disagrees with the printed amount at $_cv"; break; }
   done
   [ "${_co:-0}" -ge 1 ] && ok "the spend tier matches the two-decimal amount"
@@ -1215,7 +1343,7 @@ SUR33
   # which made every healthy daemon older than 300s a target).
   grep -q 'hbFile' ./statusline-watchdog.ps1 &&
     ok "the watchdog reads the side-channel beat" || bad "the watchdog still judges on line 2 alone"
-  grep -q 'if ($haveReg)' ./statusline-watchdog.ps1 &&
+  grep -q 'if (-not $regUnreadable)' ./statusline-watchdog.ps1 &&
     grep -q 'STATUSLINE_PANEL_DIR' ./statusline-watchdog.ps1 &&
     ok "the watchdog honours the panel dir and needs a registration to sweep" ||
     bad "the watchdog can sweep with an empty exclusion set"
@@ -1718,10 +1846,22 @@ disp_width "$1"; echo "$REPLY"' _ "$zw31")
     bash ./subagent-statusline.sh | jq -r .id | grep -c '^t[123]')
   [ "${zs:-0}" -eq 3 ] && ok "a zero-padded trend sample cannot blank the panel" ||
     bad "octal trend sample discarded the panel (${zs:-0}/3 rows)"
-  printf 't1\x1f%s\x1f0189000,0190000,0191000\n' "$now" > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  # a FRESH stamp (round-34): $now is the suite start, and by the time
+  # this runs the row is old enough that the renderer appends another
+  # sample - which changes the chart away from the two equal bars this
+  # assertion uses to identify the trend row
+  printf 't1\x1f%s\x1f0189000,0190000,0191000\n' "$(date +%s)" > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  # THE SHAPE MUST COME FROM THE TREND FILE (round-34): the fixture task
+  # carries its own tokenSamples, which the renderer falls back to when
+  # the trend file yields nothing - so "a sparkline is present" was true
+  # even with the trend row silently discarded, which is the exact thing
+  # the assertion is named after. The two samples in the trend row differ
+  # by a constant, so they chart as two equal bars; the fixture fallback
+  # has five varying samples and cannot produce that.
   zsp=$(jq -c '.columns=140' fixtures/subagent-tasks.json |
-    bash ./subagent-statusline.sh | head -1 | grep -c '[▁▂▃▄▅▆]')
-  [ "${zsp:-0}" -eq 1 ] && ok "and it still charts, rather than silently dropping the trend" ||
+    bash ./subagent-statusline.sh | head -1 | jq -r .content | strip |
+    grep -c '▃▃')
+  [ "${zsp:-0}" -eq 1 ] && ok "and it still charts from the TREND row, not the fixture fallback" ||
     bad "a zero-padded sample lost its sparkline"
   : > "$STATUSLINE_SUBAGENT_TREND_FILE"
   # R116: the trend FILE's epoch column needs the same pair - it is
@@ -2000,6 +2140,10 @@ disp_width "$1"; echo "$REPLY"' _ "$zw31")
   kill -0 "$lr_c2" 2>/dev/null && lr_left=$(( lr_left + 1 ))
   [ "$lr_left" -eq 0 ] && ok "every pid on line 4 is reaped, not just a lone one" || bad "$lr_left of 2 listed render children survived"
   kill -9 "$lr_c1" "$lr_c2" "$lr_d" 2>/dev/null
+  # ...and their stub sleep children (round-34, see R40)
+  for _lrp in "$lr_c1" "$lr_c2" "$lr_d"; do
+    reap_children "$_lrp"
+  done
   rm -rf "$lr_dir"
   # R90: the survivor retry must sit BELOW the 5s heartbeat throttle -
   # above it, hb_beat's 0.3s cadence turned one survivor into a taskkill

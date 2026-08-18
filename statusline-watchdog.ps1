@@ -71,12 +71,15 @@ $hbFile  = Join-Path $panelDir 'hb'
 $regWpid = -1
 # 读不到注册时**不做任何孤儿回收**（第 33 轮）：排除集为空比漏杀危险得多，
 # 与本文件头注「失败方向永远是少管闲事」一致。
-$haveReg = $false
+$regUnreadable = $false
 if (Test-Path $pidFile) {
   $lines = @(Get-Content $pidFile -ErrorAction SilentlyContinue)
+  # 文件在、但形状不对 = 有注册者却认不出它 -> 本拍跳过孤儿回收
+  if (-not ($lines.Count -ge 3 -and $lines[1] -match '^\d+$' -and $lines[2] -match '^\d+$')) {
+    $regUnreadable = $true
+  }
   if ($lines.Count -ge 3 -and $lines[1] -match '^\d+$' -and $lines[2] -match '^\d+$') {
     $regWpid = [int]$lines[2]
-    $haveReg = $true
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $beat = [int64]$lines[1]
     # 旁路心跳同样算数（第 33 轮）：pid 文件第 2 行只能靠 tmp+mv 刷新，而
@@ -131,7 +134,7 @@ if (Test-Path $pidFile) {
 # is already generous. The registered one is excluded above and lives
 # up to its own lifetime cap untouched.
 $orphanCutoff = (Get-Date).AddSeconds(-300)
-if ($haveReg) {
+if (-not $regUnreadable) {
 Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
   Where-Object {
     $_.CommandLine -notmatch '\s-c\s' -and

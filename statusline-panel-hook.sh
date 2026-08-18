@@ -435,7 +435,18 @@ if [ "$daemon_alive" -eq 0 ]; then
   _sp_last=""
   [ -r "$panel_dir/spawning" ] && read -r _sp_last < "$panel_dir/spawning" 2>/dev/null
   [[ "$_sp_last" =~ ^[0-9]{1,13}$ ]] || _sp_last=0
-  if [ "$(( hook_now - 10#$_sp_last ))" -lt 120 ]; then
+  # 240s, NOT 120 (round-34): the 120 was derived from three forks,
+  # and the real path is five to seven - this hook may spend two
+  # taskkill execs in the REAP above before it even stamps the marker
+  # (so the stamp is already ~62s old when written), the spawn itself
+  # is two more, and the replacement ALWAYS takes the conflict path
+  # because nothing deletes the dead daemon pid file - two more again.
+  # At the ~31s per exec this project measures under fork exhaustion
+  # that is 155-217s, so the brake released 35-97s before the
+  # replacement could register and the next tick minted another one -
+  # which then loses the race, concedes, and leaves behind one more
+  # stale tick fifo for the startup sweep to pay for.
+  if [ "$(( hook_now - 10#$_sp_last ))" -lt 240 ]; then
     reap_failed=1   # reuse the "do not spawn" brake; the cache still serves
   fi
   # NEVER MINT A REPLACEMENT FOR SOMETHING WE COULD NOT KILL (round-17):

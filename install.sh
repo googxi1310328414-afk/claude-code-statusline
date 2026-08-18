@@ -152,9 +152,13 @@ if [ "$daemon_updated" -eq 1 ]; then
     esac
   fi
   if [ "$old_ok" -eq 1 ]; then
-    kill "$old_dp" 2>/dev/null && recycled=1
+    # 「已回收」必须指进程真的没了（第 34 轮）：原先只要 kill 系统调用成功就置位，
+    # 而卡在 cygwin DLL 里的实例正是 kill 返回 0 却纹丝不动的那一类——于是同一次
+    # 安装会既打印「✓ 旧面板 daemon 已回收」又打印「⚠ 杀不掉」，两句直接打架。
+    kill "$old_dp" 2>/dev/null
     sleep 1
     kill -9 "$old_dp" 2>/dev/null
+    kill -0 "$old_dp" 2>/dev/null || recycled=1
   fi
   # 第 4 行是它在途的渲染子进程（round-13）：daemon 被杀后它会变成孤儿
   # 继续跑并占着 tmp 名，而它的 pid 从外部无从推导——daemon 自己不是进程

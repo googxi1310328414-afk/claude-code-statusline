@@ -453,6 +453,13 @@ command -v jq >/dev/null 2>&1 || { printf '\e[0m\e[97m%(%H:%M:%S)T\e[0m | status
 # Padding out of the band costs nothing and keeps every read builtin.
 hs_pad() {   # $1 = variable NAME to pad; appends spaces if in the band
   local -n _hsv="$1"
+  # MEASURED IN BYTES, NOT CHARACTERS (round-34): the pipe that deadlocks
+  # holds BYTES, and ${#var} under this script's UTF-8 locale counts
+  # CHARACTERS - so round-33 read a 65600-BYTE CJK payload as 21942 and
+  # sailed straight past its own guard. Measured: that payload still hung
+  # the renderer for the full 25s timeout. `local LC_ALL=C` makes ${#var}
+  # count bytes for the duration of this function and costs no fork.
+  local LC_ALL=C
   local _hsl=${#_hsv}
   if [ "$_hsl" -ge 65536 ] && [ "$_hsl" -le 65663 ]; then
     local _hsp
@@ -1107,7 +1114,14 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
       # not-yet-folded case and the only direction that cannot inflate.
       # (Seeding from $3 alone was not enough: closed is added on top of
       # it, so the inheritance came straight back.)
-      dbase=$(( ${du_closed[$dkey]:-0} + $3 ))
+      # DEFERRED UNTIL AFTER THE SEGMENT UPDATE (round-34): computing
+      # it here reads du_closed BEFORE the state machine folds the
+      # current peak into it, so on any fold that CLOSES a segment
+      # (the arriving value is lower than the previous one) that whole
+      # peak escaped the baseline - and the invented figure is then
+      # written to the base column, where it becomes a KNOWN baseline
+      # for good. Resolved below, once closed and peak are final.
+      dbase="__DEFER__"
     else
       # the one case that legitimately wants 0: no rollup state at all,
       # seeding from whatever fine rows exist
@@ -1123,6 +1137,13 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
     du_peak[$dkey]=$3
   else
     [ "$3" -gt "${du_peak[$dkey]:-0}" ] && du_peak[$dkey]=$3
+  fi
+  # resolve a deferred baseline now that closed and peak are final:
+  # "everything observed up to this moment" makes the day contribute
+  # exactly 0 right now and grow only with spend actually watched
+  # happening, which is the only direction that cannot inflate
+  if [ "${du_base[$dkey]-}" = "__DEFER__" ]; then
+    du_base[$dkey]=$(( ${du_closed[$dkey]:-0} + ${du_peak[$dkey]:-0} ))
   fi
   du_prev[$dkey]=$3
   du_epoch[$dkey]=$1
@@ -1899,9 +1920,20 @@ disp_width() {
       zwj_skip=0
       if [ $(( i + 1 )) -lt "$len" ]; then
         nc="${s:i+1:1}"
-        if [[ "$nc" != [[:ascii:]] ]]; then
+        # AN EMOJI COMPONENT, NOT MERELY NON-ASCII (round-34): a joiner
+        # between two ordinary characters forms no ligature and the
+        # terminal draws both - which the note above already says - but
+        # "not ASCII" also matches CJK, Devanagari and every other
+        # script where U+200D is an ordinary character. Those were
+        # swallowed whole: a directory name holding one measured two
+        # cells short and shifted line 1 against the rest. Only an
+        # astral character (surrogate half) or a BMP codepoint inside
+        # the symbol blocks can actually be an emoji component.
+        printf -v ncp '%d' "'$nc" 2>/dev/null || ncp=0
+        if { [ "$ncp" -ge 55296 ] && [ "$ncp" -le 56319 ]; } ||
+           { [ "$ncp" -ge 8448 ]  && [ "$ncp" -le 11007 ]; } ||
+           { [ "$ncp" -ge 12800 ] && [ "$ncp" -le 13055 ]; }; then
           zwj_skip=1
-          printf -v ncp '%d' "'$nc" 2>/dev/null || ncp=0
           [ "$ncp" -ge 55296 ] && [ "$ncp" -le 56319 ] && zwj_skip=2
         fi
       fi
@@ -2749,7 +2781,12 @@ if [ "$COLUMNS" -ge 100 ] && [ -n "$transcript_path" ] && [ -f "$transcript_path
       while (match(_p, /"timestamp":"[^"]*"/)) {
         last = substr(_p, RSTART+13, RLENGTH-14)
         _p = substr(_p, RSTART+RLENGTH); _off++
-        if (_off > 64) break
+        # the entry timestamp is the LAST match on the line, so giving
+        # up early lands on a nested one - a model-written JSON document
+        # or a batched MCP call easily carries 65+ of them (measured: 64
+        # nested keys rendered hot, 65 rendered cold on the same
+        # payload). The cap is a runaway backstop only.
+        if (_off > 4096) break
       }
     }
     END { if (last != "") print "A" last }

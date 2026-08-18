@@ -313,6 +313,13 @@ strip_lone_surrogates() {   # $1 = payload -> REPLY
 # Padding out of the band costs nothing and keeps every read builtin.
 hs_pad() {   # $1 = variable NAME to pad; appends spaces if in the band
   local -n _hsv="$1"
+  # MEASURED IN BYTES, NOT CHARACTERS (round-34): the pipe that deadlocks
+  # holds BYTES, and ${#var} under this script's UTF-8 locale counts
+  # CHARACTERS - so round-33 read a 65600-BYTE CJK payload as 21942 and
+  # sailed straight past its own guard. Measured: that payload still hung
+  # the renderer for the full 25s timeout. `local LC_ALL=C` makes ${#var}
+  # count bytes for the duration of this function and costs no fork.
+  local LC_ALL=C
   local _hsl=${#_hsv}
   if [ "$_hsl" -ge 65536 ] && [ "$_hsl" -le 65663 ]; then
     local _hsp
@@ -450,9 +457,20 @@ disp_width() {
       zwj_skip=0
       if [ $(( i + 1 )) -lt "$len" ]; then
         nc="${s:i+1:1}"
-        if [[ "$nc" != [[:ascii:]] ]]; then
+        # AN EMOJI COMPONENT, NOT MERELY NON-ASCII (round-34): a joiner
+        # between two ordinary characters forms no ligature and the
+        # terminal draws both - which the note above already says - but
+        # "not ASCII" also matches CJK, Devanagari and every other
+        # script where U+200D is an ordinary character. Those were
+        # swallowed whole: a directory name holding one measured two
+        # cells short and shifted line 1 against the rest. Only an
+        # astral character (surrogate half) or a BMP codepoint inside
+        # the symbol blocks can actually be an emoji component.
+        printf -v ncp '%d' "'$nc" 2>/dev/null || ncp=0
+        if { [ "$ncp" -ge 55296 ] && [ "$ncp" -le 56319 ]; } ||
+           { [ "$ncp" -ge 8448 ]  && [ "$ncp" -le 11007 ]; } ||
+           { [ "$ncp" -ge 12800 ] && [ "$ncp" -le 13055 ]; }; then
           zwj_skip=1
-          printf -v ncp '%d' "'$nc" 2>/dev/null || ncp=0
           [ "$ncp" -ge 55296 ] && [ "$ncp" -le 56319 ] && zwj_skip=2
         fi
       fi
@@ -761,8 +779,14 @@ jq_all_out=${jq_all_out//$'\t'/$'\x1f'}
 # would land inside the last line, which is a task samples row. The
 # empty elements they create are removed again immediately, so the
 # row-count arithmetic below is unaffected.
-if [ "${#jq_all_out}" -ge 65536 ] && [ "${#jq_all_out}" -le 65663 ]; then
-  printf -v _jqpad '%*s' "$(( 65664 - ${#jq_all_out} ))" ''
+# BYTES HERE TOO (round-34): this is a hand-written copy of hs_pad and
+# carried the same character-vs-byte mistake - a CJK jq output lands in
+# the band by byte count while ${#var} reports a third of that, so the
+# mapfile below deadlocked exactly as before. Measured in a subshell so
+# the C locale cannot leak into the rest of the render.
+_jqbytes=$(LC_ALL=C; printf %s "${#jq_all_out}")
+if [ "$_jqbytes" -ge 65536 ] && [ "$_jqbytes" -le 65663 ]; then
+  printf -v _jqpad '%*s' "$(( 65664 - _jqbytes ))" ''
   jq_all_out="${jq_all_out}${_jqpad// /$'\n'}"
 fi
 mapfile -t JL <<< "$jq_all_out"
