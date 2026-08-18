@@ -297,6 +297,29 @@ strip_lone_surrogates() {   # $1 = payload -> REPLY
 # once, on a payload that was already unusable. The size ceiling keeps
 # even that bounded: beyond it, honest silence beats a 20-second frame.
 
+# HERE-STRINGS DEADLOCK IN A 128-BYTE BAND (round-33): this bash writes a
+# here-string through a PIPE when its content is small enough, and the
+# cygwin pipe holds 65536 bytes - so a here-string whose content is
+# 65536..65663 bytes long fills the pipe before any reader exists and the
+# write blocks FOREVER. Measured on this box, byte by byte: 65535 fine,
+# 65536 / 65600 / 65663 hang, 65664 fine (past that threshold bash uses a
+# temp file instead). Nothing in the pipeline recovers: the render child
+# never returns, the daemon kills it at the deadline, three such frames
+# blank the cache, and the panel sits on the host default rows. The hook's
+# own comments record payloads around 80KB that drift by a few bytes per
+# tick, so creeping through a 128-byte window - and staying inside it for
+# several consecutive frames - is an ordinary thing to happen.
+#
+# Padding out of the band costs nothing and keeps every read builtin.
+hs_pad() {   # $1 = variable NAME to pad; appends spaces if in the band
+  local -n _hsv="$1"
+  local _hsl=${#_hsv}
+  if [ "$_hsl" -ge 65536 ] && [ "$_hsl" -le 65663 ]; then
+    local _hsp
+    printf -v _hsp '%*s' "$(( 65664 - _hsl ))" ''
+    _hsv="${_hsv}${_hsp}"
+  fi
+}
 # jq guard: if jq is missing, every row below is unusable - emit nothing
 # useful is impossible in this contract (no id to key a line on), so just
 # exit cleanly rather than erroring or hanging.
@@ -689,16 +712,43 @@ jq_prog='
     )
 # #z")
 '
+# trailing spaces are JSON-insignificant, so padding the payload out of
+# the deadlock band cannot change what jq sees
+hs_pad input
 jq_all_out=$(jq -r "$jq_prog" <<< "$input" 2>/dev/null)
 # the repair path (see strip_lone_surrogates): only reached when jq
 # produced nothing at all, which for a well-formed payload never happens
 if [ -z "$jq_all_out" ]; then
   case "$input" in
     *\\u[dD]*)
-      if [ "${#input}" -le 65536 ]; then
+      # THE CEILING HAS TO BE ON THE COST DRIVER (round-33): the walk is
+      # O(backslashes x length), and round-32 capped only the length - so
+      # an ensure_ascii payload of CJK text, which is one backslash every
+      # six characters instead of the one-in-26 the ceiling was
+      # calibrated against, sailed straight through it. Measured inside
+      # the old 64KB ceiling: 33KB took 17s and 65KB took 59s, both past
+      # the daemon's 16s render deadline - so the frame is killed, three
+      # of those blank the cache, and the panel sits on the host default
+      # rows while the render child burns a core on every 5s tick. The
+      # backslash count is one parameter expansion to obtain and is the
+      # factor that actually drives the cost; 1200 of them measured about
+      # 2.5s here, which leaves the deadline a wide margin.
+      # COUNT BY DELETION, NOT BY A CHARACTER CLASS (round-33): the
+      # bracket form ${s//[!\\]/} matched nothing at all in this
+      # bash - it returned the string unchanged, so the count came out
+      # equal to the LENGTH and the ceiling below rejected every
+      # payload, silently disabling the repair this whole branch
+      # exists for. Deleting the backslashes and taking the length
+      # difference is unambiguous; verified against 0, 1, 2 and 3
+      # backslash strings.
+      _bsl=$'\134'   # one backslash, from its octal code
+      _bsnone="${input//"$_bsl"/}"
+      _bscount=$(( ${#input} - ${#_bsnone} ))
+      if [ "${#input}" -le 65536 ] && [ "$_bscount" -le 1200 ]; then
         strip_lone_surrogates "$input"
         if [ "$REPLY" != "$input" ]; then
           input="$REPLY"
+          hs_pad input
           jq_all_out=$(jq -r "$jq_prog" <<< "$input" 2>/dev/null)
         fi
       fi
@@ -707,7 +757,16 @@ if [ -z "$jq_all_out" ]; then
 fi
 jq_all_out=${jq_all_out//$'\r'/}
 jq_all_out=${jq_all_out//$'\t'/$'\x1f'}
+# same band, and here the padding has to be NEWLINES - trailing spaces
+# would land inside the last line, which is a task samples row. The
+# empty elements they create are removed again immediately, so the
+# row-count arithmetic below is unaffected.
+if [ "${#jq_all_out}" -ge 65536 ] && [ "${#jq_all_out}" -le 65663 ]; then
+  printf -v _jqpad '%*s' "$(( 65664 - ${#jq_all_out} ))" ''
+  jq_all_out="${jq_all_out}${_jqpad// /$'\n'}"
+fi
 mapfile -t JL <<< "$jq_all_out"
+while [ "${#JL[@]}" -gt 0 ] && [ -z "${JL[-1]}" ]; do unset "JL[-1]"; done
 columns="${JL[0]}"
 majority_model="${JL[1]}"
 total_tokens="${JL[2]}"
@@ -824,13 +883,18 @@ for ((ti=0; ti<task_count_total; ti++)); do
   # Field order matches the CANONICAL COLUMN ORDER comment above exactly.
   # IFS is the Unit Separator (0x1F), NOT tab - see that comment for why a
   # literal tab here would silently corrupt any row with an empty field.
-  IFS=$'\x1f' read -r id identity_plain task_type model effort status start_time token_count description <<< "${JL[$row_idx]}"
+  # a single row can reach the band too if one description is enormous;
+  # spaces land at the tail of the LAST field (the description), which is
+  # width-capped a few lines further down anyway
+  _row="${JL[$row_idx]}"
+  hs_pad _row
+  IFS=$'\x1f' read -r id identity_plain task_type model effort status start_time token_count description <<< "$_row"
   [ -z "$id" ] && continue
   # @tsv DECODE (adversarial review fix, 2026-08-14): undo the doubled
   # backslashes @tsv wrote (its only remaining escape after jq-side
   # clean) on the user-text fields - Windows paths in descriptions/names
   # rendered as C:\\Users\\... and were width-budgeted at the inflated
-  # length. Enum-shaped fields (status/effort/model id) can't carry
+  # length. Only STATUS skips it - that field is matched by a case enum and its text is never displayed (round-33 corrected this note, which still named effort and model as skipped while the code below has decoded them since round-32; leaving it said they can't carry
   # backslashes and skip the expansion.
   # NUMERIC MAGNITUDE CAPS (round-6, same discipline as the main bar):
   # bash arithmetic is int64, so an 18-19 digit tokenCount wrapped

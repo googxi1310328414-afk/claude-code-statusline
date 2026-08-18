@@ -28,6 +28,27 @@
 #                    it still holds OUR pid (a second instance's claim
 #                    is never deleted out from under it)
 #   daemon-err.log   stderr blackbox, self-rotated at ~500 lines
+#   hb               "owner epoch", rewritten with a pure-builtin
+#                    redirect either side of every exec (round-31/32).
+#                    The pid file line 2 can only be refreshed by a
+#                    tmp+mv, and under fork exhaustion that exec blocks
+#                    long enough for a HEALTHY daemon to look 131-162s
+#                    stale - every consumer of liveness (the hook, the
+#                    takeover gate, the watchdog) must take whichever of
+#                    the two beats is newer, and only when the owner
+#                    matches line 1.
+#   rpid             the in-flight render child, published the instant it
+#                    is spawned so it is reachable before the next mv
+#   orphans          survivors that even taskkill could not remove,
+#                    persisted so a later instance can keep retrying them
+#   spawning         epoch stamped by the HOOK before it spawns, zeroed by
+#                    the daemon once registered: stops every tick in the
+#                    ~93s registration window minting another daemon
+#                    (round-33 added these four - they are shared state
+#                    with the hook and the watchdog, and a reimplementation
+#                    working from the old list rebuilds the pre-round-31
+#                    behaviour: a healthy daemon killed about every other
+#                    tick under fork exhaustion)
 # <key> = first task id of the payload (see the hook's comment) - each
 # concurrent session gets its own spool/cache pair.
 #
@@ -536,7 +557,16 @@ quit_with_child() {
     # in flight, while the winning instance overwrites line 4 within one
     # beat. The one process nothing else can reach went invisible to all
     # four reclaim paths at exactly the moment it was created.
-    if kill -0 "$r_pid_pub" 2>/dev/null && [ -r "/proc/$r_pid_pub/winpid" ]; then
+    # THE WRITE SIDE NEEDS THE IDENTITY GATE TOO (round-33): both
+    # readers of this list (the startup load and the merge) confirm the
+    # pid is still a renderer, but the two writers only checked that it
+    # was alive - so a pid that had already been recycled onto some
+    # unrelated process was registered as a survivor and then group
+    # killed by the retry. On the timeout path the check immediately
+    # above has already judged it, and registering something it just
+    # judged NOT to be a renderer is the contradiction this closes.
+    if kill -0 "$r_pid_pub" 2>/dev/null && child_is_renderer "$r_pid_pub" &&
+       [ -r "/proc/$r_pid_pub/winpid" ]; then
       case " $r_orphans " in
         *" $r_pid_pub "*) : ;;
         *) r_orphans="${r_orphans}${r_orphans:+ }$r_pid_pub" ;;
@@ -617,8 +647,29 @@ hb_beat() {
     esac
     _keep=""
     if kill -0 "$_op" 2>/dev/null && child_is_renderer "$_op"; then
+      # KILL THE GROUP, LIKE EVERY OTHER PATH THAT KILLS A RENDERER
+      # (round-33): this was the only one sending a bare pid. The render
+      # child is started under `set -m`, so it IS a process-group leader
+      # and its jq lives in that group - a bare kill took the leader and
+      # left the jq running. Worse, the leader then failed the liveness
+      # test on the very next line, so the pid was dropped from r_orphans
+      # AND from the orphans file, and the surviving grandchild was left
+      # in no file at all: not line 4, not orphans, not rpid, and the
+      # watchdog only ever matches the daemon script name. Measured on
+      # an inherited survivor: "survivor: reaped by the retry" followed
+      # by "grandchild: STILL ALIVE". The other three paths -
+      # quit_with_child, the render deadline and the hook - have always
+      # sent the pair; this one now does too.
+      kill -- "-$_op" 2>/dev/null
+      kill -9 -- "-$_op" 2>/dev/null
       kill -9 "$_op" 2>/dev/null
-      if kill -0 "$_op" 2>/dev/null && [ -r "/proc/$_op/winpid" ]; then
+      # RE-CONFIRM BEFORE THE NATIVE KILL (round-33): the three other
+      # escalation sites check the cmdline again here, and the guide
+      # states it as a rule, because the kill above is exactly what frees
+      # the pid for reuse - reading a winpid out of whatever inherited it
+      # and handing that to taskkill //F is the 2026-08-13 mis-kill shape.
+      if kill -0 "$_op" 2>/dev/null && child_is_renderer "$_op" &&
+         [ -r "/proc/$_op/winpid" ]; then
         _owp=""
         read -r _owp < "/proc/$_op/winpid" 2>/dev/null
         [[ "$_owp" =~ ^[0-9]{1,10}$ ]] && command -v taskkill >/dev/null 2>&1 &&
@@ -808,10 +859,13 @@ while :; do
         # must stay reachable, so survivors accumulate in a list that
         # is published alongside the current child and retried on
         # every beat until they are really gone.
-        case " $r_orphans " in
-          *" $r_pid "*) : ;;
-          *) r_orphans="${r_orphans}${r_orphans:+ }$r_pid" ;;
-        esac
+        # ...and the same gate here (round-33)
+        if child_is_renderer "$r_pid"; then
+          case " $r_orphans " in
+            *" $r_pid "*) : ;;
+            *) r_orphans="${r_orphans}${r_orphans:+ }$r_pid" ;;
+          esac
+        fi
         # tracked in the list now - keeping it in r_pid_pub too would
         # publish the same pid twice on line 4 and leave it dangling
         # there long after the survivor list has pruned it (round-23)

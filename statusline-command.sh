@@ -413,6 +413,109 @@ input+="$slurp_chunk"
 # cleanly rather than emitting nothing or erroring.
 command -v jq >/dev/null 2>&1 || { printf '\e[0m\e[97m%(%H:%M:%S)T\e[0m | statusline: jq missing\n' -1; exit 0; }
 
+# DEFINED BEFORE THEIR FIRST USE (round-33): both helpers are called
+# by the jq extraction immediately below, and a definition further
+# down the file makes every one of those calls a "command not found"
+# whose failure is silent - the payload is neither padded out of the
+# here-string deadlock band nor repaired, which is precisely the two
+# things this round added them for.
+# True terminal DISPLAY width of a plain (no ANSI/OSC 8) string, in cells,
+# for column-alignment math - ${#s} alone is a character count, which
+# under-counts East Asian wide/fullwidth characters (2 cells each). Fast
+# path: pure-ASCII strings return ${#s} directly (cheap, covers the common
+# case). Otherwise walks characters (relies on LC_ALL=C.UTF-8 above so
+# ${s:i:1}/${#s} are character-, not byte-, based), looks up each
+# non-ASCII character's Unicode codepoint via printf's "'c" numeric-value
+# extension, and adds 2 for the standard wide/fullwidth ranges, else 1.
+# The glyphs this script uses on its own (▸ ● ✓ ✗ · → ⎇ Σ » █ ░ ▁-█ …) are
+# all deliberately counted as 1 cell here, matching how Windows Terminal's
+# default (non-East-Asian-ambiguous-wide) profile renders them - a
+# terminal configured for East-Asian ambiguous-wide would need those
+# bumped to 2 to match its own rendering.
+# NO-FORK RETURN via global REPLY (see cost_to_cents's comment above) -
+# this is the single most-called helper in the script (every segment's
+# plain-width measurement, every column-width computation), so
+# $(disp_width ...) forking a subshell per call was a major contributor
+# to the fork count; call sites now do `disp_width "$s"; w="$REPLY"`.
+# HERE-STRINGS DEADLOCK IN A 128-BYTE BAND (round-33, shared with the panel): this bash writes a
+# here-string through a PIPE when its content is small enough, and the
+# cygwin pipe holds 65536 bytes - so a here-string whose content is
+# 65536..65663 bytes long fills the pipe before any reader exists and the
+# write blocks FOREVER. Measured on this box, byte by byte: 65535 fine,
+# 65536 / 65600 / 65663 hang, 65664 fine (past that threshold bash uses a
+# temp file instead). Nothing in the pipeline recovers: the render child
+# never returns, the daemon kills it at the deadline, three such frames
+# blank the cache, and the panel sits on the host default rows. The hook's
+# own comments record payloads around 80KB that drift by a few bytes per
+# tick, so creeping through a 128-byte window - and staying inside it for
+# several consecutive frames - is an ordinary thing to happen.
+#
+# Padding out of the band costs nothing and keeps every read builtin.
+hs_pad() {   # $1 = variable NAME to pad; appends spaces if in the band
+  local -n _hsv="$1"
+  local _hsl=${#_hsv}
+  if [ "$_hsl" -ge 65536 ] && [ "$_hsl" -le 65663 ]; then
+    local _hsp
+    printf -v _hsp '%*s' "$(( 65664 - _hsl ))" ''
+    _hsv="${_hsv}${_hsp}"
+  fi
+}
+
+# THE SAME LONE-SURROGATE REPAIR THE PANEL HAS (round-33): both scripts
+# are fed by the SAME host, and a string field cut by UTF-16 units then
+# re-serialised carries a lone surrogate escape - which jq rejects in
+# its PARSER, before the program runs. In the panel that blanks the
+# rows; here the capture comes back empty, the shape check fails, and
+# the whole four-line bar collapses into "statusline: degraded (fork)" -
+# a diagnostic pointing squarely at fork exhaustion while the real cause
+# is one escape in the payload, repeating every frame for as long as the
+# session name carries it. Same discipline as the panel: this runs ONLY
+# after jq has actually refused, and only when the payload really
+# contains such an escape.
+strip_lone_surrogates() {   # $1 = payload -> REPLY
+  local rest="$1" out="" seg hex lo
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *\\*) : ;;
+      *) out+="$rest"; rest=""; break ;;
+    esac
+    seg="${rest%%\\*}"
+    out+="$seg"
+    rest="${rest:${#seg}+1}"        # drop the text and the backslash
+    case "$rest" in
+      # an escaped backslash consumes BOTH characters: emit them and move
+      # on, so text that merely talks about \uXXXX is never touched
+      \\*) out+='\\'; rest="${rest:1}"; continue ;;
+      [uU]*) : ;;
+      *) out+='\'; continue ;;
+    esac
+    hex="${rest:1:4}"
+    # a TRUNCATED escape is not ours to touch: `\ud8"` has no four hex
+    # digits, so consuming five characters would eat the closing quote
+    # and turn a payload that was already malformed into a different,
+    # more confusing kind of malformed. Leave it exactly as it arrived.
+    case "$hex" in
+      [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) : ;;
+      *) out+='\'; continue ;;
+    esac
+    case "$hex" in
+      [dD][89abAB]*)
+        lo="${rest:5:6}"
+        case "$lo" in
+          \\[uU][dD][c-fC-F]*)
+            out+="\\${rest:0:11}"   # a real pair: keep both halves
+            rest="${rest:11}"
+            ;;
+          *) rest="${rest:5}" ;;    # lone high surrogate: drop it
+        esac
+        ;;
+      [dD][c-fC-F]*) rest="${rest:5}" ;;   # lone low surrogate: drop it
+      *) out+="\\${rest:0:5}"; rest="${rest:5}" ;;
+    esac
+  done
+  REPLY="$out"
+}
+
 # PERF: one jq invocation for the whole script instead of one per field.
 # Every field is null-guarded with `// ""` (not `// empty`) so each always
 # emits exactly one line, keeping the fixed field order below intact for
@@ -421,7 +524,7 @@ command -v jq >/dev/null 2>&1 || { printf '\e[0m\e[97m%(%H:%M:%S)T\e[0m | status
 # split with a herestring `mapfile` - no `tr`/pipe/subshell spawn anywhere
 # in this step. The tokenSamples-equivalent concept doesn't exist in this
 # script; nothing else needs jq after this block.
-jq_main_out=$(jq -r '
+jq_main_prog='
   # clean: every STRING field is newline-sanitized IN JQ, because the
   # one-line-per-field protocol below is what positional mapfile mapping
   # rests on - a free-text field (session_name is AI-generated) carrying
@@ -494,7 +597,37 @@ jq_main_out=$(jq -r '
   (.transcript_path? // "" | clean),
   (.model?.id? // "" | clean),
   ("__END__")
-' <<< "$input" 2>/dev/null)
+'
+hs_pad input
+jq_main_out=$(jq -r "$jq_main_prog" <<< "$input" 2>/dev/null)
+# the repair retry (see strip_lone_surrogates): only when jq produced
+# nothing at all, and only for a payload that really carries such an
+# escape - a healthy frame never pays for this
+if [ -z "$jq_main_out" ]; then
+  case "$input" in
+    *\\u[dD]*)
+      # COUNT BY DELETION, NOT BY A CHARACTER CLASS (round-33): the
+      # bracket form ${s//[!\\]/} matched nothing at all in this
+      # bash - it returned the string unchanged, so the count came out
+      # equal to the LENGTH and the ceiling below rejected every
+      # payload, silently disabling the repair this whole branch
+      # exists for. Deleting the backslashes and taking the length
+      # difference is unambiguous; verified against 0, 1, 2 and 3
+      # backslash strings.
+      _bsl=$'\134'   # one backslash, from its octal code
+      _bsnone="${input//"$_bsl"/}"
+      _bscount=$(( ${#input} - ${#_bsnone} ))
+      if [ "${#input}" -le 65536 ] && [ "$_bscount" -le 1200 ]; then
+        strip_lone_surrogates "$input"
+        if [ "$REPLY" != "$input" ]; then
+          input="$REPLY"
+          hs_pad input
+          jq_main_out=$(jq -r "$jq_main_prog" <<< "$input" 2>/dev/null)
+        fi
+      fi
+      ;;
+  esac
+fi
 jq_main_out=${jq_main_out//$'\r'/}
 mapfile -t F <<< "$jq_main_out"
 
@@ -778,7 +911,7 @@ max_persisted_wm=0
 # install / deleted file). It is the ONLY state in which an unknown
 # session may be seeded at base 0 - see fold_daily_row's baseline note.
 daily_had_rows=0
-declare -A du_closed du_peak du_prev du_epoch du_base du_sidprev du_sidepoch
+declare -A du_closed du_peak du_prev du_epoch du_base du_sidprev du_sidepoch du_sidday
 declare -A du_watermark
 printf -v today_str '%(%Y%m%d)T' -1
 if [ -f "$daily_file" ]; then
@@ -896,6 +1029,9 @@ if [ -f "$daily_file" ]; then
        { [ "$d_prev" != "0" ] || [ "$d_peak" != "0" ] || [ "$d_closed" != "0" ]; }; then
       du_sidepoch[$d_sid]=$d_epoch
       du_sidprev[$d_sid]=$d_prev
+      # which DAY that newest row belongs to (round-33) - see the
+      # baseline seeding in fold_daily_row
+      du_sidday[$d_sid]=$d_day
     fi
     [ "$d_epoch" -gt "${du_watermark[$d_sid]:-0}" ] && du_watermark[$d_sid]=$d_epoch
     [ "$d_epoch" -gt "$max_persisted_wm" ] && max_persisted_wm=$d_epoch
@@ -946,13 +1082,37 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
   # wants base 0 - a machine with NO rollup state at all, seeding from
   # whatever fine rows exist - is kept explicitly.
   if [ -z "${du_base[$dkey]+x}" ]; then
-    dbase=${du_sidprev[$2]-}
-    if [ -z "$dbase" ]; then
-      if [ "$daily_had_rows" -eq 1 ]; then dbase=$3; else dbase=0; fi
+    # ONLY AN EARLIER DAY CAN BE A MIDNIGHT BASELINE (round-33):
+    # du_sidprev holds the newest prev for this SESSION across all days,
+    # and whenever we are folding into today the newest row IS today - so
+    # that value is the low-water mark of the current run segment, not
+    # last night's cumulative. Seeding from it turned the entire
+    # inherited carry-over already sitting in `closed` into today's
+    # spend: measured, a row that should read week $2.50 rendered week
+    # $50.50.
+    dbase=""
+    if [ -n "${du_sidprev[$2]-}" ] && [ "${du_sidday[$2]-}" != "$row_day" ]; then
+      dbase=${du_sidprev[$2]}
+      # a base above the seeded value means the counter reset (/clear)
+      # across the boundary - fall back to 0
+      [ "$dbase" -gt "$3" ] && dbase=0
+    elif [ "$daily_had_rows" -eq 1 ]; then
+      # NO USABLE BASELINE: START THE DAY AT ZERO FROM HERE (round-33).
+      # Everything observed so far - the closed segments AND the value
+      # arriving now - may contain money that was already spent before
+      # midnight, and nothing left on disk can separate the two. Seeding
+      # the baseline at "everything observed up to this moment" makes the
+      # day contribute 0 right now and grow only with spend we actually
+      # watch happen, which is the same promise round-32 made for the
+      # not-yet-folded case and the only direction that cannot inflate.
+      # (Seeding from $3 alone was not enough: closed is added on top of
+      # it, so the inheritance came straight back.)
+      dbase=$(( ${du_closed[$dkey]:-0} + $3 ))
+    else
+      # the one case that legitimately wants 0: no rollup state at all,
+      # seeding from whatever fine rows exist
+      dbase=0
     fi
-    # a base above the seeded value means the counter reset (/clear)
-    # across the boundary - fall back to 0
-    [ "$dbase" -gt "$3" ] && dbase=0
     du_base[$dkey]=$dbase
   fi
   if [ -z "$d_prev" ]; then
@@ -1689,24 +1849,7 @@ fmt_small_or_k() {
   fi
 }
 
-# True terminal DISPLAY width of a plain (no ANSI/OSC 8) string, in cells,
-# for column-alignment math - ${#s} alone is a character count, which
-# under-counts East Asian wide/fullwidth characters (2 cells each). Fast
-# path: pure-ASCII strings return ${#s} directly (cheap, covers the common
-# case). Otherwise walks characters (relies on LC_ALL=C.UTF-8 above so
-# ${s:i:1}/${#s} are character-, not byte-, based), looks up each
-# non-ASCII character's Unicode codepoint via printf's "'c" numeric-value
-# extension, and adds 2 for the standard wide/fullwidth ranges, else 1.
-# The glyphs this script uses on its own (▸ ● ✓ ✗ · → ⎇ Σ » █ ░ ▁-█ …) are
-# all deliberately counted as 1 cell here, matching how Windows Terminal's
-# default (non-East-Asian-ambiguous-wide) profile renders them - a
-# terminal configured for East-Asian ambiguous-wide would need those
-# bumped to 2 to match its own rendering.
-# NO-FORK RETURN via global REPLY (see cost_to_cents's comment above) -
-# this is the single most-called helper in the script (every segment's
-# plain-width measurement, every column-width computation), so
-# $(disp_width ...) forking a subshell per call was a major contributor
-# to the fork count; call sites now do `disp_width "$s"; w="$REPLY"`.
+
 disp_width() {
   local s="$1"
   if [[ "$s" != *[![:ascii:]]* ]]; then
@@ -2200,7 +2343,11 @@ bypass_plain=""
 # "⏵⏵ bypass permissions on" 横条覆盖同一信息。请勿作为"缺失损坏"恢复。)
 
 # 8. context battery bar: [!]<bar> N% [Xk/Yk]. remaining_int truncates the
-# fractional part (floor for a non-negative percentage), so the integer
+# fractional part (round-33 corrected this note: the value is ROUNDED the
+# way the percentage is printed, and the old wording also asserted a
+# reason - "so the integer comparisons match real-valued thresholds
+# exactly" - which is now false and would push the next reader straight
+# back to the split where 19.7 printed 20% and was coloured as 19), so the integer
 # comparisons below match real-valued thresholds exactly. "!" is prefixed
 # when remaining is below 20%. The bar is 5 cells; filled count is
 # remaining_int rounded to the nearest fifth via integer math
@@ -2588,7 +2735,23 @@ if [ "$COLUMNS" -ge 100 ] && [ -n "$transcript_path" ] && [ -f "$transcript_path
   # system entries and pass through whole for the N3 parser below.
   tail_scan=$(tail -c "$tail_bytes" -- "$transcript_path" 2>/dev/null | awk '
     /"subtype":"compact_boundary"/ && !/"isSidechain":true/ { print "C" $0; next }
-    /"type":"assistant"/ && !/"isSidechain":true/ && (/"cache_read_input_tokens": ?[1-9]/ || /"cache_creation_input_tokens": ?[1-9]/) && match($0, /"timestamp":"[^"]*"/) { last = substr($0, RSTART+13, RLENGTH-14) }
+    /"type":"assistant"/ && !/"isSidechain":true/ && (/"cache_read_input_tokens": ?[1-9]/ || /"cache_creation_input_tokens": ?[1-9]/) {
+      # THE ENTRY OWN TIMESTAMP IS THE LAST ONE ON THE LINE (round-33):
+      # taking the first match picked up any "timestamp" nested inside the
+      # message - a tool_use input carrying one is an ordinary MCP schema,
+      # and its quotes are NOT escaped, so it matches - and a value from
+      # 2020 made the cache look expired. Measured: the same payload
+      # rendered a green "hot" without the tool_use block and a grey
+      # "cold" with it, i.e. a fake reading of the one thing this segment
+      # exists to report. The timestamp of the entry itself is written last by
+      # this host, so scan to the end of the line.
+      _p = $0; _off = 0
+      while (match(_p, /"timestamp":"[^"]*"/)) {
+        last = substr(_p, RSTART+13, RLENGTH-14)
+        _p = substr(_p, RSTART+RLENGTH); _off++
+        if (_off > 64) break
+      }
+    }
     END { if (last != "") print "A" last }
   ' 2>/dev/null)
   tail_scan=${tail_scan//$'\r'/}
@@ -2755,7 +2918,15 @@ if [[ "$cost" =~ ^[0-9]{1,9}(\.[0-9]+)?$ ]]; then
   # YELLOW "$5.00" against the header's own ">= $5 is bright red" rule.
   # A session crossing $1 or $5 spends a few frames inside that band
   # every single time.
-  printf -v cost_int '%.0f' "$cost" 2>/dev/null || cost_int="${cost%%.*}"
+  # ROUND THE WAY THE TEXT IS PRINTED (round-33): round-32 fixed the
+  # percentages, whose text has NO decimals, and then applied the same
+  # %.0f to the spend - whose text has TWO. That made $0.51 a "1" and
+  # $4.51 a "5", so a bar reading $0.51 went yellow and one reading $4.51
+  # went bright red. The rule is "derive the tier from the figure the
+  # user sees", and the figure here is the 2-decimal one - so round to
+  # two decimals first, then take the integer part of THAT.
+  printf -v cost_disp '%.2f' "$cost" 2>/dev/null || cost_disp="$cost"
+  cost_int="${cost_disp%%.*}"
   cost_color="$GRAY"
   if [ "$cost_int" -ge 5 ]; then
     cost_color="$RED_BRIGHT"
@@ -3227,7 +3398,15 @@ if [ -f "$usage_cache_file" ]; then
         wk_plain="wk ${wk_model_parts_plain}"
       fi
       # extra usage (cents/100, 2dp): gray "extra " + white "$used/$limit"
+      # base 10 as well (round-33): this was the last arithmetic input in
+      # the file carrying a digit cap and no 10#. A zero-padded value
+      # renders silent fake money - 0250 came out as $1.68 against a
+      # true $2.50 - and one containing an 8 or a 9 fails arithmetic
+      # outright, which drops the whole extra-credit half and writes a
+      # line into the blackbox on every frame.
       if [ "$usage_extra_en" = "1" ] && [[ "$usage_extra_used" =~ ^[0-9]{1,12}$ ]] && [[ "$usage_extra_limit" =~ ^[0-9]{1,12}$ ]]; then
+        usage_extra_used=$(( 10#$usage_extra_used ))
+        usage_extra_limit=$(( 10#$usage_extra_limit ))
         printf -v extra_used_fmt '%d.%02d' "$(( usage_extra_used / 100 ))" "$(( usage_extra_used % 100 ))"
         printf -v extra_limit_fmt '%d.%02d' "$(( usage_extra_limit / 100 ))" "$(( usage_extra_limit % 100 ))"
         extra_seg="${GRAY}extra${RESET} ${WHITE}\$${extra_used_fmt}/\$${extra_limit_fmt}${RESET}"

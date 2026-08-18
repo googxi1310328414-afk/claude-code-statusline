@@ -42,7 +42,11 @@ $cutoff = (Get-Date).AddSeconds(-90)
 # /home/u/.claude/statusline-panel-daemon.sh` 旧式 True、新式 False，而
 # 真实的四种形态（裸路径 / 带引号 / 家目录含空格 / 带 --once）全部仍为 True。
 # 外壳（诊断命令、测试脚本、AI 代理自己的 bash）同样命中并被 -Force 杀掉。
-# 判据收窄为「bash 的参数位就是该脚本」：命令行以脚本名（可带引号）结尾，
+# 判据收窄为「bash 之后的第一个 argv 位就是该脚本」（第 33 轮订正这句：它原本
+# 写成「命令行以脚本名结尾」，那正是上面第 26-34 行判定必须废弃的尾锚——照它
+# 把过滤器改回 `-match '名\.sh$'` 会让 `bash <脚本> --once` 对全部回收路径
+# 隐身，改成 `-like '*名.sh'` 则退回「命令行提及脚本名」的模糊匹配，即
+# 2026-08-13/14 两次误杀事故的形态），
 # 且不含 ` -c `（-c 形态一律是外壳，真渲染永远是 `bash <script>`）。
 Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
   Where-Object {
@@ -53,13 +57,45 @@ Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 # ---- 面板 daemon：仅在「注册者心跳陈旧」时，按记录的 Windows pid 精确回收 ----
-$pidFile = Join-Path $env:USERPROFILE '.claude\statusline-panel.d\daemon.pid'
+# 面板目录必须跟随配置（第 33 轮）：daemon 写的是
+# ${STATUSLINE_PANEL_DIR:-$HOME/.claude/statusline-panel.d}，而这里写死
+# $env:USERPROFILE。两者在 MSYS2 的 db_home 配置下经常不同（install.sh 自己
+# 就用 cygpath -w "$HOME" 生成计划任务路径，等于承认这一点），一旦读不到，
+# $regWpid 停在 -1，而下面 300s 孤儿分支的排除条件是 -ne $regWpid——-1 不等于
+# 任何真实 pid，排除集变成空集，于是**注册在案、心跳新鲜、正在为用户渲染的
+# 健康 daemon** 每 2 分钟被 -Force 杀一次，寿命被硬钳在 5 分钟内。
+$panelDir = $env:STATUSLINE_PANEL_DIR
+if (-not $panelDir) { $panelDir = Join-Path $env:USERPROFILE '.claude\statusline-panel.d' }
+$pidFile = Join-Path $panelDir 'daemon.pid'
+$hbFile  = Join-Path $panelDir 'hb'
 $regWpid = -1
+# 读不到注册时**不做任何孤儿回收**（第 33 轮）：排除集为空比漏杀危险得多，
+# 与本文件头注「失败方向永远是少管闲事」一致。
+$haveReg = $false
 if (Test-Path $pidFile) {
   $lines = @(Get-Content $pidFile -ErrorAction SilentlyContinue)
   if ($lines.Count -ge 3 -and $lines[1] -match '^\d+$' -and $lines[2] -match '^\d+$') {
     $regWpid = [int]$lines[2]
-    $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$lines[1]
+    $haveReg = $true
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $beat = [int64]$lines[1]
+    # 旁路心跳同样算数（第 33 轮）：pid 文件第 2 行只能靠 tmp+mv 刷新，而
+    # daemon 头注自己实测过 fork 枯竭下健康实例也有「冷启 131s / 稳态 162s」
+    # 的陈旧期——第 31/32 轮为此加了纯内建写的 hb 旁路（内容是「owner epoch」），
+    # 钩子与 daemon 接管闸都已改成取两者较新者，唯独这条 180s 分支没跟上：
+    # 于是它会把一个正在正常出帧的 daemon 强杀并删注册，钩子下一拍读不到注册、
+    # 「回收失败绝不拉新」那条闸因为「没有可回收对象」而失效，照常拉新——
+    # 在已经没有 fork 的机器上每 2 分钟循环一次，永不收敛。
+    if (Test-Path $hbFile) {
+      $hbLine = (Get-Content $hbFile -First 1 -ErrorAction SilentlyContinue)
+      if ($hbLine -match '^(\d+)\s+(\d+)$') {
+        # 只有归属与第 1 行相符时才采信，否则一个残留文件就能替别人担保
+        if ($matches[1] -eq $lines[0] -and [int64]$matches[2] -gt $beat) {
+          $beat = [int64]$matches[2]
+        }
+      }
+    }
+    $age = $now - $beat
     if ($age -gt 180) {
       $wpid = [int]$lines[2]
       # 二次确认：该 Windows pid 现在确实是一个执行 daemon 脚本的 bash
@@ -95,6 +131,7 @@ if (Test-Path $pidFile) {
 # is already generous. The registered one is excluded above and lives
 # up to its own lifetime cap untouched.
 $orphanCutoff = (Get-Date).AddSeconds(-300)
+if ($haveReg) {
 Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
   Where-Object {
     $_.CommandLine -notmatch '\s-c\s' -and
@@ -103,3 +140,4 @@ Get-CimInstance Win32_Process -Filter "Name='bash.exe'" |
     $_.CreationDate -lt $orphanCutoff
   } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}

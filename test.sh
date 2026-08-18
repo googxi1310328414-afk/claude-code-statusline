@@ -7,7 +7,22 @@ export LC_ALL=C.UTF-8
 cd "$(dirname "$0")" || exit 1
 
 # 全程使用隔离历史文件——绝不触碰真实 ~/.claude/statusline-history.tsv
-export STATUSLINE_HISTORY_FILE="$(mktemp -u)/test-hist.tsv" 2>/dev/null || export STATUSLINE_HISTORY_FILE="/tmp/statusline-test-hist.$$"
+# THE FALLBACK HAS TO BE REACHABLE (round-33): this was written as
+#   export VAR="$(mktemp -u)/x" || export VAR=fallback
+# and `export` reports ITS OWN status, never the command substitution's,
+# so the fallback was dead code. With TMPDIR pointing at a file (or no
+# mktemp on PATH) the substitution yields nothing, VAR becomes
+# "/test-hist.tsv", every other state path is derived from its dirname,
+# and the EXIT trap below - rm -rf "$(dirname ...)" - becomes rm -rf "/",
+# which on MSYS is the whole Git Bash installation. Assign first, check
+# the value, and refuse anything that is not an absolute path at least
+# two levels deep.
+_tmpbase="$(mktemp -u 2>/dev/null)"
+case "$_tmpbase" in
+  /*/?*) : ;;
+  *) _tmpbase="/tmp/statusline-test.$$" ;;
+esac
+export STATUSLINE_HISTORY_FILE="$_tmpbase/test-hist.tsv"
 mkdir -p "$(dirname "$STATUSLINE_HISTORY_FILE")"
 export STATUSLINE_SUBAGENT_TREND_FILE="$(dirname "$STATUSLINE_HISTORY_FILE")/test-subtrend.tsv"
 export STATUSLINE_PANEL_DIR="$(dirname "$STATUSLINE_HISTORY_FILE")/panel.d"
@@ -98,6 +113,23 @@ subagent_payload() {  # 3 tasks: ms/s/none timestamps
     {id:"s",label:"秒探针",status:"completed",tokenCount:8000,startTime:($now-300),description:"d"},
     {id:"none",label:"无时间探针",status:"failed",tokenCount:3000,description:"d"}]}'
 }
+
+# NO REAL NETWORK, INCLUDING gh (round-33): the fixture carries repo
+# acme/webapp and PR 42, and the isolated CI cache is empty by
+# construction, so every render took the miss branch and made a real,
+# credentialed GitHub round trip - which also outlives the suite and
+# writes into a directory the EXIT trap has already deleted. A stub first
+# on PATH keeps `command -v gh` true, so the code path under test still
+# runs, while going nowhere. (Round-32 wrote this block and lost it to a
+# patch script that exited before saving; the assertion that was supposed
+# to guard it grepped test.sh for the stub's own variable name and
+# therefore matched itself. It now greps for the file the stub creates.)
+ghstub_dir="${_tmpbase}/ghstub"
+mkdir -p "$ghstub_dir" 2>/dev/null
+printf '#!/bin/bash\nexit 1\n' > "$ghstub_dir/gh" 2>/dev/null
+chmod +x "$ghstub_dir/gh" 2>/dev/null
+PATH="$ghstub_dir:$PATH"
+export PATH
 
 if [ "$1" = "--assert" ]; then
   fails=0
@@ -319,7 +351,14 @@ if [ "$1" = "--assert" ]; then
   while IFS= read -r _hl; do
     _he=${_hl%%$''*}
     [[ "$_he" =~ ^[0-9]+$ ]] || continue
-    [ "$_he" -le "$((now+60))" ] && [ "$_he" -ge "$((now-60))" ] && fresh_ok=1
+    # window centred on NOW, not on when the suite started (round-33):
+    # reaching this point costs ~30-50s of the 60s budget on this box, and
+    # the same render has been measured 2.5x slower under load - so the
+    # row this assertion just caused to be appended can fall outside a
+    # window anchored at startup, failing an assertion about code that is
+    # behaving perfectly.
+    _fnow=$(date +%s)
+    [ "$_he" -le "$((_fnow+60))" ] && [ "$_he" -ge "$((_fnow-180))" ] && fresh_ok=1
   done < "$STATUSLINE_HISTORY_FILE"
   [ "$fresh_ok" -eq 1 ] && ok "future-epoch row does not freeze sampling" || bad "clock rollback froze sampling"
   make_history "$now" "$STATUSLINE_HISTORY_FILE"
@@ -1074,6 +1113,112 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-33 regression asserts (2026-08-18) ----
+  # R162: the survivor retry was the only path that killed a renderer
+  # with a bare pid. The child is a process-group leader, so its jq lived
+  # on while the leader died - and the leader failing the liveness test
+  # then dropped the pid from every list, leaving the grandchild in no
+  # file at all.
+  awk "/SURVIVOR RETRY, ONE PER BEAT/,/^  fi$/" ./statusline-panel-daemon.sh |
+    grep -q 'kill -9 -- "-\$_op"' &&
+    ok "the survivor retry kills the process group" || bad "the retry still sends a bare pid"
+  # R163: and it was the only native escalation that did not re-confirm
+  # the cmdline first - the kill immediately above is exactly what frees
+  # the pid for reuse.
+  awk "/SURVIVOR RETRY, ONE PER BEAT/,/^  fi$/" ./statusline-panel-daemon.sh |
+    grep -q 'child_is_renderer "\$_op" &&' &&
+    ok "the retry re-confirms identity before taskkill" || bad "native escalation without a fresh identity check"
+  # R164: both WRITERS of the orphans list must apply the identity gate
+  # its two readers already apply - the timeout path was registering a
+  # pid the line above had just judged NOT to be a renderer.
+  [ "$(grep -c 'child_is_renderer' ./statusline-panel-daemon.sh)" -ge 6 ] &&
+    ok "the orphans writers check identity too" || bad "an orphans writer still registers on liveness alone"
+  # R165: a here-string whose content lands in 65536..65663 bytes fills
+  # the cygwin pipe with no reader and blocks FOREVER. Measured byte by
+  # byte on this box: 65535 fine, 65536/65600/65663 hang, 65664 fine.
+  # The panel feeds three here-strings that size (the payload, the jq
+  # output, and one row), and the hook records payloads near 80KB that
+  # drift a few bytes per tick - so creeping through a 128-byte window is
+  # ordinary, and each frame inside it costs the full render deadline.
+  grep -q 'hs_pad' ./subagent-statusline.sh && grep -q 'hs_pad' ./statusline-command.sh &&
+    ok "both scripts pad out of the here-string deadlock band" || bad "a here-string can still deadlock"
+  for _hb33 in 65536 65600 65663; do
+    python - "$_hb33" "$tmpd/hs33.json" <<'HS33'
+import io, json, sys
+n = int(sys.argv[1])
+d = {"columns": 120, "tasks": [{"id": "t1", "name": "a", "status": "running",
+     "tokenCount": 100, "description": "d"}]}
+while len(json.dumps(d)) < n:
+    d["tasks"][0]["description"] += "x"
+while len(json.dumps(d)) > n:
+    d["tasks"][0]["description"] = d["tasks"][0]["description"][:-1]
+io.open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(d))
+HS33
+    : > "$STATUSLINE_SUBAGENT_TREND_FILE"
+    _hr33=$(timeout 20 bash ./subagent-statusline.sh < "$tmpd/hs33.json" | jq -r .id 2>/dev/null | grep -c "^t1")
+    [ "${_hr33:-0}" -eq 1 ] || { bad "a ${_hb33}-byte payload hung the renderer"; break; }
+  done
+  [ "${_hr33:-0}" -eq 1 ] && ok "payloads inside the here-string band still render"
+  # R166: the repair ceiling must bound the COST DRIVER. Round-32 capped
+  # only the length, and an ensure_ascii payload is one backslash every
+  # six characters instead of one in 26 - 65KB inside that ceiling
+  # measured 59s, well past the render deadline.
+  grep -q '_bscount' ./subagent-statusline.sh &&
+    ok "the repair ceiling counts backslashes" || bad "the repair is still capped on length alone"
+  # ...and the count itself must WORK: the bracket-class form matched
+  # nothing in this bash, which made the count equal the length and
+  # silently disabled the repair entirely.
+  awk "/_bscount=/{print}" ./subagent-statusline.sh | grep -q '#input} - ${#_bsnone}' &&
+    ok "the backslash count is computed by deletion" || bad "backslash count uses the class form that matches nothing"
+  # R167: the main bar needs the same lone-surrogate repair as the panel -
+  # they are fed by the same host, and without it one escape collapses the
+  # whole bar into a "degraded (fork)" line that blames the wrong thing.
+  python - "$tmpd/sur33.json" <<'SUR33'
+import io, json, sys
+BS = chr(92)
+d = json.load(io.open("fixtures/full.json", encoding="utf-8"))
+d["session_name"] = "abc MARK"
+io.open(sys.argv[1], "w", encoding="utf-8").write(json.dumps(d).replace("MARK", BS + "ud83d"))
+SUR33
+  sur33=$(bash ./statusline-command.sh < "$tmpd/sur33.json" | strip | grep -c "degraded")
+  [ "${sur33:-1}" -eq 0 ] && ok "a lone surrogate cannot collapse the main bar" ||
+    bad "one surrogate escape still degrades the whole bar"
+  # R168: the spend tier follows the two-decimal amount that is printed.
+  for _c33 in 0.51:90 4.51:33 5.00:91 0.99:90; do
+    _cv="${_c33%%:*}"; _cc="${_c33##*:}"
+    _co=$(jq -c --argjson v "$_cv" '.cost.total_cost_usd=$v' fixtures/full.json |
+      bash ./statusline-command.sh | grep -c "\[${_cc}m")
+    [ "${_co:-0}" -ge 1 ] || { bad "spend tier disagrees with the printed amount at $_cv"; break; }
+  done
+  [ "${_co:-0}" -ge 1 ] && ok "the spend tier matches the two-decimal amount"
+  # R169: an unknown baseline may not be re-seeded from a value belonging
+  # to the SAME day - that is the current run segment low-water mark, not
+  # a midnight baseline, and closed already carries the inheritance.
+  : > "$STATUSLINE_DAILY_FILE"
+  printf '%s\x1fabc\x1f5000\x1f100\x1f100\x1f%s\x1f\n' "$(date +%Y%m%d)" "$((now-3600))" > "$STATUSLINE_DAILY_FILE"
+  fb33=$(jq -c '.session_id="abc" | .cost.total_cost_usd=1.50' fixtures/full.json | bash ./statusline-command.sh | strip)
+  case "$fb33" in
+    *'$50.'*|*'$51.'*) bad "the fold re-seeded a baseline from the same day ($fb33)" ;;
+    *) ok "the fold will not invent a baseline from today" ;;
+  esac
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R170: the cache-freshness scan must take the LAST timestamp on the
+  # line - a tool_use input carrying one is an ordinary MCP schema, and
+  # its quotes are not escaped, so the first match was a tool argument.
+  grep -q 'while (match(_p,' ./statusline-command.sh &&
+    ok "the cache scan takes the entry timestamp, not a nested one" ||
+    bad "the cache scan still takes the first timestamp on the line"
+  # R171: the watchdog judges liveness on the same two beats everyone
+  # else does, and refuses to sweep orphans when it cannot read the
+  # registration (an unreadable pid file left the exclusion set empty,
+  # which made every healthy daemon older than 300s a target).
+  grep -q 'hbFile' ./statusline-watchdog.ps1 &&
+    ok "the watchdog reads the side-channel beat" || bad "the watchdog still judges on line 2 alone"
+  grep -q 'if ($haveReg)' ./statusline-watchdog.ps1 &&
+    grep -q 'STATUSLINE_PANEL_DIR' ./statusline-watchdog.ps1 &&
+    ok "the watchdog honours the panel dir and needs a registration to sweep" ||
+    bad "the watchdog can sweep with an empty exclusion set"
   # ---- adversarial-review round-32 regression asserts (2026-08-18) ----
   # R152: round-31 inserted a heartbeat between the `&&` and the mv that
   # publishes a frame. `&&` binds to ONE command, so the publish became
@@ -1155,7 +1300,8 @@ sleep 300
   # the only call site must sit inside the "jq produced nothing" branch,
   # and there must be exactly one of them
   [ "$(grep -c 'strip_lone_surrogates "\$input"' ./subagent-statusline.sh)" -eq 1 ] &&
-    grep -B 6 'strip_lone_surrogates "\$input"' ./subagent-statusline.sh | grep -q 'jq_all_out' &&
+    awk '/if \[ -z "\$jq_all_out" \]; then/,/^fi$/' ./subagent-statusline.sh |
+      grep -q 'strip_lone_surrogates' &&
     ok "the surrogate repair runs only after jq refuses" || bad "the repair still runs on every payload"
   : > "$STATUSLINE_SUBAGENT_TREND_FILE"
   perf32a=$EPOCHREALTIME
@@ -1178,7 +1324,10 @@ sleep 300
   [ "${c32a:-0}" -ge 1 ] && [ "${c32b:-0}" -ge 1 ] &&
     ok "the spend tier matches the printed amount" || bad "4.996 and 5.00 render the same text in different colours"
   # R161: the suite must not reach the real GitHub.
-  grep -q 'ghstub_dir' ./test.sh && ok "the suite stubs gh out" || bad "the suite can still call the real gh"
+  # the STUB ITSELF must exist and be first on PATH - grepping this file
+  # for the variable name matched the assertion's own source line
+  [ -x "$ghstub_dir/gh" ] && [ "$(command -v gh)" = "$ghstub_dir/gh" ] &&
+    ok "the suite stubs gh out" || bad "the suite can still call the real gh"
   # ---- adversarial-review round-31 regression asserts (2026-08-18) ----
   # R141: the lone-surrogate strip was eight blind glob deletions, which
   # cut six bytes out of anything that merely LOOKED like an escape. Text
@@ -1333,10 +1482,16 @@ SHARE31
   done
   [ "${_po:-0}" -ge 1 ] && ok "the percentage tier matches the rendered figure"
   # R150: padding may never push a line past the terminal
+  # COMPARE AGAINST THE ACTUAL TERMINAL (round-33): this measured bytes
+  # against 140 for a 100-column terminal - 40 cells of slack, enough that
+  # reverting the fix under test still passed at 108 cells - and treated an
+  # empty render as success, because awk prints 0 when nothing matches.
   w31=$(jq -c '.workspace.current_dir="C:/Users/Administrator/dev/claude-code-statusline/packages/statusline-renderer"' fixtures/full.json |
-    COLUMNS=100 bash ./statusline-command.sh | strip | awk '{ if (length($0) > m) m = length($0) } END { print m+0 }')
-  [ "${w31:-999}" -le 140 ] && ok "the grid stays inside a 100-column terminal (${w31} bytes)" ||
-    bad "padding overflowed a 100-column terminal (${w31} bytes)"
+    COLUMNS=100 bash ./statusline-command.sh | strip |
+    LC_ALL=C.UTF-8 awk '{ n = length($0); if (n > m) m = n } END { print m+0 }')
+  [ "${w31:-0}" -ge 20 ] && [ "${w31:-999}" -le 100 ] &&
+    ok "the grid stays inside a 100-column terminal (${w31} cells)" ||
+    bad "padding overflowed a 100-column terminal (${w31} cells, limit 100)"
   # R151: a zero-width joiner followed by an ASCII character must not
   # steal a cell from the next wide character
   zw31=$(printf 'a\u200db\u4e2dc')
@@ -1378,10 +1533,15 @@ disp_width "$1"; echo "$REPLY"' _ "$zw31")
   # and the next settle writes that inflated figure into an _agg row
   printf '%s\x1fSB\x1f0\x1f1000\x1f1000\x1f%s\x1fabc\n' "$(date +%Y%m%d)" "$((now-100))" > "$STATUSLINE_DAILY_FILE"
   bs30=$(jq -c '.session_id="SB" | .cost.total_cost_usd=15.00' fixtures/full.json | bash ./statusline-command.sh | strip)
+  # round-33: an unknown baseline now contributes NOTHING rather than
+  # `closed` - closed carries the inherited cross-midnight cumulative
+  # too, so the round-32 expectation of \$5.xx was itself an
+  # over-count. The only wrong answers are the gross figure and any
+  # value that books closed.
   case "$bs30" in
     *'today $15.'*) bad "an illegal base column was treated as a known zero ($bs30)" ;;
-    *'today $5.'*) ok "an illegal base column is an unknown baseline, not zero" ;;
-    *) bad "today segment absent or unexpected ($bs30)" ;;
+    *'today $5.'*) bad "an illegal base column still booked closed as spend ($bs30)" ;;
+    *) ok "an illegal base column books nothing at all" ;;
   esac
   : > "$STATUSLINE_DAILY_FILE"
   # R125: a line's LAST cell is never padded by render_line, so folding it
