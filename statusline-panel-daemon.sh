@@ -151,7 +151,25 @@ hb_file="$panel_dir/hb"
 # alive to the hook - which would suppress the reap of a genuinely
 # wedged daemon, the exact opposite of the point. The reader accepts
 # the value only when the owner matches line 1 of the pid file.
+# ONLY THE REGISTERED INSTANCE MAY STAMP IT (round-32): the file is
+# shared by every instance in this panel directory, and round-31 wrote
+# it unconditionally - including from instances that are about to lose
+# the noclobber race and exit, from a conceding instance, and from every
+# --once test run. One such write replaces the owner, the hook then sees
+# a beat that does not belong to the pid it is judging, discards it, and
+# falls back to line 2 of the pid file - which under fork exhaustion is
+# exactly the 131-162s stale value this side channel exists to route
+# around. So a single write from an instance that never registers undoes
+# the whole round-31 fix and the hook kills a healthy daemon.
+#
+# hb_own is set to $$ only once this process holds the registration;
+# until then the beat is written to nothing.
+hb_own=0
+# clears the hook's "spawn in flight" brake once we are real (round-31,
+# actually called from round-32)
+spawn_clear() { echo 0 > "$panel_dir/spawning" 2>/dev/null; }   # builtin, zero fork
 hb_touch() {   # ZERO FORK: printf -v and > are both builtins
+  [ "$hb_own" -eq 1 ] || return 0
   printf -v _ht '%(%s)T' -1
   printf '%s %s\n' "$$" "$_ht" > "$hb_file" 2>/dev/null
 }
@@ -165,7 +183,14 @@ hb_touch() {   # ZERO FORK: printf -v and > are both builtins
 # line-4 mechanism exists to prevent. Published here the instant it is
 # spawned, for free.
 rpid_file="$panel_dir/rpid"
+# ...and the same ownership gate (round-32): any second instance -
+# including every --once run - published an empty line here after each
+# key it rendered, wiping the registered daemon's pointer to its own
+# in-flight child. That child is then outside line 4, outside orphans
+# and outside this file: the unkillable renderer round-31 added rpid to
+# prevent, recreated by the file being shared without an owner.
 rpid_publish() {   # ZERO FORK
+  [ "$hb_own" -eq 1 ] || return 0
   printf '%s\n' "$1" > "$rpid_file" 2>/dev/null
 }
 
@@ -194,17 +219,31 @@ rpid_publish() {   # ZERO FORK
 # (missing/old-format heartbeat counts as stale -> smooth migration).
 if [ "$once" -eq 0 ]; then
   printf -v hb_now '%(%s)T' -1
-  hb_touch   # before ANY exec on the startup path (round-31)
-  # clear the hook's "spawn in flight" brake as soon as we are real
-  spawn_clear() { echo 0 > "$panel_dir/spawning" 2>/dev/null; }   # builtin, zero fork
   if ! ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_now" "$daemon_winpid" "" > "$panel_dir/daemon.pid" ) 2>/dev/null; then
     holder=""
     holder_hb=""
     [ -r "$panel_dir/daemon.pid" ] && { read -r holder; read -r holder_hb; } < "$panel_dir/daemon.pid"
+    # THE TAKEOVER GATE READS THE SIDE CHANNEL TOO (round-32): this
+    # judgement and the hook's are meant to be the same judgement - the
+    # file header says so - but round-31 upgraded only the hook. Left on
+    # line 2 alone, this gate evicts a REGISTERED, HEALTHY holder
+    # whenever line 2 is stale, and line 2 being stale under fork
+    # exhaustion is precisely the measured condition (131s cold, 162s
+    # steady) that the side channel was added for. The evicted holder
+    # concedes on its next beat and takes its in-flight render child
+    # with it, which under fork exhaustion is how a survivor is minted.
+    holder_hb2o=""
+    holder_hb2=""
+    [ -r "$hb_file" ] && read -r holder_hb2o holder_hb2 < "$hb_file" 2>/dev/null
+    [ "$holder_hb2o" = "$holder" ] && [[ "$holder_hb2" =~ ^[0-9]{1,13}$ ]] || holder_hb2=""
     holder_fresh=0
     if [[ "$holder_hb" =~ ^[0-9]+$ ]]; then
       hb_age=$(( hb_now - holder_hb ))
       [ "$hb_age" -ge -60 ] && [ "$hb_age" -le 60 ] && holder_fresh=1
+    fi
+    if [ -n "$holder_hb2" ]; then
+      hb_age2=$(( hb_now - 10#$holder_hb2 ))
+      [ "$hb_age2" -ge -60 ] && [ "$hb_age2" -le 60 ] && holder_fresh=1
     fi
     if [ -n "$holder" ] && [ "$holder" != "$$" ] && [ "$holder_fresh" -eq 1 ] && kill -0 "$holder" 2>/dev/null; then
       exit 0
@@ -216,6 +255,18 @@ if [ "$once" -eq 0 ]; then
     rm -f "$panel_dir/daemon.pid" 2>/dev/null
     ( set -C; printf '%s\n%s\n%s\n%s\n' "$$" "$hb_now" "$daemon_winpid" "" > "$panel_dir/daemon.pid" ) 2>/dev/null || exit 0
   fi
+  # THE REGISTRATION IS OURS FROM HERE (round-32): hb_touch and
+  # rpid_publish are no-ops until this flag is set, so that an instance
+  # which never registers cannot stamp the shared files (see their
+  # comments). This is also the moment the hook's "spawn in flight"
+  # brake must be released - round-31 defined spawn_clear and then never
+  # called it, so the brake stayed on for its full 120s and any daemon
+  # that died inside that window (conceded, reaped, or simply hit the
+  # 60s MAX_LIFE floor) left the panel on the host default rows until it
+  # expired. With MAX_LIFE at its floor that is half the time.
+  hb_own=1
+  spawn_clear
+  hb_touch
   # startup housekeeping: orphaned in-flight claims from a crashed
   # predecessor, caches nothing has touched for a day, and orphaned
   # per-PID tmp files a killed hook/daemon left behind (age-gated so a
@@ -791,12 +842,24 @@ while :; do
       mapfile -t _rows < "$raw_tmp" 2>/dev/null
       : > "$raw_tmp" 2>/dev/null
       printf -v _cache_ep '%(%s)T' -1
-      { printf '%s
+      if { printf '%s
 ' "$_cache_ep"; printf '%s
-' "${_rows[@]}"; } > "$cache_tmp" 2>/dev/null &&
+' "${_rows[@]}"; } > "$cache_tmp" 2>/dev/null; then
+        # THE PUBLISH IS STILL GUARDED (round-32): round-31 inserted a
+        # beat between the `&&` and the mv, and `&&` binds to exactly one
+        # command - so the mv became unconditional while the indentation
+        # went on looking like a chain. A write that failed halfway (disk
+        # full, quota, the directory turned read-only, an AV lock) then
+        # published a TRUNCATED frame: first line an epoch, last line half
+        # a JSON row, which the hook hands to the host as a real row. And
+        # because this branch sets frame_bad=0 and clears bad_streak, the
+        # "three bad frames blank the cache" degradation never fires -
+        # only the 60s staleness gate eventually catches it. Written as an
+        # `if` so a checkpoint can never silently escape the guard again.
         hb_touch
         mv -f "$cache_tmp" "$panel_dir/cache.$key" 2>/dev/null
         hb_touch
+      fi
       bad_streak[$key]=0
     else
       : > "$raw_tmp" 2>/dev/null

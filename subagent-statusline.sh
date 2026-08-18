@@ -276,9 +276,26 @@ strip_lone_surrogates() {   # $1 = payload -> REPLY
   REPLY="$out"
 }
 
-case "$input" in
-  *\\u[dD]*) strip_lone_surrogates "$input"; input="$REPLY" ;;
-esac
+# ...AND ONLY WHEN JQ ACTUALLY REFUSES THE PAYLOAD (round-32): the walk
+# is O(backslashes x length) - it rescans the remainder for every
+# backslash it passes - and round-31 ran it on EVERY payload containing
+# the two characters that introduce a surrogate escape. Any ensure_ascii
+# serialiser (Python json.dumps by default, Jackson with
+# ESCAPE_NON_ASCII - both named in the note above as ordinary things to
+# find between a host and this hook) emits one backslash per non-ASCII
+# character, so a CJK-heavy payload grows both factors together.
+# Measured here: 6.9KB/636 backslashes cost 660ms, 16.7KB/1272 cost
+# 2.2s, and 66KB/2544 cost 21.7s - past the daemon's 15s render
+# deadline, so the frame is killed, three of those blank the cache, and
+# the panel falls back to the host default rows for as long as the host
+# keeps sending it. That is the exact outcome this function exists to
+# prevent, reached through CPU instead of a parse error.
+#
+# jq accepts every shape that does not actually need repairing - a
+# PAIRED surrogate, and text that merely contains the characters - so
+# the healthy path now pays nothing at all, and the walk runs at most
+# once, on a payload that was already unusable. The size ceiling keeps
+# even that bounded: beyond it, honest silence beats a 20-second frame.
 
 # jq guard: if jq is missing, every row below is unusable - emit nothing
 # useful is impossible in this contract (no id to key a line on), so just
@@ -351,21 +368,77 @@ short_model() {
 # description-cut loop); $(disp_width ...) forked a subshell PER CALL on
 # MSYS2 even though the function is pure bash, which for a long
 # description could mean dozens of forks for ONE cell of ONE row.
+# WIDTH TABLE AND ZERO-WIDTH HANDLING KEPT IDENTICAL TO THE MAIN BAR
+# (round-32): this copy never received round-30's EAW=Wide ranges below
+# U+1F300 or round-31's joiner work, so the panel measured a check mark,
+# a cross, a lightning bolt or a sparkle as ONE cell while the terminal
+# drew two - a description of forty check marks came out 24 cells over
+# its budget and wrapped, taking every row below it out of position - and
+# a joined emoji in an agent name measured 5 or 8 cells against a drawn 2,
+# which both broke that row's separator alignment and shrank the ONE
+# panel-wide description budget for every other row. The two files are
+# now byte-identical here; keep them that way.
 disp_width() {
   local s="$1"
   if [[ "$s" != *[![:ascii:]]* ]]; then
     REPLY="${#s}"
     return
   fi
-  local len=${#s} i c cp w total=0
+  local len=${#s} i c nc cp ncp w total=0 zwj_skip=0
   for ((i=0; i<len; i++)); do
     c="${s:i:1}"
+    # THE PENDING-SKIP CHECK COMES FIRST (round-31): it used to sit
+    # below the ASCII fast path, which returns early - so when a joiner
+    # was followed by an ASCII character, that character was charged a
+    # full cell AND left the skip unconsumed. The stale credit then hit
+    # whatever wide character came next and zeroed it: measured
+    # disp_width on a CJK-joiner-ASCII-CJK string returned 7 against a
+    # true 9, and the line 1 separator landed two columns off the other
+    # three lines - the same misalignment the joiner handling was added
+    # to fix, entered through the other door.
+    if [ "$zwj_skip" -gt 0 ]; then
+      zwj_skip=$(( zwj_skip - 1 ))
+      continue
+    fi
     if [[ "$c" == [[:ascii:]] ]]; then
       total=$(( total + 1 ))
       continue
     fi
     printf -v cp '%d' "'$c"
     w=1
+    # ZERO-WIDTH JOINERS AND THE COMPONENT AFTER THEM (round-30): a ZWJ
+    # sequence draws as ONE glyph, but this loop charged full width for
+    # every component plus one for each joiner and variation selector -
+    # a two-person family emoji measured 5 cells against the 2 the
+    # terminal draws, and everything after it on that line shifted
+    # against the other three lines. Variation selectors and combining
+    # marks are zero-width for the same reason.
+    if [ "$cp" -eq 8205 ]; then
+      # the joiner is zero-width AND so is the glyph it joins; an astral
+      # partner occupies TWO of this shell's string units, so look ahead
+      # once to find out how many to swallow (this runs only on the rare
+      # frame that actually contains a joined emoji)
+      # ...but ONLY when it actually joins something (round-31): a
+      # joiner between two ordinary characters forms no ligature -
+      # terminals draw both - so swallowing the next character
+      # regardless under-counted every such string by one cell.
+      # An ASCII character is never an emoji component, which is
+      # the cheap and correct discriminator here.
+      zwj_skip=0
+      if [ $(( i + 1 )) -lt "$len" ]; then
+        nc="${s:i+1:1}"
+        if [[ "$nc" != [[:ascii:]] ]]; then
+          zwj_skip=1
+          printf -v ncp '%d' "'$nc" 2>/dev/null || ncp=0
+          [ "$ncp" -ge 55296 ] && [ "$ncp" -le 56319 ] && zwj_skip=2
+        fi
+      fi
+      continue
+    fi
+    if [ "$cp" -eq 65039 ] || [ "$cp" -eq 65038 ] ||
+       { [ "$cp" -ge 768 ] && [ "$cp" -le 879 ]; }; then
+      continue
+    fi
     if   [ "$cp" -ge 4352 ]   && [ "$cp" -le 4447 ]; then w=2    # 1100-115F
     elif [ "$cp" -ge 11904 ]  && [ "$cp" -le 12350 ]; then w=2   # 2E80-303E
     elif [ "$cp" -ge 12353 ]  && [ "$cp" -le 13311 ]; then w=2   # 3041-33FF
@@ -377,6 +450,37 @@ disp_width() {
     elif [ "$cp" -ge 65072 ]  && [ "$cp" -le 65103 ]; then w=2   # FE30-FE4F
     elif [ "$cp" -ge 65280 ]  && [ "$cp" -le 65376 ]; then w=2   # FF00-FF60
     elif [ "$cp" -ge 65504 ]  && [ "$cp" -le 65510 ]; then w=2   # FFE0-FFE6
+    # the EAW=Wide emoji that live BELOW U+1F300 (round-30): the table
+    # jumped straight from FFE6 to 1F300, so a directory or branch name
+    # holding one of the very common ones - the numbers below are all
+    # EastAsianWidth=W and all render as 2 cells in Windows Terminal -
+    # was measured one cell short, and every separator after that cell
+    # on its line shifted against the other three lines. Only the W
+    # subranges are listed; the Ambiguous glyphs this script draws
+    # itself (see the header) stay at 1 cell deliberately.
+    elif [ "$cp" -ge 8986 ]   && [ "$cp" -le 8987 ]; then w=2    # 231A-231B
+    elif [ "$cp" -ge 9193 ]   && [ "$cp" -le 9196 ]; then w=2    # 23E9-23EC
+    elif [ "$cp" -eq 9200 ]   || [ "$cp" -eq 9203 ]; then w=2    # 23F0, 23F3
+    elif [ "$cp" -ge 9725 ]   && [ "$cp" -le 9726 ]; then w=2    # 25FD-25FE
+    elif [ "$cp" -ge 9748 ]   && [ "$cp" -le 9749 ]; then w=2    # 2614-2615
+    elif [ "$cp" -ge 9800 ]   && [ "$cp" -le 9811 ]; then w=2    # 2648-2653
+    elif [ "$cp" -eq 9855 ]   || [ "$cp" -eq 9875 ]; then w=2    # 267F, 2693
+    elif [ "$cp" -eq 9889 ]   || [ "$cp" -eq 9898 ]; then w=2    # 26A1, 26AA
+    elif [ "$cp" -eq 9899 ]   || [ "$cp" -eq 9917 ]; then w=2    # 26AB, 26BD
+    elif [ "$cp" -eq 9918 ]   || [ "$cp" -eq 9924 ]; then w=2    # 26BE, 26C4
+    elif [ "$cp" -eq 9925 ]   || [ "$cp" -eq 9934 ]; then w=2    # 26C5, 26CE
+    elif [ "$cp" -eq 9940 ]   || [ "$cp" -eq 9962 ]; then w=2    # 26D4, 26EA
+    elif [ "$cp" -ge 9970 ]   && [ "$cp" -le 9971 ]; then w=2    # 26F2-26F3
+    elif [ "$cp" -eq 9973 ]   || [ "$cp" -eq 9978 ]; then w=2    # 26F5, 26FA
+    elif [ "$cp" -eq 9981 ]   || [ "$cp" -eq 9989 ]; then w=2    # 26FD, 2705
+    elif [ "$cp" -ge 9994 ]   && [ "$cp" -le 9995 ]; then w=2    # 270A-270B
+    elif [ "$cp" -eq 10024 ]  || [ "$cp" -eq 10060 ]; then w=2   # 2728, 274C
+    elif [ "$cp" -eq 10062 ]  || [ "$cp" -eq 10071 ]; then w=2   # 274E, 2757
+    elif [ "$cp" -ge 10067 ]  && [ "$cp" -le 10069 ]; then w=2   # 2753-2755
+    elif [ "$cp" -ge 10133 ]  && [ "$cp" -le 10135 ]; then w=2   # 2795-2797
+    elif [ "$cp" -eq 10160 ]  || [ "$cp" -eq 10175 ]; then w=2   # 27B0, 27BF
+    elif [ "$cp" -ge 11035 ]  && [ "$cp" -le 11036 ]; then w=2   # 2B1B-2B1C
+    elif [ "$cp" -eq 11088 ]  || [ "$cp" -eq 11093 ]; then w=2   # 2B50, 2B55
     elif [ "$cp" -ge 127744 ] && [ "$cp" -le 129791 ]; then w=2  # 1F300-1FAFF
     elif [ "$cp" -ge 131072 ]; then w=2                          # >= 20000
     fi
@@ -481,7 +585,7 @@ cut_cells() {   # $1=text $2=cap in cells -> REPLY
 # later field into the wrong variable (this hit production). 0x1F is not
 # IFS-whitespace, so empty fields survive exactly; every `read` below
 # uses IFS=$'\x1f' to match.
-jq_all_out=$(jq -r '
+jq_prog='
   # the range starts at \u0000 (round-30): starting at \u0001 left NUL
   # alive, and @tsv renders NUL as a FIFTH escape - the two characters
   # backslash-zero - which breaks both the "the only escape left is a
@@ -584,7 +688,23 @@ jq_all_out=$(jq -r '
         )
     )
 # #z")
-' <<< "$input" 2>/dev/null)
+'
+jq_all_out=$(jq -r "$jq_prog" <<< "$input" 2>/dev/null)
+# the repair path (see strip_lone_surrogates): only reached when jq
+# produced nothing at all, which for a well-formed payload never happens
+if [ -z "$jq_all_out" ]; then
+  case "$input" in
+    *\\u[dD]*)
+      if [ "${#input}" -le 65536 ]; then
+        strip_lone_surrogates "$input"
+        if [ "$REPLY" != "$input" ]; then
+          input="$REPLY"
+          jq_all_out=$(jq -r "$jq_prog" <<< "$input" 2>/dev/null)
+        fi
+      fi
+      ;;
+  esac
+fi
 jq_all_out=${jq_all_out//$'\r'/}
 jq_all_out=${jq_all_out//$'\t'/$'\x1f'}
 mapfile -t JL <<< "$jq_all_out"
@@ -755,6 +875,14 @@ for ((ti=0; ti<task_count_total; ti++)); do
   identity_plain=${identity_plain//"$BSL2"/"$BSL1"}
   task_type=${task_type//"$BSL2"/"$BSL1"}
   description=${description//"$BSL2"/"$BSL1"}
+  # model and effort need it too (round-32): the note above justified
+  # skipping them as "enum-shaped fields cannot carry backslashes",
+  # but nothing constrains their CONTENT - this file only narrows
+  # their TYPE. A backslash in either was drawn doubled and measured
+  # one cell too wide, which inflates col_max and is then charged to
+  # the panel-wide description budget. An assumption is not a guard.
+  model=${model//"$BSL2"/"$BSL1"}
+  effort=${effort//"$BSL2"/"$BSL1"}
   # IDENTITY CELL CAP (round-17, corrected round-18): the cap has to
   # bound the whole CELL, not just the name inside it. Column 0 is
   # "▸ " + identity + "(type)" + "·effort" + " <glyph>", and for a

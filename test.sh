@@ -176,7 +176,13 @@ if [ "$1" = "--assert" ]; then
 
   narrow=$(COLUMNS=80 bash ./statusline-command.sh < fixtures/full.json | strip)
   [ "$(printf '%s\n' "$narrow" | wc -l)" -eq 1 ] && ok "narrow mode single line" || bad "narrow mode line count"
-  printf '%s' "$narrow" | grep -q 'today' && bad "narrow leaks wide segments" || ok "narrow drops wide segments"
+  # THE TOKEN HAS TO EXIST IN WIDE MODE (round-32): this looked for
+  # "today", and the fixture session contributes exactly its own cost
+  # segment, so the today segment is suppressed as a restatement even
+  # at full width - the assertion could never fail whatever the narrow
+  # branch leaked. "week" IS in the wide render and absent from the
+  # compact line, which is the property actually under test.
+  printf '%s' "$narrow" | grep -q 'week' && bad "narrow leaks wide segments" || ok "narrow drops wide segments"
 
   hotout=$(make_transcript "$tmpd/tr2.jsonl"; jq --arg tp "$tmpd/tr2.jsonl" '.transcript_path=$tp' fixtures/full.json | bash ./statusline-command.sh | strip)
   printf '%s' "$hotout" | grep -q ' hot' && ok "cache hot state" || bad "hot state missing"
@@ -1068,6 +1074,111 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-32 regression asserts (2026-08-18) ----
+  # R152: round-31 inserted a heartbeat between the `&&` and the mv that
+  # publishes a frame. `&&` binds to ONE command, so the publish became
+  # unconditional: a write that failed halfway shipped a truncated frame
+  # to the host, and this branch clears bad_streak, so the "three bad
+  # frames blank the cache" degradation never fired either.
+  awk "/cache_tmp.*2>.dev.null; then/,/^      fi$/" ./statusline-panel-daemon.sh |
+    grep -q "mv -f .\$cache_tmp" &&
+    ok "the cache publish is inside the write guard" ||
+    bad "the cache publish escaped its guard again"
+  [ "$(grep -c 'cache_tmp\" 2>/dev/null &&' ./statusline-panel-daemon.sh)" -eq 0 ] &&
+    ok "no bare && chain left in front of the publish" || bad "publish still guarded by a bare &&"
+  # R153: only the registered instance may stamp the shared side
+  # channels - see the resident-vs---once pair in R144 above.
+  awk "/^hb_touch\(\) \{/,/^}/" ./statusline-panel-daemon.sh | grep -q 'hb_own' &&
+    awk "/^rpid_publish\(\) \{/,/^}/" ./statusline-panel-daemon.sh | grep -q 'hb_own' &&
+    ok "both side channels are owner-gated" || bad "a side channel can be written by any instance"
+  # R154: spawn_clear was defined and never called, so the hook's 120s
+  # brake stayed on for its whole window - with MAX_LIFE at its 60s floor
+  # that is half the time with no panel at all.
+  [ "$(grep -c '^  spawn_clear$' ./statusline-panel-daemon.sh)" -ge 1 ] &&
+    ok "spawn_clear is actually called" || bad "spawn_clear is still dead code"
+  sc32="$tmpd/sc32"; mkdir -p "$sc32"
+  printf '%s\n' "$now" > "$sc32/spawning"
+  cp fixtures/subagent-tasks.json "$sc32/spool.z1.new"
+  STATUSLINE_PANEL_DIR="$sc32" STATUSLINE_PANEL_RENDERER="$PWD/subagent-statusline.sh" \
+    STATUSLINE_SUBAGENT_TREND_FILE="$tmpd/sc32trend" bash ./statusline-panel-daemon.sh >/dev/null 2>&1 &
+  sc32_pid=$!
+  for _sw in 1 2 3 4 5 6 7 8 9 10; do
+    [ "$(cat "$sc32/spawning" 2>/dev/null)" = "0" ] && break; sleep 0.4
+  done
+  sc32v=$(cat "$sc32/spawning" 2>/dev/null)
+  kill "$sc32_pid" 2>/dev/null; wait "$sc32_pid" 2>/dev/null
+  [ "$sc32v" = "0" ] && ok "registering releases the hook spawn brake" ||
+    bad "the spawn brake is never released (marker still $sc32v)"
+  # R155: the takeover freshness gate has to consult the same side
+  # channel the hook does, or a healthy holder is evicted whenever line 2
+  # is stale - which under fork exhaustion is its normal state.
+  awk "/read -r holder; read -r holder_hb/,/kill -0 .\$holder./" ./statusline-panel-daemon.sh |
+    grep -q 'hb_age2' &&
+    ok "the takeover gate reads the side-channel beat" || bad "takeover still judges on line 2 alone"
+  # R156: an unknown midnight baseline contributes NOTHING. Round-31
+  # returned du_closed, but closed carries the inherited cumulative just
+  # as peak does (the state machine seeds peak with the full total and
+  # folds it into closed), so any session that cleared during the day
+  # booked the inheritance all over again.
+  : > "$STATUSLINE_DAILY_FILE"
+  printf '%s\x1fS32\x1f5100\x1f20\x1f20\x1f%s\x1fabc\n' "$(date +%Y%m%d)" "$((now-400))" > "$STATUSLINE_DAILY_FILE"
+  ub32=$(jq -c '.session_id="S32-other" | .cost.total_cost_usd=0' fixtures/full.json | bash ./statusline-command.sh | strip)
+  case "$ub32" in
+    *'$51.'*|*'$50.'*) bad "closed was booked as spend under an unknown baseline ($ub32)" ;;
+    *) ok "an unknown baseline books nothing, not closed" ;;
+  esac
+  # R157: the overflow merge is the FOURTH consumer of the baseline, and
+  # it is the one that WRITES _agg - a known-zero there is permanent.
+  : > "$STATUSLINE_DAILY_FILE"
+  printf '%s\x1fsleeper32\x1f0\x1f1000\x1f1000\x1f%s\x1f\n' "$(date +%Y%m%d)" "$((now-14400))" > "$STATUSLINE_DAILY_FILE"
+  jq -c '.session_id="live32" | .cost.total_cost_usd=0' fixtures/full.json | bash ./statusline-command.sh >/dev/null 2>&1
+  ag32=$(grep '_agg' "$STATUSLINE_DAILY_FILE" 2>/dev/null | head -1)
+  case "$ag32" in
+    *1000*) bad "the merge froze a gross figure into _agg ($ag32)" ;;
+    *) ok "the merge honours an unknown baseline" ;;
+  esac
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R158: the panel measures width exactly like the main bar - it never
+  # received the EAW ranges below U+1F300 or the joiner work, so a check
+  # mark measured one cell against two drawn and a joined emoji measured
+  # five against two.
+  cmp <(awk "/^disp_width\(\) \{/,/^}/" ./statusline-command.sh) \
+      <(awk "/^disp_width\(\) \{/,/^}/" ./subagent-statusline.sh) >/dev/null 2>&1 &&
+    ok "both scripts measure width with identical code" ||
+    bad "the panel width table has drifted from the main bar again"
+  # R159: the repair walk is quadratic, so it may only run when jq has
+  # actually refused the payload - round-31 ran it on every payload that
+  # merely contained the characters, and an ensure_ascii serialiser makes
+  # that every payload with any non-ASCII text (measured 21.7s at 66KB,
+  # past the render deadline, which blanks the panel).
+  # the only call site must sit inside the "jq produced nothing" branch,
+  # and there must be exactly one of them
+  [ "$(grep -c 'strip_lone_surrogates "\$input"' ./subagent-statusline.sh)" -eq 1 ] &&
+    grep -B 6 'strip_lone_surrogates "\$input"' ./subagent-statusline.sh | grep -q 'jq_all_out' &&
+    ok "the surrogate repair runs only after jq refuses" || bad "the repair still runs on every payload"
+  : > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  perf32a=$EPOCHREALTIME
+  jq -c '.columns=120 | .tasks[0].description="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"' fixtures/subagent-tasks.json |
+    bash ./subagent-statusline.sh >/dev/null 2>&1
+  perf32b=$EPOCHREALTIME
+  awk -v a="$perf32a" -v b="$perf32b" 'BEGIN{exit (b-a < 4.0) ? 0 : 1}' &&
+    ok "a plain panel render stays well under the deadline" || bad "panel render too slow"
+  # R160: the tier must match the printed figure for the battery and the
+  # spend amount too - round-31 fixed only the three limit windows.
+  for _t32 in 19.7:33 20.0:33 49.7:32 50.0:32; do
+    _tv="${_t32%%:*}"; _tc="${_t32##*:}"
+     _to=$(jq -n --argjson v "$_tv" '{session_id:"t32",model:{display_name:"M"},workspace:{current_dir:"/x"},context_window:{remaining_percentage:$v}}' |
+      bash ./statusline-command.sh | grep -c "\[${_tc}m")
+    [ "${_to:-0}" -ge 1 ] || { bad "ctx battery tier disagrees with the printed figure at $_tv"; break; }
+  done
+  [ "${_to:-0}" -ge 1 ] && ok "the battery tier matches the printed figure"
+  c32a=$(jq -c '.cost.total_cost_usd=4.996' fixtures/full.json | bash ./statusline-command.sh | grep -c '\[91m5.00')
+  c32b=$(jq -c '.cost.total_cost_usd=5.0' fixtures/full.json | bash ./statusline-command.sh | grep -c '\[91m5.00')
+  [ "${c32a:-0}" -ge 1 ] && [ "${c32b:-0}" -ge 1 ] &&
+    ok "the spend tier matches the printed amount" || bad "4.996 and 5.00 render the same text in different colours"
+  # R161: the suite must not reach the real GitHub.
+  grep -q 'ghstub_dir' ./test.sh && ok "the suite stubs gh out" || bad "the suite can still call the real gh"
   # ---- adversarial-review round-31 regression asserts (2026-08-18) ----
   # R141: the lone-surrogate strip was eight blind glob deletions, which
   # cut six bytes out of anything that merely LOOKED like an escape. Text
@@ -1152,14 +1263,32 @@ SHARE31
     ok "beats are stamped either side of the exec sites" || bad "too few heartbeat checkpoints"
   grep -q 'read -r _hbo daemon_hb2' ./statusline-panel-hook.sh &&
     ok "the hook reads the side-channel beat, owner-checked" || bad "hook ignores the side-channel beat"
+  # a RESIDENT daemon, not --once (round-32): only the instance holding
+  # the registration may stamp the shared beat now, so a --once run
+  # correctly writes nothing at all.
   hb31="$tmpd/hb31"; mkdir -p "$hb31"
   cp fixtures/subagent-tasks.json "$hb31/spool.z1.new"
   STATUSLINE_PANEL_DIR="$hb31" STATUSLINE_PANEL_RENDERER="$PWD/subagent-statusline.sh" \
-    STATUSLINE_SUBAGENT_TREND_FILE="$tmpd/hb31trend" once_daemon ./statusline-panel-daemon.sh --once >/dev/null 2>&1
+    STATUSLINE_SUBAGENT_TREND_FILE="$tmpd/hb31trend" bash ./statusline-panel-daemon.sh >/dev/null 2>&1 &
+  hb31_pid=$!
+  for _hw in 1 2 3 4 5 6 7 8 9 10; do [ -s "$hb31/hb" ] && break; sleep 0.4; done
   hb31o=""; hb31t=""
   [ -r "$hb31/hb" ] && read -r hb31o hb31t < "$hb31/hb"
-  [[ "$hb31o" =~ ^[0-9]+$ ]] && [[ "$hb31t" =~ ^[0-9]{9,13}$ ]] &&
-    ok "the beat file carries owner and timestamp" || bad "hb file malformed ($hb31o/$hb31t)"
+  hb31reg=$(sed -n 1p "$hb31/daemon.pid" 2>/dev/null)
+  kill "$hb31_pid" 2>/dev/null; wait "$hb31_pid" 2>/dev/null
+  [[ "$hb31o" =~ ^[0-9]+$ ]] && [[ "$hb31t" =~ ^[0-9]{9,13}$ ]] && [ "$hb31o" = "$hb31reg" ] &&
+    ok "the beat file carries owner and timestamp" || bad "hb file malformed ($hb31o/$hb31t vs reg $hb31reg)"
+  # ...and an instance that never registers must not stamp it (round-32):
+  # one such write replaces the owner, the hook then discards the beat as
+  # somebody else's and falls back to the pid file line that is 131-162s
+  # stale under fork exhaustion - which kills a healthy daemon.
+  hb32="$tmpd/hb32"; mkdir -p "$hb32"
+  cp fixtures/subagent-tasks.json "$hb32/spool.z1.new"
+  STATUSLINE_PANEL_DIR="$hb32" STATUSLINE_PANEL_RENDERER="$PWD/subagent-statusline.sh" \
+    STATUSLINE_SUBAGENT_TREND_FILE="$tmpd/hb32trend" once_daemon ./statusline-panel-daemon.sh --once >/dev/null 2>&1
+  [ ! -e "$hb32/hb" ] && [ ! -e "$hb32/rpid" ] &&
+    ok "a --once run never stamps the shared beat or render pointer" ||
+    bad "an unregistered instance wrote the shared side channels"
   # R145: the in-flight render child must be reachable the instant it
   # exists, not on the next successful mv - a hook that judged the daemon
   # dead in that window left a renderer no reclaim path could see

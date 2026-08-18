@@ -8,7 +8,7 @@ An information-dense, colorized status line for Claude Code (Windows / Git Bash)
 
 ```
 08:17:08                 | fable-5·max·think | ~\claude-code-statusline  | main*
-ctx ███░│ 71% 294k/1M    | ▂▃▂▄ 2.9k/m       | cache 99.3% r337.0k hot   | ↻2 ↓230k
+ctx ████│ 71% 294k/1M    | ▂▃▂▄ 2.9k/m       | cache 99.3% r337.0k hot   | ↻2 ↓230k
 $74.94 $79.8/h           | today $848.27     | week $3822.68             | +2005/-585
 5h 32%·t60%→09:10 7d 12% | wk Fab8%          | » session-name
 ```
@@ -50,7 +50,7 @@ It atomically installs the four scripts, creates `statusline-panel.d/`, MERGES s
 ```bash
 bash test.sh          # render all fixtures (see real colors in your terminal)
 bash test.sh --codes  # show ANSI escapes as \e[..m for inspection
-bash test.sh --assert # 250 assertions (CI mode; perf gates + thirty-one adversarial-review regression groups + color asserts)
+bash test.sh --assert # 265 assertions (CI mode; perf gates + thirty-two adversarial-review regression groups + color asserts)
 ```
 
 ## Notable engineering notes

@@ -168,8 +168,13 @@ fi
 # orphan incident, restored by its own fix: one wedged daemon per ~65s,
 # forever, each one spinning on the idle tick. /proc/<pid>/cmdline is
 # NUL-separated, so bash reads it with `read -d ''` and no process at all.
-# argv-POSITION discipline (same as the watchdog): the verdict is the LAST
-# argv element, and any process with a bare `-c` element is excluded
+# argv-POSITION discipline (same as the watchdog): the verdict is the
+# FIRST non-option argv after bash (round-32 corrected this note - the
+# body below has anchored there since round-30, and two mutually
+# exclusive rules on one function is exactly how a maintainer reverts
+# the right one; a tail anchor reads `bash <script> --once` as "--once"
+# and every reclaim path then fails to recognise it, which is the
+# 14-CPU-hour leak in the record), and any process with a bare `-c` element is excluded
 # outright - a shell that merely TALKS about the script (a diagnostic, a
 # test, an agent's own bash) carries the whole command as one -c argument
 # and must never enter a kill set.
@@ -257,15 +262,22 @@ if [ "$daemon_alive" -eq 0 ]; then
   # daemon wedged somewhere it can no longer beat from. The old code
   # just spawned a replacement and walked away - nothing anywhere ever
   # reaped the wedged one (the daemon's own takeover only rm's the pid
-  # file, install only kills a FRESH-heartbeat instance, and the
-  # watchdog deliberately skips daemons), so one wedge minted a new
+  # file; install did not reclaim at all back then, and the watchdog had
+  # no daemon branch - BOTH of which changed since: install now reclaims
+  # the registered instance without consulting the heartbeat (round-29),
+  # and the watchdog has TWO daemon branches, stale-registered and
+  # unregistered-orphan (round-32 corrected this sentence, which still
+  # described the old world; the daemon header carries the same
+  # correction and warns that dropping those branches on the strength of
+  # the old wording brings the 38-orphan storm straight back), so one wedge minted a new
   # permanent process every ~65s forever. Killing is safe against pid
   # recycling because the pid came from OUR pid file AND we verify the
   # process is really a panel daemon before signalling.
   if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
     # confirm the pid really IS our daemon before signalling: the
-    # cmdline is NUL-separated so the SCRIPT PATH is its tail -
-    # matching the tail (not "mentions anywhere") keeps a shell that
+    # cmdline is NUL-separated and the SCRIPT PATH is the first
+    # non-option argv after bash - matching that POSITION (not
+    # "mentions anywhere", and not the tail) keeps a shell that
     # merely TALKS about the file (a diagnostic, a test, an agent's
     # own bash) out of the kill set.
     argv_identity "$daemon_pid"

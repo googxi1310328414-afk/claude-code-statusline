@@ -144,7 +144,14 @@ fi
 # are skipped ENTIRELY (no blank line) when every one of their segments
 # is absent - e.g. a fresh minimal session can render as just line 1 + a
 # short line 4, with no lines 2 or 3 at all. The " | " separators are
-# COLUMN-ALIGNED across all four lines: every segment tracks a parallel
+# COLUMN-ALIGNED across all four lines WHENEVER THE PADDED GRID STILL
+# FITS $COLUMNS - when it would not, the frame pads nothing at all
+# rather than wrap (round-32 qualified this, which round-31 left
+# absolute after adding that fallback; measured, an ordinary payload at
+# COLUMNS=100 takes the no-padding path about a quarter of the time, so
+# a reader of the old wording either drops the fallback - restoring the
+# four-line grid that wraps into five or more - or files perfectly
+# normal frames as a regression): every segment tracks a parallel
 # plain-text twin (no ANSI, no OSC 8 - hyperlinks and colors are
 # zero-width and never factor into alignment) purely for width
 # measurement, measured in true terminal DISPLAY cells via disp_width()
@@ -1306,15 +1313,27 @@ printf -v week_first_str '%(%Y%m%d)T' "$(( now_epoch - 518400 ))"
 # evidence behind it expired ninety minutes after it was written - so it
 # is wrong for the rest of the nine-day window with no way back.
 #
-# When the baseline is genuinely unknown the honest answer is "this day
-# owns only what it was OBSERVED to spend": the closed segments, which
-# accrued during the day, and nothing from the open segment, whose
-# cumulative still contains the carry-over. That can understate, never
-# overstate - and understating self-corrects the moment a real
-# observation arrives, while overstating gets frozen into _agg.
+# When the baseline is genuinely unknown the only non-inflating answer
+# is ZERO (round-32 corrected round-31, which returned du_closed and was
+# therefore pointed the wrong way). closed is NOT "what was observed to
+# be spent today": the state machine seeds peak with the FULL cumulative
+# on first observation, and a later lower value folds that whole peak
+# into closed - so closed contains last night's carry-over just as much
+# as peak does. Any session that cleared even once during the day has
+# closed > 0, and returning it booked the inheritance as spend all over
+# again: measured, a day that renders today $1.20 with its base intact
+# rendered today $51.00 with the base column blanked, and the fold wrote
+# that figure back, so it repeated every frame and would have frozen
+# into _agg at settle time.
+#
+# Zero can understate a genuinely-unknown day, and that is the right
+# direction: it self-corrects the moment fold_daily_row sees a real
+# value and seeds the baseline, while any positive guess gets frozen
+# into an _agg row whose fine-grained evidence expired 90 minutes after
+# it was written.
 day_contrib() {   # $1 = dkey -> REPLY (cents, never negative)
   if [ -z "${du_base[$1]+x}" ]; then
-    REPLY=${du_closed[$1]:-0}
+    REPLY=0
   else
     REPLY=$(( ${du_closed[$1]:-0} + ${du_peak[$1]:-0} - ${du_base[$1]} ))
   fi
@@ -1475,9 +1494,23 @@ if [ "$daily_persist_due" -eq 1 ]; then
       dl_ep=${dl_r5%%$SEP1*}
       dl_r6=${dl_r5#*$SEP1}
       dl_base=${dl_r6%%$SEP1*}
-      # a 6-column row (hand-edited/legacy file) leaves r6 == the epoch
+      # a 6-column row (hand-edited/legacy file) leaves r6 == the epoch,
+      # and a legacy row genuinely means base 0 (see the loader)
+      dl_base_known=1
       [ "$dl_base" = "$dl_ep" ] && dl_base=0
-      [[ "$dl_base" =~ ^[0-9]{1,12}$ ]] || dl_base=0
+      # THE FOURTH CONSUMER (round-32): round-31 taught three places
+      # that an unparseable base means "baseline unknown" and left this
+      # one turning it into a KNOWN zero - and this is the path that
+      # WRITES _agg, so the inflated figure becomes permanent. Worse,
+      # the empty base column is written by this very script whenever
+      # the baseline is unknown, so the shape is self-inflicted rather
+      # than exotic: measured, a frame that correctly showed no today or
+      # week segment persisted _agg 1000 in the same pass, and the next
+      # frame rendered today $10.00 / week $10.00 - permanently, because
+      # the fine rows behind it were long gone. (The round-31 assertion
+      # missed it too: it grepped for the ${du_base[...]:-0} spelling,
+      # and this site is spelled || dl_base=0.)
+      [[ "$dl_base" =~ ^[0-9]{1,12}$ ]] || { dl_base=0; dl_base_known=0; }
       # _agg rows JOIN the bucket instead of being passed through
       # (round-11): passing them through while also appending a fresh
       # _agg for the same day wrote TWO rows with the same key, and the
@@ -1490,9 +1523,14 @@ if [ "$daily_persist_due" -eq 1 ]; then
       # watermark and let those rows re-fold FROM SCRATCH, inflating
       # today/week (the forbidden direction).
       if [[ "$dl_ep" =~ ^[0-9]+$ ]] && { [ "$dl_sid" = "_agg" ] || [ "$dl_ep" -lt "$(( now_epoch - 10800 ))" ]; }; then
-        # same net-of-base arithmetic as the settled fold above
-        dl_contrib=$(( ${dl_closed:-0} + ${dl_peak:-0} - dl_base ))
-        [ "$dl_contrib" -lt 0 ] && dl_contrib=0
+        # same net-of-base arithmetic as the settled fold above, and the
+        # same "unknown baseline contributes nothing" rule as day_contrib
+        if [ "$dl_base_known" -eq 1 ]; then
+          dl_contrib=$(( ${dl_closed:-0} + ${dl_peak:-0} - dl_base ))
+          [ "$dl_contrib" -lt 0 ] && dl_contrib=0
+        else
+          dl_contrib=0
+        fi
         daily_agg2[$dl_day]=$(( ${daily_agg2[$dl_day]:-0} + dl_contrib ))
       else
         daily_keep_lines+=("$dl")
@@ -2263,7 +2301,13 @@ elif [[ "$remaining" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]]; then
     remaining_int=0
     remaining_disp="0"
   else
-    remaining_int="${remaining%%.*}"
+    # SAME RULE AS THE LIMIT WINDOWS (round-32): round-31 aligned 5h, 7d
+    # and wk with the figure actually printed and left the context
+    # battery on the truncated value, though its own note listed the
+    # battery as a victim of the same split. Measured: 19.7 drew a
+    # bright-red "ctx !20%" while 20.0 drew a yellow "20%", and 49.7 vs
+    # 50.0 differed by a whole filled cell under the same printed "50%".
+    printf -v remaining_int '%.0f' "$remaining" 2>/dev/null || remaining_int="${remaining%%.*}"
     if [ "$remaining_int" -gt 100 ]; then
       remaining_int=100
       remaining_disp="100"
@@ -2706,7 +2750,12 @@ cost_compact_seg=""
 # to a real historical $/h rate that fake reads as a live figure). Digit
 # cap keeps the later integer comparisons inside bash arithmetic range.
 if [[ "$cost" =~ ^[0-9]{1,9}(\.[0-9]+)?$ ]]; then
-  cost_int="${cost%%.*}"
+  # ...and the spend amount (round-32): the tier came from the truncated
+  # dollars while the text is printed with %.2f, so 4.996 rendered a
+  # YELLOW "$5.00" against the header's own ">= $5 is bright red" rule.
+  # A session crossing $1 or $5 spends a few frames inside that band
+  # every single time.
+  printf -v cost_int '%.0f' "$cost" 2>/dev/null || cost_int="${cost%%.*}"
   cost_color="$GRAY"
   if [ "$cost_int" -ge 5 ]; then
     cost_color="$RED_BRIGHT"
@@ -2794,7 +2843,10 @@ fi
 # 13. rate limits (each window independently optional, each with an optional
 # "->reset" suffix guarded by a numeric check before it's handed to `date`).
 # Per-part colors per window: "5h"/"7d" label is fixed cyan; "N%" is dynamic
-# by that window's own floor(used_percentage) (<50 green, 50-79 yellow, >=80
+# by that window's own ROUNDED used_percentage - the same figure the text
+# shows, see the note at five_int (round-32 corrected this line, which
+# still said floor and was contradicted by the code 37 lines below it)
+# (<50 green, 50-79 yellow, >=80
 # bright red); "→reset" (arrow included) is white. Windows are still joined
 # by a plain space.
 # (five/five_reset/week/week_reset already extracted by the consolidated
@@ -3235,8 +3287,17 @@ if [ "$usage_needs_refresh" -eq 1 ] && command -v curl >/dev/null 2>&1; then
           # tmp names MUST match the orphan-sweep glob statusline-*.tmp.*
           # (the old dot-prefixed .statusline-usage-*.$$.tmp form escaped
           # every sweep - a killed background job stranded them forever)
-          usage_hdr_tmp="$HOME/.claude/statusline-usage-hdr.tmp.$$"
-          usage_body_tmp="$HOME/.claude/statusline-usage-body.tmp.$$"
+          # ISOLATION APPLIES TO THESE TWO AS WELL (round-32): they were the last
+# writes still pinned to the real ~/.claude, so with the state files
+# redirected (every test run, every review sandbox) they landed outside
+# the sandbox AND outside the reach of the orphan sweep below, whose
+# scope follows the history file. A refresh killed by the host then left
+# a pair behind in the user's real directory on every occurrence, with
+# nothing to collect them.
+usage_tmp_dir="${history_file%/*}"
+[ -d "$usage_tmp_dir" ] || usage_tmp_dir="$HOME/.claude"
+usage_hdr_tmp="$usage_tmp_dir/statusline-usage-hdr.tmp.$$"
+          usage_body_tmp="$usage_tmp_dir/statusline-usage-body.tmp.$$"
           usage_http_code=$(curl -sS -m 5 -D "$usage_hdr_tmp" -o "$usage_body_tmp" -w '%{http_code}' \
             -H "Authorization: Bearer $oauth_token" \
             -H "anthropic-beta: oauth-2025-04-20" \
