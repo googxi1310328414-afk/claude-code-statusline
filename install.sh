@@ -233,7 +233,17 @@ if [ "$daemon_updated" -eq 1 ]; then
     rm -f "$CLAUDE_DIR/statusline-panel.d"/render.* "$CLAUDE_DIR/statusline-panel.d"/*.raw 2>/dev/null
   else
     # pid 文件与在途渲染残骸一并清掉，避免新实例读到陈旧注册
-    rm -f "$daemon_pid_file" "$CLAUDE_DIR/statusline-panel.d"/render.* "$CLAUDE_DIR/statusline-panel.d"/*.raw 2>/dev/null
+    # 只删自己刚回收的那一条（第 35 轮）：从杀掉老实例到这里隔着一次 sleep 1
+    # 与一次 powershell 往返（fork 枯竭下各按 31s 计），而宿主每 ~5s 敲一次钩子
+    # ——这个窗口里钩子必然读到「注册 pid 已死」并拉起替身、替身重建注册。
+    # 无条件删就把替身的注册摘掉了，而 daemon 自己的退出路径与 AI-GUIDE §4
+    # 都明令「删 pid 文件前必须校验内容==自己」。
+    cur_reg=""
+    [ -r "$daemon_pid_file" ] && read -r cur_reg < "$daemon_pid_file" 2>/dev/null
+    if [ -z "$cur_reg" ] || [ "$cur_reg" = "$old_dp" ]; then
+      rm -f "$daemon_pid_file" 2>/dev/null
+    fi
+    rm -f "$CLAUDE_DIR/statusline-panel.d"/render.* "$CLAUDE_DIR/statusline-panel.d"/*.raw 2>/dev/null
   fi
 fi
 

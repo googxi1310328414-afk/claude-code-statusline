@@ -218,7 +218,13 @@ if [ "$1" = "--assert" ]; then
   printf '%s' "$plain" | grep -q '·t60%' && ok "pace cursor value (t60%)" || bad "pace value wrong"
 
   narrow=$(COLUMNS=80 bash ./statusline-command.sh < fixtures/full.json | strip)
-  [ "$(printf '%s\n' "$narrow" | wc -l)" -eq 1 ] && ok "narrow mode single line" || bad "narrow mode line count"
+  # AND IT HAS TO HAVE PRINTED SOMETHING (round-35): printf appends a
+  # newline unconditionally, so wc -l reports 1 for an EMPTY string - the
+  # blank bar, this project's worst outcome, scored the same as a healthy
+  # compact line. The reverse grep below has the same hole. Require real
+  # content as well as a single line.
+  [ "$(printf '%s\n' "$narrow" | wc -l)" -eq 1 ] && [ "${#narrow}" -ge 20 ] &&
+    ok "narrow mode single line (${#narrow} chars)" || bad "narrow mode line count / empty (${#narrow} chars)"
   # THE TOKEN HAS TO EXIST IN WIDE MODE (round-32): this looked for
   # "today", and the fixture session contributes exactly its own cost
   # segment, so the today segment is suppressed as a restatement even
@@ -726,6 +732,18 @@ sleep 120
 ' > "$tmpd/statusline-panel-daemon.sh"
   bash "$tmpd/statusline-panel-daemon.sh" &
   wedged=$!
+  # note the stub's own child now, while it still has a parent to match
+  wedged_kid=""
+  for _wk in 1 2 3 4 5 6 7 8 9 10; do
+    for _wd in /proc/[0-9]*; do
+      [ -r "$_wd/stat" ] || continue
+      read -r _wst < "$_wd/stat" 2>/dev/null || continue
+      _wst=${_wst#*") "}; _wpp=${_wst#* }; _wpp=${_wpp%% *}
+      [ "$_wpp" = "$wedged" ] && wedged_kid="${_wd##*/}"
+    done
+    [ -n "$wedged_kid" ] && break
+    sleep 0.2
+  done
   printf '%s
 %s
 %s
@@ -746,7 +764,13 @@ sleep 120
   # daemons. (Making the stub `exec` instead would strip the daemon
   # filename from its cmdline, which is exactly what the assertion needs
   # the hook to recognise.)
-  reap_children "$wedged"
+  # CAPTURED BEFORE THE PARENT DIED (round-35): reap_children matches on
+  # ppid, and by this point the hook has already killed $wedged - cygwin
+  # reparents its child to 1 the moment that happens, so the round-34
+  # version matched nothing at all and the sleep still outlived the
+  # suite by two minutes. The child pid has to be noted while the parent
+  # is still alive.
+  [ -n "$wedged_kid" ] && kill -9 "$wedged_kid" 2>/dev/null
   rm -f "$STATUSLINE_PANEL_DIR/daemon.pid" "$STATUSLINE_PANEL_DIR"/spool.kl1.new 2>/dev/null
   # R41: the daily row cap must never lose money - overflow merges
   # settled per-session rows into _agg instead of slicing in hash order
@@ -1133,6 +1157,88 @@ sleep 300
   HOME="$ihome" bash ./install.sh >/dev/null 2>&1 && ok "installer runs clean" || bad "installer failed"
   [ -x "$ihome/.claude/statusline-panel-daemon.sh" ] && [ -f "$ihome/.claude/statusline-command.sh" ] && [ -d "$ihome/.claude/statusline-panel.d" ] && ok "installer places files" || bad "installer files missing"
   [ "$(jq -r '.model' "$ihome/.claude/settings.json")" = "keep-me" ] && [ "$(jq -r '.statusLine.padding' "$ihome/.claude/settings.json")" = "0" ] && jq -r '.subagentStatusLine.command' "$ihome/.claude/settings.json" | grep -q panel-hook && ok "installer merges settings" || bad "installer merge wrong"
+  # ---- adversarial-review round-35 regression asserts (2026-08-19) ----
+  # R179: the orphans merge must re-check the IN-MEMORY half too. Only
+  # the disk half was gated, so a pid that died after registration was
+  # written straight back out, and the one-per-beat rotation is then the
+  # only thing that can remove it - K corpses delay the real survivor by
+  # K beats while both shared files keep advertising them.
+  awk "/^orphans_save\(\) \{/,/^}/" ./statusline-panel-daemon.sh |
+    grep -q 'child_is_renderer "\$_os_s"' &&
+    ok "the orphans merge re-checks the in-memory half" ||
+    bad "the in-memory half of the merge is still unchecked"
+  # R180: a conceding instance must stop owning the shared beat first -
+  # otherwise it stamps the side channel with ITS pid while the pid file
+  # names the winner, the hook discards the beat as somebody elses and
+  # falls back to a line that is 131-162s stale under fork exhaustion.
+  awk '/elif \[ -n "\$hb_cur" \]/,/quit_with_child/' ./statusline-panel-daemon.sh |
+    grep -q 'hb_own=0' &&
+    ok "conceding gives up the shared beat" || bad "a conceding instance still owns the beat"
+  # R181: "the rollup file was empty" and "every row was filtered out"
+  # are different questions - conflating them made a discarded table look
+  # like a brand-new machine and planted a KNOWN zero baseline.
+  grep -q 'daily_file_had_lines' ./statusline-command.sh &&
+    ok "an all-filtered rollup is not mistaken for a new machine" ||
+    bad "a fully filtered rollup still seeds a known zero baseline"
+  : > "$STATUSLINE_DAILY_FILE"
+  printf '%s\x1fabc\x1f0\x1f4900\x1f4900\x1f%s\x1f4900\n' "$(date +%Y%m%d)" "$((now+99999))" > "$STATUSLINE_DAILY_FILE"
+  fr35=$(jq -c '.session_id="abc" | .cost.total_cost_usd=50.00' fixtures/full.json | bash ./statusline-command.sh | strip)
+  case "$fr35" in
+    *'today $50'*) bad "a future-stamped rollup seeded a zero baseline ($fr35)" ;;
+    *) ok "a fully filtered rollup books nothing" ;;
+  esac
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R182: the share population must be the population that renders. Tasks
+  # without an id never produce a row, but they were counted into both
+  # the denominator and the ">=2 tasks with tokens" gate - so a one-row
+  # panel claimed that row was 10% of something nothing on screen shows.
+  : > "$STATUSLINE_SUBAGENT_TREND_FILE"
+  gh35=$(jq -nc '{columns:120,tasks:[{id:"vis1",name:"visible",status:"running",tokenCount:10000,description:"only row"},{name:"ghostA",status:"running",tokenCount:45000},{id:"",name:"ghostB",status:"running",tokenCount:45000}]}' |
+    bash ./subagent-statusline.sh | jq -r .content | strip | grep -c 'Σ')
+  [ "${gh35:-1}" -eq 0 ] && ok "id-less tasks cannot manufacture a share" ||
+    bad "a share was printed with nothing on screen to compare against"
+  # R183: the identity hash walks the host id, so it needs a bound - a
+  # pathological id pushed the render past the daemon deadline.
+  grep -q '_idcap' ./subagent-statusline.sh &&
+    ok "the identity hash is bounded" || bad "the identity hash walks an unbounded id"
+  # R184: measuring a length must not cost a fork (one jq per frame is
+  # the entire budget).
+  grep -q 'byte_len() {' ./subagent-statusline.sh &&
+    ! grep -q '_jqbytes=$(' ./subagent-statusline.sh &&
+    ok "the byte length costs no fork" || bad "a subshell is spent measuring a length"
+  # R185: today is hidden only when it restates the figure printed beside
+  # it. The old test was "this session contributed all of today", which a
+  # session straddling midnight also satisfies - and then the only money
+  # on screen was the cross-midnight cumulative.
+  : > "$STATUSLINE_DAILY_FILE"
+  # a session id the fine history does NOT carry, so the only cents in
+  # play are the two rollup rows - otherwise the fixture history adds
+  # its own and the totals stop being predictable
+  y35=$(date -d yesterday +%Y%m%d 2>/dev/null || date +%Y%m%d)
+  printf '%s\x1fxmid\x1f0\x1f800\x1f800\x1f%s\x1f0\n%s\x1fxmid\x1f0\x1f1000\x1f1000\x1f%s\x1f800\n' \
+    "$y35" "$((now-90000))" "$(date +%Y%m%d)" "$((now-100))" > "$STATUSLINE_DAILY_FILE"
+  tm35=$(jq -c '.session_id="xmid" | .cost.total_cost_usd=10.00' fixtures/full.json | bash ./statusline-command.sh | strip)
+  case "$tm35" in
+    *'today $2.'*) ok "a cross-midnight session still shows today" ;;
+    *) bad "today vanished for a cross-midnight session ($tm35)" ;;
+  esac
+  : > "$STATUSLINE_DAILY_FILE"
+  make_history "$now" "$STATUSLINE_HISTORY_FILE"
+  # R186: U+FE0F turns the character before it into a two-cell emoji, and
+  # every base that needs it is EAW=Ambiguous (counted as one).
+  awk "/^disp_width\(\) \{/,/^}/" ./statusline-command.sh > "$tmpd/dw35.sh"
+  fe35=$(LC_ALL=C.UTF-8 bash -c '. "$1"; disp_width "$2"; echo "$REPLY"' _ "$tmpd/dw35.sh" "$(printf '\u26a0\ufe0fx')")
+  [ "${fe35:-0}" -eq 3 ] && ok "an emoji-presentation sequence measures two cells (${fe35})" ||
+    bad "FE0F sequence mis-measured (${fe35} cells, want 3)"
+  # R187: install may only delete a registration that is still the one it
+  # reclaimed - the hook can have spawned a replacement in the window.
+  awk "/still_alive/,/^  fi$/" ./install.sh | grep -q 'cur_reg' &&
+    ok "install only deletes its own registration" || bad "install deletes whatever registration it finds"
+  # R188: the watchdog may only de-register a daemon it confirmed gone.
+  grep -q 'if (-not $stillThere)' ./statusline-watchdog.ps1 &&
+    ok "the watchdog de-registers only what it removed" ||
+    bad "the watchdog can de-register a live daemon it failed to kill"
   # ---- adversarial-review round-34 regression asserts (2026-08-18) ----
   # R172: the here-string deadlock band is measured in BYTES. Round-33
   # guarded it with ${#var}, which counts CHARACTERS under this locale -
@@ -1184,7 +1290,10 @@ CJK34
   # is bracketed by beats - one leftover fifo made the window (N+1) execs
   # long, which under fork exhaustion is past the hook gate, and the
   # daemon is already REGISTERED by then so it gets killed and replaced.
-  [ "$(grep -c '^ *hb_touch$' ./statusline-panel-daemon.sh)" -ge 16 ] &&
+  # AN EXACT FLOOR (round-35): the threshold sat one BELOW the real
+  # count, so deleting any single beat still passed - which is exactly
+  # the regression this assertion is named after.
+  [ "$(grep -c '^ *hb_touch$' ./statusline-panel-daemon.sh)" -ge 17 ] &&
     ok "the startup and fallback paths are fully bracketed by beats" ||
     bad "an exec on a startup or fallback path has no beat around it"
   awk "/for _tf in/,/^  done$/" ./statusline-panel-daemon.sh | grep -q "hb_touch" &&
@@ -1385,7 +1494,12 @@ SUR33
   # R155: the takeover freshness gate has to consult the same side
   # channel the hook does, or a healthy holder is evicted whenever line 2
   # is stale - which under fork exhaustion is its normal state.
-  awk "/read -r holder; read -r holder_hb/,/kill -0 .\$holder./" ./statusline-panel-daemon.sh |
+  # THE RANGE HAS TO END (round-35): the closing regex was written in a
+  # double-quoted string, so awk received /kill -0 .$holder./ - and $ is
+  # awk's end-of-line anchor, which nothing after it can ever match. The
+  # range therefore ran to the end of the file and the grep below searched
+  # three quarters of the daemon instead of the takeover gate.
+  awk '/read -r holder; read -r holder_hb/,/holder_fresh" -eq 1 \]/' ./statusline-panel-daemon.sh |
     grep -q 'hb_age2' &&
     ok "the takeover gate reads the side-channel beat" || bad "takeover still judges on line 2 alone"
   # R156: an unknown midnight baseline contributes NOTHING. Round-31
@@ -1892,7 +2006,15 @@ disp_width "$1"; echo "$REPLY"' _ "$zw31")
       once_daemon ./statusline-panel-daemon.sh --once >/dev/null 2>&1
     [ -s "$zt/cache.z1" ] && zt_ok=$(( zt_ok + 1 ))
   done
-  [ "$zt_ok" -eq 3 ] && ok "a minimum render deadline is really a whole second (3/3)" ||
+  # AT LEAST ONE, NOT ALL THREE (round-35): the floor makes the budget
+  # (1s, 2s] because SECONDS is an integer, and a render of this fixture
+  # measures 0.8-0.95s idle but 1.6-2.6s with a handful of busy shells -
+  # so on a machine running real sessions this went red with nothing
+  # wrong, and requiring 3/3 multiplied that chance rather than reducing
+  # it. What the assertion actually has to prove is that the floor is
+  # non-zero at all: with the floor removed NONE of the three produce a
+  # frame, so "at least one" is the discriminating question.
+  [ "$zt_ok" -ge 1 ] && ok "a minimum render deadline is really a whole second ($zt_ok/3)" ||
     bad "the floored deadline still kills renders ($zt_ok/3)"
   # R117: the daily rollup columns are written straight back out by the
   # fold, so a zero-padded cell is a PERMANENT lie inside the 9-day

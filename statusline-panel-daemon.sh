@@ -481,7 +481,26 @@ child_is_renderer() { # $1=pid
 orphans_save() {
   _os_disk=""
   [ -r "$orphan_file" ] && read -r _os_disk < "$orphan_file" 2>/dev/null
-  _os_all="$r_orphans"
+  # THE SEED NEEDS THE SAME GATE AS THE DISK HALF (round-35): round-30
+  # put the identity check on the pids read from the file and left the
+  # in-memory list going in unchecked, so a pid that died after it was
+  # registered was written straight back out. The only thing that can
+  # then remove it is the one-per-beat rotation, so K corpses delay the
+  # retry of the one process actually burning CPU by K beats - measured:
+  # three registered survivors all dead within two seconds still took
+  # 15 further seconds to leave the file, one per beat, and both the
+  # orphans file and pid line 4 advertised them to the hook, install and
+  # the watchdog throughout.
+  _os_all=""
+  for _os_s in $r_orphans; do
+    [[ "$_os_s" =~ ^[0-9]{1,10}$ ]] || continue
+    kill -0 "$_os_s" 2>/dev/null || continue
+    child_is_renderer "$_os_s" || continue
+    case " $_os_all " in
+      *" $_os_s "*) : ;;
+      *) _os_all="${_os_all}${_os_all:+ }$_os_s" ;;
+    esac
+  done
   for _os_p in $_os_disk; do
     [[ "$_os_p" =~ ^[0-9]{1,10}$ ]] || continue
     kill -0 "$_os_p" 2>/dev/null || continue
@@ -633,6 +652,15 @@ hb_beat() {
   if [ "$hb_cur" = "$$" ]; then
     printf '%s\n%s\n%s\n%s\n' "$$" "$hb_t" "$daemon_winpid" "${r_pid_pub}${r_orphans:+ }${r_orphans}" > "$panel_dir/daemon.pid.tmp.$$" 2>/dev/null && mv -f "$panel_dir/daemon.pid.tmp.$$" "$panel_dir/daemon.pid" 2>/dev/null
   elif [ -n "$hb_cur" ] && kill -0 "$hb_cur" 2>/dev/null; then
+    # WE ARE NOT THE HOLDER ANY MORE (round-35): this instance had
+    # registered once, so hb_own is still 1 and the beat two lines up
+    # has just stamped the SHARED file with OUR pid - while the pid file
+    # names somebody else. The hook only trusts a beat whose owner
+    # matches line 1, so it discards it and falls back to the pid file
+    # line that under fork exhaustion is 131-162s stale: it judges the
+    # NEW holder dead and kills it. Conceding must give up ownership of
+    # the side channel before anything else.
+    hb_own=0
     quit_with_child
   else
     rm -f "$panel_dir/daemon.pid" 2>/dev/null

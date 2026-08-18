@@ -917,12 +917,15 @@ max_persisted_wm=0
 # "this machine has no rollup history at all" (first run / fresh
 # install / deleted file). It is the ONLY state in which an unknown
 # session may be seeded at base 0 - see fold_daily_row's baseline note.
+# TWO SEPARATE QUESTIONS (round-35): "was there a rollup file with rows in it" and "did any row survive the filters". Only the second used to be tracked, and the baseline seeder keys off it - so when a clock rollback (or any other filter) discarded EVERY row, the seeder concluded "brand new machine, nothing on record" and planted a KNOWN zero baseline, which books the whole cumulative a session inherited as today spend and then persists it. The file plainly existed; the rows were merely rejected.
 daily_had_rows=0
+daily_file_had_lines=0
 declare -A du_closed du_peak du_prev du_epoch du_base du_sidprev du_sidepoch du_sidday
 declare -A du_watermark
 printf -v today_str '%(%Y%m%d)T' -1
 if [ -f "$daily_file" ]; then
   mapfile -t daily_raw_lines < "$daily_file" 2>/dev/null
+  [ "${#daily_raw_lines[@]}" -gt 0 ] && daily_file_had_lines=1
   for dline in "${daily_raw_lines[@]}"; do
     dline=${dline//$'\r'/}
     # split via parameter expansions, NOT `read <<<` - a herestring costs
@@ -1083,7 +1086,7 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
   # while that same money already sat inside _agg: today AND week
   # double-counted, in the direction this file everywhere forbids. With no
   # baseline on record the honest answer is "this day owns only what we
-  # OBSERVE it spend", so the base becomes the seeded value itself. For a
+  # OBSERVE it spend", so the base becomes the seeded value itself (round-35: that WAS the rule through round-32; the current one is "everything observed up to this moment, resolved AFTER the segment update", and only a row from an EARLIER day may supply a real midnight baseline - see fold_daily_row). For a
   # genuinely new session that costs nothing (its first frame lands within
   # seconds of session start, at ~$0.00); the one case that legitimately
   # wants base 0 - a machine with NO rollup state at all, seeding from
@@ -1103,7 +1106,7 @@ fold_daily_row() { # $1=epoch $2=sid $3=cents
       # a base above the seeded value means the counter reset (/clear)
       # across the boundary - fall back to 0
       [ "$dbase" -gt "$3" ] && dbase=0
-    elif [ "$daily_had_rows" -eq 1 ]; then
+    elif [ "$daily_had_rows" -eq 1 ] || [ "$daily_file_had_lines" -eq 1 ]; then
       # NO USABLE BASELINE: START THE DAY AT ZERO FROM HERE (round-33).
       # Everything observed so far - the closed segments AND the value
       # arriving now - may contain money that was already spent before
@@ -1811,7 +1814,17 @@ if [ -n "$cost" ] && cost_to_cents "$cost"; then
 fi
 today_seg=""
 today_plain=""
-if [ "$today_total_cents" -gt 0 ] && [ "$(( today_total_cents - today_self_cents ))" -ge 1 ]; then
+# HIDDEN ONLY WHEN IT RESTATES THE FIGURE BESIDE IT (round-35): the test
+# was "this session contributed all of today", which is NOT the same
+# thing. A session that straddled midnight owns all of today AND
+# carries yesterday inside .cost.total_cost_usd, so the segment
+# vanished while the only money on screen was the cross-midnight
+# cumulative - measured: $8 yesterday plus $2 today rendered "$10.00"
+# with no today segment at all, and adding one unrelated session with
+# a single cent brought "today $2.01" straight back, which is proof the
+# old condition was not testing what it claimed. Compare against the
+# number actually printed to the left instead.
+if [ "$today_total_cents" -gt 0 ] && [ "$today_total_cents" -ne "$current_cost_cents" ]; then
   printf -v today_fmt '%d.%02d' "$(( today_total_cents / 100 ))" "$(( today_total_cents % 100 ))"
   today_seg="${GRAY}today${RESET} ${WHITE}\$${today_fmt}${RESET}"
   today_plain="today \$${today_fmt}"
@@ -1877,7 +1890,7 @@ disp_width() {
     REPLY="${#s}"
     return
   fi
-  local len=${#s} i c nc cp ncp w total=0 zwj_skip=0
+  local len=${#s} i c nc cp ncp w total=0 zwj_skip=0 prev_w=0
   for ((i=0; i<len; i++)); do
     c="${s:i:1}"
     # THE PENDING-SKIP CHECK COMES FIRST (round-31): it used to sit
@@ -1895,6 +1908,7 @@ disp_width() {
     fi
     if [[ "$c" == [[:ascii:]] ]]; then
       total=$(( total + 1 ))
+      prev_w=1
       continue
     fi
     printf -v cp '%d' "'$c"
@@ -1939,8 +1953,22 @@ disp_width() {
       fi
       continue
     fi
-    if [ "$cp" -eq 65039 ] || [ "$cp" -eq 65038 ] ||
+    # U+FE0F ASKS FOR THE EMOJI PRESENTATION (round-35): it is itself
+    # zero-width, but it turns the character BEFORE it into a two-cell
+    # emoji - and every base that needs it (warning sign, heart, arrow,
+    # check mark, sun) is EAW=Ambiguous and was therefore counted as
+    # one. Measured: a directory named with one came out a cell short
+    # and pushed line 1 out of step with line 3. U+FE0E asks for the
+    # TEXT presentation, so it stays at zero.
+    if [ "$cp" -eq 65039 ]; then
+      [ "$prev_w" -eq 1 ] && total=$(( total + 1 ))
+      prev_w=2
+      continue
+    fi
+    # zero-width space and friends draw nothing at all (round-35)
+    if [ "$cp" -eq 65038 ] || [ "$cp" -eq 8203 ] || [ "$cp" -eq 8204 ] ||
        { [ "$cp" -ge 768 ] && [ "$cp" -le 879 ]; }; then
+      prev_w=0
       continue
     fi
     if   [ "$cp" -ge 4352 ]   && [ "$cp" -le 4447 ]; then w=2    # 1100-115F
@@ -1989,6 +2017,7 @@ disp_width() {
     elif [ "$cp" -ge 131072 ]; then w=2                          # >= 20000
     fi
     total=$(( total + w ))
+    prev_w=$w
   done
   REPLY="$total"
 }

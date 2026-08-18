@@ -414,7 +414,7 @@ disp_width() {
     REPLY="${#s}"
     return
   fi
-  local len=${#s} i c nc cp ncp w total=0 zwj_skip=0
+  local len=${#s} i c nc cp ncp w total=0 zwj_skip=0 prev_w=0
   for ((i=0; i<len; i++)); do
     c="${s:i:1}"
     # THE PENDING-SKIP CHECK COMES FIRST (round-31): it used to sit
@@ -432,6 +432,7 @@ disp_width() {
     fi
     if [[ "$c" == [[:ascii:]] ]]; then
       total=$(( total + 1 ))
+      prev_w=1
       continue
     fi
     printf -v cp '%d' "'$c"
@@ -476,8 +477,22 @@ disp_width() {
       fi
       continue
     fi
-    if [ "$cp" -eq 65039 ] || [ "$cp" -eq 65038 ] ||
+    # U+FE0F ASKS FOR THE EMOJI PRESENTATION (round-35): it is itself
+    # zero-width, but it turns the character BEFORE it into a two-cell
+    # emoji - and every base that needs it (warning sign, heart, arrow,
+    # check mark, sun) is EAW=Ambiguous and was therefore counted as
+    # one. Measured: a directory named with one came out a cell short
+    # and pushed line 1 out of step with line 3. U+FE0E asks for the
+    # TEXT presentation, so it stays at zero.
+    if [ "$cp" -eq 65039 ]; then
+      [ "$prev_w" -eq 1 ] && total=$(( total + 1 ))
+      prev_w=2
+      continue
+    fi
+    # zero-width space and friends draw nothing at all (round-35)
+    if [ "$cp" -eq 65038 ] || [ "$cp" -eq 8203 ] || [ "$cp" -eq 8204 ] ||
        { [ "$cp" -ge 768 ] && [ "$cp" -le 879 ]; }; then
+      prev_w=0
       continue
     fi
     if   [ "$cp" -ge 4352 ]   && [ "$cp" -le 4447 ]; then w=2    # 1100-115F
@@ -526,6 +541,7 @@ disp_width() {
     elif [ "$cp" -ge 131072 ]; then w=2                          # >= 20000
     fi
     total=$(( total + w ))
+    prev_w=$w
   done
   REPLY="$total"
 }
@@ -689,8 +705,17 @@ jq_prog='
   # with the three rows summing to 30099%. Round-26 unified the type
   # gate and round-27 the digit cap across these two places; clean was
   # the third thing that had to match and did not.
-  | ([$tasks[]? | .tokenCount // 0 | clean | select(test("^[0-9]{1,12}$") and (test("[^0-9]") | not)) | (tonumber? // empty)] | add // 0 | tostring) as $total_tokens
-  | ([$tasks[]? | .tokenCount // empty | clean | select(test("^[0-9]{1,12}$") and (test("[^0-9]") | not)) | (tonumber? // empty) | select(. > 0)] | length | tostring) as $tokened_count
+  # ONLY TASKS THAT WILL ACTUALLY RENDER A ROW (round-35): a task whose
+  # id is missing or empty is dropped by the row loop, but both of these
+  # aggregates counted it - so a payload with one visible task and two
+  # id-less ones printed a single row reading 10% of a total nothing on
+  # screen accounts for. The >=2 gate exists precisely to guarantee the
+  # percentage has something to be compared against, and it was being
+  # satisfied by rows that do not exist. Both halves now use the same
+  # population the renderer does.
+  | [$tasks[]? | select((.id // "" | clean) != "")] as $vtasks
+  | ([$vtasks[]? | .tokenCount // 0 | clean | select(test("^[0-9]{1,12}$") and (test("[^0-9]") | not)) | (tonumber? // empty)] | add // 0 | tostring) as $total_tokens
+  | ([$vtasks[]? | .tokenCount // empty | clean | select(test("^[0-9]{1,12}$") and (test("[^0-9]") | not)) | (tonumber? // empty) | select(. > 0)] | length | tostring) as $tokened_count
   | ($columns | clean), ($majority_model | clean), $total_tokens, $tokened_count,
     (
       range(0; $tcount) as $i
@@ -784,7 +809,13 @@ jq_all_out=${jq_all_out//$'\t'/$'\x1f'}
 # the band by byte count while ${#var} reports a third of that, so the
 # mapfile below deadlocked exactly as before. Measured in a subshell so
 # the C locale cannot leak into the rest of the render.
-_jqbytes=$(LC_ALL=C; printf %s "${#jq_all_out}")
+# NO FORK FOR A LENGTH (round-35): the command substitution here cost a
+# subshell on every single frame, against a header and a guide that both
+# budget exactly one jq and nothing else - and under fork exhaustion it
+# would fail silently, leaving the value empty and the guard inert. A
+# function with a local LC_ALL does the same job with no process.
+byte_len() { local LC_ALL=C; REPLY=${#1}; }
+byte_len "$jq_all_out"; _jqbytes=$REPLY
 if [ "$_jqbytes" -ge 65536 ] && [ "$_jqbytes" -le 65663 ]; then
   printf -v _jqpad '%*s' "$(( 65664 - _jqbytes ))" ''
   jq_all_out="${jq_all_out}${_jqpad// /$'\n'}"
@@ -1110,8 +1141,18 @@ for ((ti=0; ti<task_count_total; ti++)); do
       # multiply-accumulate over the WHOLE id: a plain byte SUM over a
       # truncated prefix clustered badly (two live agents landed on the
       # same hue), so ids that differ only late still separate here.
+      # BOUNDED (round-35): this walks the host id one character at a
+      # time, ~2 statements each, with nothing capping it - a
+      # pathological id pushes the render past the daemon deadline,
+      # which kills the frame, and three of those blank the panel.
+      # Real ids are UUID-shaped (36 characters); 256 hashes every
+      # realistic one in full. Round-30 moved from a 4-character
+      # prefix to the whole id because the prefix clustered - a
+      # 256-character window has no such problem.
       ident_hash=0
-      for (( ihx=0; ihx<${#id}; ihx++ )); do
+      _idcap=${#id}
+      [ "$_idcap" -gt 256 ] && _idcap=256
+      for (( ihx=0; ihx<_idcap; ihx++ )); do
         printf -v ident_ch '%d' "'${id:ihx:1}" 2>/dev/null || ident_ch=0
         ident_hash=$(( (ident_hash * 31 + ident_ch) % 100003 ))
       done

@@ -15,7 +15,9 @@
 # Windows pid 并清掉注册，下一拍钩子会拉起新实例。心跳新鲜则一律不动。
 # 没有 pid 文件、格式不对、或第 3 行缺失（非 MSYS 环境无 /proc）→ 什么都不做，
 # 失败方向永远是「少管闲事」而不是「乱杀」。
-# 30s 门（渲染脚本）：一次渲染实测 0.4–1.3s，>30s 即判挂死。注意
+# 90s 门（渲染脚本）：一次渲染实测 0.4–1.3s，>90s 才判挂死（第 35 轮
+# 订正这个小标题：它一直写着 30s，而同段末尾与代码常量都是 90——
+# 照标题复刻会在后台 usage/CI 刷新正常跑到 30s 以上时误杀它们）。注意
 # **后台脱离式**的 usage/CI 刷新子壳也是 bash，但它们的命令行是
 # `bash <脚本>` 的子壳形态（cmdline 仍是父脚本名），curl -m 5 / gh 网络
 # 调用可能合法地跑到 30s 以上——为避免误杀这类正常后台任务，判据除
@@ -107,8 +109,16 @@ if (Test-Path $pidFile) {
       if ($p -and $p.Name -eq 'bash.exe' -and $p.CommandLine -notmatch '\s-c\s' -and $p.CommandLine -match 'bash(\.exe)?"?\s+(?:"[^"]*statusline-panel-daemon\.sh"|[^" ]*statusline-panel-daemon\.sh(\s|$))') {
         Stop-Process -Id $wpid -Force -ErrorAction SilentlyContinue
       }
-      # 注册已确认陈旧：无论进程是否还在，都清掉它，下一拍钩子会重建
-      Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+      # 只有确认进程真的没了才清注册（第 35 轮）：二次确认失败时
+      # （WMI 超时、CommandLine 取不到权限、winpid 已被回收）上面那句
+      # Stop-Process 一次都没发出去，而无条件删注册会把一个还活着、
+      # 还在烧 CPU 的实例从「注册在案、钩子够得着、钩子会因回收失败
+      # 拒绝拉新」变成「未注册孤儿」，钩子下一拍读不到注册就畅通无阻
+      # 地拉新——install.sh 为自己那条路径逐字禁止过同一个动作。
+      $stillThere = Get-CimInstance Win32_Process -Filter "ProcessId=$wpid" -ErrorAction SilentlyContinue
+      if (-not $stillThere) {
+        Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+      }
     }
   }
 }
